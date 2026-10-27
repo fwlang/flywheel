@@ -1,3 +1,11 @@
 import html.*
 
-print <h1>Hello, World!</h1>
+element page = <div>
+    <p>Hello, World!</p>
+    <p>Welcome to Wednesware!</p>
+</div>
+
+string rendered = render(page)
+
+print rendered
+print typeof(rendered)

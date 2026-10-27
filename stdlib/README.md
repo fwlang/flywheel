@@ -4,7 +4,7 @@ Libraries are currently compiler-resolved declarations backed by C++ runtime fun
 
 | Module | Implemented API |
 |---|---|
-| implicit core / `core` | `print(value)`; unqualified `typeof(value)`, `len(string_or_array)`, numeric casts, `string(value)`, `render(tree)` |
+| implicit core / `core` | `print(value)` (automatically serializes elements/fragments); unqualified `typeof(value)`, `len(string_or_array)`, numeric casts, `string(value)`, `render(tree)` |
 | `html` | subset of HTML tags through `import html.*`; `html.render(element_or_fragment)` |
 | `fs` | `exists(string) returns bool`, `read(string) returns string`, `write(string,string) returns void`, `remove(string) returns void` |
 | `math` | `PI`, `sqrt(double)`, `sin(double)`, `cos(double)`, `pow(double,double)`; results are `double` |

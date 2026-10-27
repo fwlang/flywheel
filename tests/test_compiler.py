@@ -291,7 +291,63 @@ POSITIVE.update(
     }
 )
 
+POSITIVE.update(
+    {
+        "print_markup_argument": (
+            "import html.*\nprint <h1>Hello, World!</h1>",
+            "<h1>Hello, World!</h1>\n",
+        ),
+        "print_markup_parenthesized": (
+            "import html.*\nprint (<h1>Hello, World!</h1>)\nprint(<h1>Hello, World!</h1>)",
+            "<h1>Hello, World!</h1>\n<h1>Hello, World!</h1>\n",
+        ),
+        "print_nested_markup": (
+            "import html.*\nprint <div><h1>Hello</h1><p>World!</p></div>\nprint(<div><span>Nested</span></div>)",
+            "<div><h1>Hello</h1><p>World!</p></div>\n<div><span>Nested</span></div>\n",
+        ),
+        "print_fragments": (
+            "import html.*\nprint <><h1>Hello</h1><p>World!</p></>\nprint(<><b>one</b><i>two</i></>)\nprint <>plain &amp; text</>\nprint <> </>\nprint <></>",
+            "<h1>Hello</h1><p>World!</p>\n<b>one</b><i>two</i>\nplain &amp; text\n \n\n",
+        ),
+        "markup_argument_calls": (
+            "import html.*\nfunction echo(element value) returns element\nreturn value\nend\nfunction join(element left, fragment right) returns fragment\nreturn <>{left}{right}</>\nend\nvar emit = echo\nprint emit(<h1>alias</h1>)\nemit <h1>discarded</h1>\nvar tree = echo <p>declaration</p>\nprint tree\ntree = echo <p>assignment</p>\nprint tree\nvar nodes = join <b>left</b>, <><i>right</i></>\nprint nodes\nprint(join(<b>explicit</b>, <><i>calls</i></>))",
+            "<h1>alias</h1>\n<p>declaration</p>\n<p>assignment</p>\n<b>left</b><i>right</i>\n<b>explicit</b><i>calls</i>\n",
+        ),
+        "markup_member_argument": (
+            "import html.*\nclass Output\nfunction show(element value) returns void\nprint value\nend\nend\nvar out = Output()\nout.show <p>member</p>\nout.show(<p>explicit member</p>)",
+            "<p>member</p>\n<p>explicit member</p>\n",
+        ),
+        "markup_formatting": (
+            'import html.*\nvar tree = <h1>Hello &amp; World!</h1>\nvar fragment = <><b>A</b><i>B</i></>\nprint string(tree)\nprint string(fragment)\nprint "Tree: {tree}"\nprint "Fragment: {fragment}"\nprint html.render(tree)\nprint html.render(fragment)\nprint tree',
+            "<h1>Hello &amp; World!</h1>\n<b>A</b><i>B</i>\nTree: <h1>Hello &amp; World!</h1>\nFragment: <b>A</b><i>B</i>\n<h1>Hello &amp; World!</h1>\n<b>A</b><i>B</i>\n<h1>Hello &amp; World!</h1>\n",
+        ),
+        "print_markup_escaping": (
+            'import html.*\nvar text = "<>&\\"\'"\nprint <p title={text}>{text} &amp; &#x1F600;</p>\nprint(<><span title="&quot;&amp;">&lt;safe&gt;</span>{text}</>)\nprint <p>{string(<b>A &amp; B</b>)}</p>',
+            '<p title="&lt;&gt;&amp;&quot;&#39;">&lt;&gt;&amp;&quot;&#39; &amp; 😀</p>\n<span title="&quot;&amp;">&lt;safe&gt;</span>&lt;&gt;&amp;&quot;&#39;\n<p>&lt;b&gt;A &amp;amp; B&lt;/b&gt;</p>\n',
+        ),
+        "markup_comparison_boundary": (
+            "import html.*\nint a = 1\nint b = 2\nprint a<b\nprint a <b and b>a\nif a<b then\nprint <p>comparison</p>\nend\nprint <p>{a <b}</p>",
+            "true\ntrue\n<p>comparison</p>\n<p>true</p>\n",
+        ),
+        "markup_temporary_arc": (
+            'import html.*\nfunction make(int n) returns element\nreturn <p>{n}</p>\nend\nvar retained = make(7)\nint i = 0\nint total = 0\nwhile i < 2000 do\nvar text = string(make(i))\ntotal += len(text)\ni += 1\nend\nprint total\nprint retained\nprint retained\nprint "{make(9)}"',
+            "20890\n<p>7</p>\n<p>7</p>\n<p>9</p>\n",
+        ),
+    }
+)
+
+POSITIVE.update(
+    {
+        "markup_self_closing_component": (
+            "import html.*\ncomponent Label = <p>{attr inner}</p>\nprint <br />\nprint <input disabled={true} />\nprint <Label>component</Label>",
+            '<br>\n<input disabled="">\n<p>component</p>\n',
+        )
+    }
+)
+
 NEGATIVE = {
+    "markup_argument_mismatch": ("import html.*\nprint <p>bad</div>", "mismatched"),
+    "markup_argument_unknown": ("print <h1>bad</h1>", "unknown tag"),
     "unknown_tag": ("var t = <p>test</p>", "unknown tag"),
     "missing_attr": (
         "import html.*\ncomponent C = <p>{attr user}</p>\nvar c = <C />",
@@ -419,6 +475,21 @@ class CompilerTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(message, result.stderr)
                 self.assertIn(": error:", result.stderr)
+
+    def test_statement_diagnostics(self):
+        for source, unexpected in [
+            ("var x = 1 2", "2"),
+            ("print 1 2", "2"),
+            ("var x = 1, 2", ","),
+        ]:
+            with self.subTest(source=source):
+                self.source.write_text(source, encoding="utf-8")
+                result = self.command("check", self.source)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    f"expected end of statement, got '{unexpected}'", result.stderr
+                )
+                self.assertNotIn("nested calls", result.stderr)
 
     def test_runtime_errors(self):
         for name, (source, message) in TRAPS.items():

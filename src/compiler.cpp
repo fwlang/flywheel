@@ -236,6 +236,8 @@ class Compiler {
     Val stringify(Val x) {
         if (x.t.name == "string")
             return x;
+        if (x.t.name == "element" || x.t.name == "fragment")
+            return {objectCall("fw_render", {frame, x.v}), Ty{"string"}};
         if (x.t.integer()) {
             auto y = b.CreateIntCast(x.v, b.getInt64Ty(), !x.t.unsigned_());
             return {objectCall(x.t.unsigned_() ? "fw_uint_string" : "fw_int_string", {frame, y}),

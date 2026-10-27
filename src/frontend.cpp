@@ -12,6 +12,37 @@ bool start(unsigned char c) {
 bool part(unsigned char c) {
     return std::isalnum(c) || c == '_';
 }
+// A tag header also starts an argument after a callable, where '<' could otherwise
+// be a comparison. Inspect only the header prefix, never search ahead for a closing
+// tag: a later markup statement must not change how 'a <b' is tokenized.
+bool markupArgumentStart(const std::string &source, size_t p) {
+    ++p; // '<'
+    if (p == source.size())
+        return false;
+    if (source[p] == '>')
+        return true; // fragment
+    if (!start(source[p]))
+        return false;
+    auto name = [&] {
+        while (p < source.size() && (part(source[p]) || source[p] == '-' || source[p] == ':'))
+            ++p;
+    };
+    auto space = [&] {
+        while (p < source.size() && std::isspace(static_cast<unsigned char>(source[p])))
+            ++p;
+    };
+    name();
+    space();
+    if (p == source.size())
+        return false;
+    if (source[p] == '>' || source.compare(p, 2, "/>") == 0)
+        return true;
+    if (!start(source[p]))
+        return false;
+    name();
+    space();
+    return p < source.size() && source[p] == '=';
+}
 size_t quotedEnd(const std::string &s, size_t p);
 size_t braceEnd(const std::string &s, size_t p) {
     int depth = 1;
@@ -227,7 +258,7 @@ std::vector<Token> lex(const std::string &source) {
             expected = false;
             continue;
         }
-        if (c == '<' && expected && p + 1 < source.size() &&
+        if (c == '<' && (expected || markupArgumentStart(source, p)) && p + 1 < source.size() &&
             (start(source[p + 1]) || source[p + 1] == '>')) {
             auto end = markupEnd(source, p);
             emit("markup", source.substr(p, end - p + 1), end + 1);
@@ -333,7 +364,7 @@ void Parser::newlines() {
 }
 void Parser::finish() {
     if (peek().kind != "nl" && peek().kind != "eof")
-        throw Error(peek().loc, "expected end of statement; nested calls require parentheses");
+        throw Error(peek().loc, "expected end of statement, got '" + peek().text + "'");
     newlines();
 }
 std::string Parser::type() {
@@ -664,6 +695,11 @@ EP Parser::outer() {
         do {
             n->args.push_back(expression());
         } while (accept(","));
+        const auto &last = *n->args.back();
+        if ((last.kind == "name" || last.kind == "member") &&
+            (peek().kind == "id" || peek().kind == "int" || peek().kind == "real" ||
+             peek().kind == "string" || peek().kind == "markup"))
+            throw Error(peek().loc, "nested calls require parentheses around their arguments");
         e = std::move(n);
     }
     return e;
