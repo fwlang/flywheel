@@ -1,0 +1,38 @@
+name: Native compiler
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+      - uses: mamba-org/setup-micromamba@v3
+        with:
+          environment-name: flywheel
+          create-args: >-
+            llvmdev=21.1.8
+            cmake
+            ninja
+            python=3.12
+            -c conda-forge
+          init-shell: bash
+          cache-environment: true
+      - name: Configure
+        shell: bash -el {0}
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_PREFIX_PATH="$CONDA_PREFIX;$CONDA_PREFIX/Library"
+      - name: Build
+        shell: bash -el {0}
+        run: cmake --build build --parallel 2
+      - name: Native smoke tests and regressions
+        shell: bash -el {0}
+        run: ctest --test-dir build --output-on-failure

@@ -1,0 +1,12 @@
+import html.*
+class Person
+    string name
+    int age = 0
+end
+component UserCard = <div style={attr style}>
+    <h1>{attr user.name}</h1>
+    <p>Age: {attr user.age}</p>
+    {attr inner}
+</div>
+var user = Person("Danny & friends", 15)
+print html.render(<UserCard user={user}><p>Native markup!</p></UserCard>)

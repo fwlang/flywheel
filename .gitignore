@@ -1,0 +1,8 @@
+/build*/
+__pycache__/
+*.o
+*.obj
+*.exe
+/a.out
+FLYWHEEL.md
+STATUS.md

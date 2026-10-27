@@ -1,0 +1,11 @@
+function fib(int n) returns int
+    if n < 2 then
+        return n
+    else
+        return fib(n - 1) + fib(n - 2)
+    end
+end
+int[] values = [1, 2, 3]
+for value in values do
+    print "fib({value}) = {fib(value)}"
+end

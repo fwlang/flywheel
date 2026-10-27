@@ -1,0 +1,57 @@
+import html.*
+import web
+import fs
+
+const int PORT = 8000
+
+class Person
+    string name
+    int age = 0
+
+    function greet() returns string
+        return "Hello, {inst name}! You're {inst age} years old."
+    end
+
+    function birthday() returns void
+        inst age += 1
+    end
+end
+
+component Title = <h1 style="font-size: 10em; {attr style}">
+    {attr inner}
+</h1>
+
+component UserCard = <div style={attr style}>
+    <h1>{attr user.name}</h1>
+    <p>Age: {attr user.age}</p>
+    {attr inner}
+</div>
+
+function load_user(string path) returns Person
+    if fs.exists(path) then
+        return Person.from_json(fs.read(path))
+    else
+        return Person("danny", 15)
+    end
+end
+
+function index() returns element
+    var user = load_user("user.json")
+    return <html>
+        <head><title>Flywheel Demo</title></head>
+        <body>
+            <UserCard user={user} style="font-family: arial;">
+                This is a title card
+            </UserCard>
+            <Title>Welcome!</Title>
+            <p>Powered by Flywheel!</p>
+        </body>
+    </html>
+end
+
+function main() returns void
+    print "Starting Flywheel server on port {PORT}"
+    web.serve "/", index, PORT
+end
+
+main
