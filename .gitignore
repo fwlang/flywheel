@@ -6,3 +6,4 @@ __pycache__/
 /a.out
 FLYWHEEL.md
 STATUS.md
+build.sh

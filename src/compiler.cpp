@@ -836,7 +836,7 @@ Val Compiler::value(Expr &e, Ty expected) {
             "nav",   "section", "article",  "aside",      "strong", "em",    "b",      "i",
             "code",  "pre",     "small",    "blockquote", "video",  "audio", "source"};
         if (!e.text.empty() && (!p.html || !tags.count(e.text)))
-            error("unknown tag '" + e.text + "'; import html.* or declare a component");
+            error("unknown tag '" + e.text + "'");
         auto tag = literal(e.text);
         Val tree{objectCall("fw_element", {frame, tag.v}),
                  Ty{e.text.empty() ? "fragment" : "element"}};
