@@ -13,6 +13,19 @@ values.clear()
 
 `push(value)` appends a value of the element type; `pop()` removes and returns the last value; `clear()` releases all elements. `len(array)`, indexing, indexed assignment, membership (`value in array`), and `for` iteration are supported. Indexes are checked. Assigning an array to another variable aliases it; mutation is visible through both bindings. A `for` expression is evaluated once and captures the initial length; shrinking the array during iteration can raise `IndexError`. Growth does not extend an already-running loop.
 
+Higher-order methods take function values or lambdas:
+
+```flywheel
+var nums = [1, 2, 3, 4]
+print nums.map(function(int x) => x * x)              # [1, 4, 9, 16]
+print nums.filter(function(int x) => x % 2 == 0)      # [2, 4]
+print nums.reduce(0, function(int sum, int x) => sum + x)  # 10
+print nums.any(function(int x) => x > 3)              # true
+nums.each(function(int x) => print(x))
+```
+
+`map` returns a new array of the callback's result type; `filter`, `any`, and `all` require a `bool` predicate. See [function types and closures](language.md).
+
 Maps are homogeneous associative values with shared mutable identity:
 
 ```flywheel
@@ -27,7 +40,7 @@ end
 scores.clear()
 ```
 
-Keys may be strings, booleans, or integer types. Values may be any supported concrete non-void type, including arrays, tuples, classes, or Results. Missing-key reads raise `KeyError`; plain assignment inserts or updates. A failed RHS does not insert a placeholder. `remove(key)` returns bool, `keys()` returns an array snapshot, and `len(map)` / `.length` count entries. Iteration uses a key snapshot in insertion order. Maps currently use linear key lookup; hashing and broader key protocols remain optimization work. Empty maps require a declared/contextual `map<K,V>` type.
+Keys may be strings, booleans, or integer types. Values may be any supported concrete non-void type, including arrays, tuples, classes, or Results. Missing-key reads raise `KeyError`; plain assignment inserts or updates. A failed RHS does not insert a placeholder. `remove(key)` returns bool, `keys()` returns an array snapshot, and `len(map)` / `.length` count entries. Iteration uses a key snapshot in insertion order. Lookup, insertion, and membership use a hash index over the insertion-ordered entries, so they take expected constant time at any size. Broader key protocols (custom hash/equality) remain future work. Empty maps require a declared/contextual `map<K,V>` type.
 
 Tuples have fixed length and statically known types at each position:
 

@@ -7,3 +7,4 @@ __pycache__/
 FLYWHEEL.md
 STATUS.md
 build.sh
+.vscode

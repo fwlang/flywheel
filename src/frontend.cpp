@@ -233,7 +233,7 @@ std::vector<Token> lex(const std::string &source) {
         }
     };
     auto emit = [&](std::string kind, std::string text, size_t end) {
-        out.push_back({std::move(text), std::move(kind), loc});
+        out.push_back({std::move(text), std::move(kind), loc, group});
         advance(end);
     };
     while (p < source.size()) {
@@ -248,11 +248,11 @@ std::vector<Token> lex(const std::string &source) {
             continue;
         }
         if (c == '\n' || c == ';') {
-            if (!group) {
-                emit("nl", "\n", p + 1);
+            // Grouped newlines are kept with their depth; the parser ignores them except
+            // inside a lambda body that starts at that depth.
+            if (!group)
                 expected = true;
-            } else
-                advance(p + 1);
+            emit("nl", "\n", p + 1);
             continue;
         }
         if (c == '"') {
@@ -263,7 +263,8 @@ std::vector<Token> lex(const std::string &source) {
         }
         bool genericType = !out.empty() && out.back().kind == "id" &&
                            (out.back().text == "array" || out.back().text == "tuple" ||
-                            out.back().text == "map" || out.back().text == "Result");
+                            out.back().text == "map" || out.back().text == "Result" ||
+                            out.back().text == "weak");
         if (c == '<' && !genericType && (expected || markupArgumentStart(source, p)) &&
             p + 1 < source.size() && (start(source[p + 1]) || source[p + 1] == '>')) {
             auto end = markupEnd(source, p);
@@ -313,7 +314,7 @@ std::vector<Token> lex(const std::string &source) {
             auto two = source.substr(p, 2);
             if (two == "==" || two == "!=" || two == "<=" || two == ">=" || two == "+=" ||
                 two == "-=" || two == "*=" || two == "/=" || two == "%=" || two == "//" ||
-                two == "..")
+                two == ".." || two == "=>")
                 op = two;
         }
         if (op == ".." && p + 2 < source.size() && source[p + 2] == '<')
@@ -334,13 +335,25 @@ std::vector<Token> lex(const std::string &source) {
     out.push_back({"", "eof", loc});
     return out;
 }
+size_t Parser::index(size_t n) {
+    int active = bodyDepths.empty() ? 0 : bodyDepths.back();
+    size_t i = pos;
+    while (true) {
+        while (i + 1 < tokens.size() && tokens[i].kind == "nl" && tokens[i].depth != active)
+            ++i;
+        if (n == 0 || i + 1 >= tokens.size())
+            return i;
+        --n;
+        ++i;
+    }
+}
 Token &Parser::peek(size_t n) {
-    return tokens[std::min(pos + n, tokens.size() - 1)];
+    return tokens[index(n)];
 }
 Token Parser::take() {
-    auto t = peek();
-    if (t.kind != "eof")
-        ++pos;
+    auto i = index(0);
+    auto t = tokens[i];
+    pos = t.kind == "eof" ? i : i + 1;
     return t;
 }
 bool Parser::accept(const std::string &s) {
@@ -384,6 +397,21 @@ std::string Parser::type() {
             r += "," + type();
         expect("]");
         r += "]";
+    } else if (peek().text == "function" && peek(1).text == "(") {
+        // function(A, B) returns R is stored as function<R,A,B>.
+        take();
+        take();
+        std::vector<std::string> params;
+        if (!accept(")")) {
+            do {
+                params.push_back(type());
+            } while (accept(","));
+            expect(")");
+        }
+        r = "function<" + (accept("returns") ? type() : std::string("void"));
+        for (auto &param : params)
+            r += "," + param;
+        return r + ">";
     } else {
         auto t = take();
         if (t.kind != "id")
@@ -658,6 +686,11 @@ EP Parser::prefix() {
         }
     } else if (accept("inst") || accept("attr")) {
         e = node(t.text, identifier().text, t.loc);
+    } else if (t.kind == "id" && t.text == "function" && peek(1).text == "(") {
+        e = lambda();
+    } else if (t.kind == "id" && t.text == "weak" && peek(1).text == "(") {
+        take();
+        e = node("name", "weak", t.loc);
     } else if (t.kind == "id") {
         static const std::set<std::string> structural = {
             "function", "class", "component", "import",   "public", "private", "returns",
@@ -876,6 +909,48 @@ SP Parser::statement() {
     finish();
     return s;
 }
+EP Parser::lambda() {
+    auto t = expect("function");
+    auto f = std::make_shared<Function>();
+    f->loc = t.loc;
+    f->name = "lambda";
+    expect("(");
+    if (!accept(")")) {
+        do {
+            Param p;
+            p.loc = peek().loc;
+            p.type = type();
+            p.name = identifier().text;
+            if (peek().text == "=")
+                throw Error(peek().loc, "lambda parameters cannot have defaults");
+            f->params.push_back(std::move(p));
+        } while (accept(","));
+        expect(")");
+    }
+    if (accept("returns"))
+        f->result = type();
+    if (accept("=>")) {
+        auto r = std::make_unique<Stmt>();
+        r->kind = "return";
+        r->loc = peek().loc;
+        r->expr = expression();
+        f->body.push_back(std::move(r));
+    } else {
+        bodyDepths.push_back(t.depth);
+        try {
+            finish();
+            f->body = block();
+            expect("end");
+        } catch (...) {
+            bodyDepths.pop_back();
+            throw;
+        }
+        bodyDepths.pop_back();
+    }
+    auto e = node("lambda", "", t.loc);
+    e->lambda = std::move(f);
+    return e;
+}
 Function Parser::function(const std::string &owner) {
     auto t = expect("function");
     Function f;
@@ -946,7 +1021,7 @@ Program Parser::parse() {
             p.importOrder.push_back(alias);
             p.importLocations[alias] = tokens[pos - 1].loc;
             finish();
-        } else if (peek().text == "function")
+        } else if (peek().text == "function" && peek(1).text != "(")
             p.functions.push_back(function());
         else if (accept("class")) {
             Class c;
@@ -954,7 +1029,7 @@ Program Parser::parse() {
             c.name = identifier().text;
             finish();
             while (peek().text != "end" && peek().kind != "eof") {
-                if (peek().text == "function")
+                if (peek().text == "function" && peek(1).text != "(")
                     c.methods.push_back(function(c.name));
                 else {
                     Param field;

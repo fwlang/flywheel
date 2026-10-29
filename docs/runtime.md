@@ -12,7 +12,11 @@ Native C++ failures are caught at runtime C ABI boundaries and recorded in a thr
 
 `testing.live_objects()` reports the current number of live managed objects, enabling lifetime regression checks; it does not count ownership frames or all C++ allocations. AddressSanitizer/UBSan tests exercise both standalone programs and imported projects.
 
-Reference counts remain atomic. This does not make mutable arrays, maps, or class fields safe for concurrent mutation; parallel language execution is not enabled. Strong cycles are not collected, and `weak<T>` remains unimplemented. Full escape analysis, stack allocation of managed objects, general move optimization, and automatic cycle handling are not claimed.
+Reference counts remain atomic. This does not make mutable arrays, maps, or class fields safe for concurrent mutation; parallel language execution is not enabled. Strong cycles are not collected; break them with `weak<T>`. Full escape analysis, stack allocation of managed objects, general move optimization, and automatic cycle handling are not claimed.
+
+`weak<T>` holds a non-owning reference to a class instance, element, or other managed reference type. Assigning a `T` (or calling `weak(x)`) creates one; `get()` returns `T?` and `alive()` reports whether the target still exists. Each referenced object owns a shared cell that is cleared when the object is destroyed, so a weak reference never keeps its target alive and never dangles. Typical uses are parent links in trees and closures that refer back to their owner (`weak<Button> self = button`).
+
+Closures are ARC-managed objects holding a code pointer and their captured values in ordinary slots. Captured references are retained for the closure's lifetime and released with it. A named function used as a value is wrapped in a capture-free closure.
 
 Markup is constructed by compiled native calls, with no runtime XML parser. Fragments preserve their sequence of children and serialize without a wrapper. `element` can hold either a named element or a fragment; this compatibility does not turn the fragment into a named tag. Both support `.render()`, and formatting uses the same HTML serializer as explicit `html.render`. Serialized strings are ordinary managed strings. Text/attribute escaping and source entity decoding remain unchanged.
 

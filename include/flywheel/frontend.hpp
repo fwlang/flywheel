@@ -1,6 +1,7 @@
 #pragma once
 #include <map>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -8,6 +9,7 @@
 namespace fw {
 struct Location {
     int line = 1, column = 1;
+    std::string file;
 };
 struct Error : std::runtime_error {
     Location loc;
@@ -16,20 +18,26 @@ struct Error : std::runtime_error {
 struct Token {
     std::string text, kind;
     Location loc;
+    int depth = 0; // open delimiters before the token; newlines inside lambdas use it
 };
 std::vector<Token> lex(const std::string &source);
+struct Function;
 struct Expr {
     std::string kind, text;
+    bool grouped = false, outer = false;
     Location loc;
     std::vector<std::unique_ptr<Expr>> args;
     std::vector<std::string> names;
+    std::shared_ptr<Function> lambda;
 };
 using EP = std::unique_ptr<Expr>;
 struct Stmt {
     std::string kind, name, type, op;
     Location loc;
     EP expr, target;
-    std::vector<std::unique_ptr<Stmt>> body, other;
+    std::vector<std::unique_ptr<Stmt>> body, other, finalizer;
+    std::vector<std::string> catchTypes, catchNames;
+    std::vector<std::vector<std::unique_ptr<Stmt>>> catches;
 };
 using SP = std::unique_ptr<Stmt>;
 struct Param {
@@ -55,11 +63,16 @@ struct Program {
     std::vector<SP> body;
     std::map<std::string, EP> components;
     std::map<std::string, std::string> imports;
+    std::vector<std::string> importOrder;
+    std::map<std::string, Location> importLocations;
     bool html = false;
+    std::set<std::string> wildcards, privateNames;
 };
 class Parser {
     std::vector<Token> tokens;
     size_t pos = 0;
+    std::vector<int> bodyDepths;
+    size_t index(size_t n);
     Token &peek(size_t n = 0);
     Token take();
     bool accept(const std::string &s);
@@ -77,14 +90,17 @@ class Parser {
     SP statement();
     std::vector<SP> block();
     Function function(const std::string &owner = "");
+    EP lambda();
 
   public:
     explicit Parser(std::vector<Token> t) : tokens(std::move(t)) {}
     Program parse();
 };
+Program loadProgram(const std::string &filename);
 struct Options {
     int optimization = 0;
-    std::string ir, object;
+    std::string ir, object, desktopBackend;
+    std::string *objectData = nullptr; // receives the object file in memory when set
 };
 void compile(Program &program, const std::string &filename, const Options &options);
 } // namespace fw

@@ -2,9 +2,22 @@
 #include <chrono>
 #include <filesystem>
 #include <iostream>
+#include <optional>
 #include <llvm/Config/llvm-config.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/Program.h>
+#ifdef FW_JIT
+#include <cerrno>
+#include <cstdio>
+#include <llvm/ExecutionEngine/Orc/LLJIT.h>
+#include <llvm/Support/MemoryBuffer.h>
+#include <csignal>
+#include <sys/wait.h>
+#include <unistd.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
+#endif
 
 namespace fs = std::filesystem;
 namespace {
@@ -70,6 +83,48 @@ std::string desktopPath(const fs::path &runtime) {
         return fs::absolute(installed).string();
     return FW_DESKTOP_BACKEND;
 }
+#ifdef FW_JIT
+// Runs a compiled object without linking it: the runtime is part of this executable and its fw_*
+// symbols are exported for the JIT. The program runs in a child process, so traps and crashes
+// behave as they would in a built executable. Returns nullopt when the JIT is unavailable.
+std::optional<int> runInProcess(const std::string &object) {
+    auto jit = llvm::orc::LLJITBuilder().create();
+    std::optional<llvm::orc::ExecutorAddr> entry;
+    if (jit) {
+        auto buffer = llvm::MemoryBuffer::getMemBufferCopy(object, "program.o");
+        if (auto error = (*jit)->addObjectFile(std::move(buffer)))
+            llvm::consumeError(std::move(error));
+        else if (auto symbol = (*jit)->lookup("main"))
+            entry = *symbol;
+        else
+            llvm::consumeError(symbol.takeError());
+    } else
+        llvm::consumeError(jit.takeError());
+    if (!entry)
+        return std::nullopt;
+    std::cout.flush();
+    std::cerr.flush();
+    std::fflush(nullptr);
+    [[maybe_unused]] pid_t parent = getpid();
+    pid_t child = fork();
+    if (child < 0)
+        return std::nullopt;
+    if (child == 0) {
+#ifdef __linux__
+        // Stop the program (and free e.g. its listening sockets) if the driver is killed.
+        prctl(PR_SET_PDEATHSIG, SIGTERM);
+        if (getppid() != parent)
+            _exit(1);
+#endif
+        std::exit(entry->toPtr<int (*)()>()());
+    }
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0)
+        if (errno != EINTR)
+            return 1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+#endif
 } // namespace
 int main(int argc, char **argv) {
     if (argc == 2 && std::string(argv[1]) == "--version") {
@@ -116,13 +171,23 @@ int main(int argc, char **argv) {
             fw::compile(program, filename, {optimization, ir, "", ""});
             return 0;
         }
+        auto runtime = runtimePath(argv[0]);
+#ifdef FW_JIT
+        if (command == "run") {
+            std::string object;
+            fw::compile(program, filename,
+                        {optimization, ir, "", desktopPath(runtime), &object});
+            if (auto status = runInProcess(object))
+                return *status;
+            program = fw::loadProgram(filename);
+        }
+#endif
         Temp temp;
 #ifdef _WIN32
         auto object = temp.path / "program.obj";
 #else
         auto object = temp.path / "program.o";
 #endif
-        auto runtime = runtimePath(argv[0]);
         fw::compile(program, filename, {optimization, ir, object.string(), desktopPath(runtime)});
 #ifdef _WIN32
         std::string suffix = ".exe";
@@ -140,6 +205,8 @@ int main(int argc, char **argv) {
                 "/link",   "Ws2_32.lib"};
 #else
         link = {object.string(), runtime.string(), "-o", binary.string(), "-pthread"};
+        if (*FW_LINKER_FLAG)
+            link.push_back(FW_LINKER_FLAG);
 #endif
 #if defined(_WIN32) && !defined(_MSC_VER)
         link.push_back("-lws2_32");

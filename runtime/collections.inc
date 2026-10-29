@@ -55,6 +55,16 @@ std::string formatObject(Object *object, bool nested, std::set<Object *> &active
         return jsonRender(*object->json);
     if (object->kind == Object::DesktopWindow)
         return "desktop.window(" + jsonQuote(object->desktop->title) + ")";
+    if (object->kind == Object::Closure)
+        return "<function>";
+    if (object->kind == Object::Weak) {
+        auto target = object->link ? object->link->target : nullptr;
+        if (!target)
+            return "weak(null)";
+        if (active.count(target))
+            return "weak(<cycle>)";
+        return "weak(" + formatObject(target, true, active, depth + 1) + ")";
+    }
     if (object->kind == Object::ErrorValue)
         return nested ? readableType(object->errorType) + "(" + jsonQuote(object->text) + ")"
                       : object->text;
@@ -319,10 +329,9 @@ Slot castValue(Frame *frame, const Slot &value, const CastType &source, const Ca
             auto convertedValue =
                 castValue(frame, item, valueType, target.parts[1], false, depth + 1);
             auto index = findKey(output, convertedKey.integer, convertedKey.object);
-            if (index < 0) {
-                output->keys.push_back(convertedKey);
-                output->slots.push_back(convertedValue);
-            } else
+            if (index < 0)
+                appendKey(output, convertedKey, convertedValue);
+            else
                 output->slots[static_cast<size_t>(index)] = convertedValue;
         };
         if (source.kind == CastType::Map) {
@@ -514,6 +523,48 @@ Object *fw_tuple_range(Frame *frame, int64_t begin, int64_t end, int64_t inclusi
         for (size_t i = 0; i < out->slots.size(); ++i)
             out->slots[i].integer = begin + static_cast<int64_t>(i);
         return out;
+    });
+}
+}
+// Weak references and closures.
+extern "C" {
+Object *fw_weak_new(Frame *frame, Object *target) {
+    return nativeBoundary([&] {
+        auto weak = managed(frame, Object::Weak);
+        if (target) {
+            if (!target->weakCell) {
+                target->weakCell = std::make_shared<WeakCell>();
+                target->weakCell->target = target;
+            }
+            weak->link = target->weakCell;
+        }
+        return weak;
+    });
+}
+Object *fw_weak_get(Frame *frame, Object *weak) {
+    return nativeBoundary([&]() -> Object * {
+        if (!weak)
+            fail("weak reference is null", "CastError");
+        auto target = weak->link ? weak->link->target : nullptr;
+        if (!target)
+            return nullptr;
+        retain(target);
+        return own(frame, target);
+    });
+}
+Object *fw_closure_new(Frame *frame, void *code, int64_t captures) {
+    return nativeBoundary([&] {
+        auto closure = managed(frame, Object::Closure);
+        closure->code = code;
+        closure->slots.resize(static_cast<size_t>(captures));
+        return closure;
+    });
+}
+void *fw_closure_code(Object *closure) {
+    return nativeBoundary([&]() -> void * {
+        if (!closure || closure->kind != Object::Closure)
+            fail("called a null function value", "RuntimeError");
+        return closure->code;
     });
 }
 }

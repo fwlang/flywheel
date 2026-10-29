@@ -21,6 +21,7 @@
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -68,6 +69,16 @@ struct Slot {
     }
 };
 std::atomic<int64_t> liveObjects{0};
+// Shared by an object and its weak references; cleared when the object is destroyed.
+struct WeakCell {
+    Object *target = nullptr;
+};
+// Hash lookup for map keys. Positions index the insertion-ordered keys/slots vectors.
+struct MapIndex {
+    std::unordered_map<int64_t, size_t> integers;
+    std::unordered_map<std::string, size_t> strings;
+    size_t count = 0;
+};
 struct DesktopState {
     std::string title;
     int width = 960, height = 640;
@@ -85,7 +96,9 @@ struct Object {
         ErrorValue,
         Tuple,
         Result,
-        DesktopWindow
+        DesktopWindow,
+        Weak,
+        Closure
     } kind;
     std::unique_ptr<DesktopState> desktop;
     std::string text;
@@ -96,10 +109,16 @@ struct Object {
     std::string errorType, typeName;
     std::vector<std::string> fieldNames;
     std::vector<std::pair<std::string, std::string>> attributes;
+    std::unique_ptr<MapIndex> index;
+    // weakCell belongs to a weak reference's target; link is the cell a Weak object reads.
+    std::shared_ptr<WeakCell> weakCell, link;
+    void *code = nullptr; // Closure entry point; captured values live in slots.
     explicit Object(Kind k) : kind(k) {
         ++liveObjects;
     }
     ~Object() {
+        if (weakCell)
+            weakCell->target = nullptr;
         --liveObjects;
     }
 };
@@ -1220,256 +1239,7 @@ std::string httpPath(const std::string &path) {
     }
     return out;
 }
-using HttpHandler = Object *(*)();
-struct SocketOwner {
-    Socket value = invalidSocket;
-    explicit SocketOwner(Socket socket) : value(socket) {}
-    SocketOwner(SocketOwner &&other) noexcept : value(std::exchange(other.value, invalidSocket)) {}
-    SocketOwner(const SocketOwner &) = delete;
-    ~SocketOwner() {
-        if (value != invalidSocket)
-            closeSocket(value);
-    }
-};
-struct Network {
-    Network() {
-#ifdef _WIN32
-        WSADATA data;
-        if (WSAStartup(MAKEWORD(2, 2), &data) != 0)
-            fail("socket initialization failed");
-#endif
-    }
-    ~Network() {
-#ifdef _WIN32
-        WSACleanup();
-#endif
-    }
-};
-struct HttpServer {
-    SocketOwner socket;
-    std::string route;
-    HttpHandler handler;
-    HttpServer(SocketOwner &&socket, std::string route, HttpHandler handler)
-        : socket(std::move(socket)), route(std::move(route)), handler(handler) {}
-};
-struct HttpRuntime {
-    Network network;
-    std::vector<std::unique_ptr<HttpServer>> servers;
-    bool running = false;
-};
-std::unique_ptr<HttpRuntime> &httpRuntime() {
-    static std::unique_ptr<HttpRuntime> state;
-    return state;
-}
-bool serveRequest(HttpServer &server) {
-    SocketOwner connection(accept(server.socket.value, nullptr, nullptr));
-    Socket client = connection.value;
-    if (client == invalidSocket)
-        return true;
-#ifdef _WIN32
-    DWORD timeout = 5000;
-    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char *>(&timeout),
-               sizeof(timeout));
-    setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char *>(&timeout),
-               sizeof(timeout));
-#else
-    timeval timeout{5, 0};
-    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-#ifdef SO_NOSIGPIPE
-    int noSignal = 1;
-    setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, sizeof(noSignal));
-#endif
-#endif
-    std::string request;
-    char buffer[4096];
-    while (request.find("\r\n\r\n") == std::string::npos && request.size() < 16384) {
-        int n = static_cast<int>(recv(client, buffer, sizeof(buffer), 0));
-        if (n <= 0)
-            break;
-        request.append(buffer, static_cast<size_t>(n));
-    }
-    std::string status = "400 Bad Request", body = "Bad Request",
-                content = "text/plain; charset=utf-8";
-    auto first = request.find(' '),
-         second = first == std::string::npos ? first : request.find(' ', first + 1);
-    if (request.find("\r\n\r\n") != std::string::npos && first != std::string::npos &&
-        second != std::string::npos) {
-        auto method = request.substr(0, first);
-        auto path = request.substr(first + 1, second - first - 1);
-        auto query = path.find('?');
-        if (query != std::string::npos)
-            path.resize(query);
-        path = httpPath(path);
-        if (method != "GET") {
-            status = "405 Method Not Allowed";
-            body = "Method Not Allowed";
-        } else if (path != server.route) {
-            status = "404 Not Found";
-            body = "Not Found";
-        } else {
-            Object *result = server.handler();
-            if (pendingError.value) {
-                return false;
-            }
-            struct ResultOwner {
-                Object *value;
-                ~ResultOwner() {
-                    release(value);
-                }
-            } owned{result};
-            body.clear();
-            render(result, body);
-            status = "200 OK";
-            content = "text/html; charset=utf-8";
-        }
-    }
-    std::string response = "HTTP/1.1 " + status + "\r\nContent-Type: " + content +
-                           "\r\nContent-Length: " + std::to_string(body.size()) +
-                           "\r\nConnection: close\r\n\r\n" + body;
-    size_t sent = 0;
-    while (sent < response.size()) {
-#ifdef MSG_NOSIGNAL
-        constexpr int flags = MSG_NOSIGNAL;
-#else
-        constexpr int flags = 0;
-#endif
-        int n = static_cast<int>(
-            send(client, response.data() + sent,
-                 static_cast<int>(std::min<size_t>(response.size() - sent, 65536)), flags));
-        if (n <= 0)
-            break;
-        sent += static_cast<size_t>(n);
-    }
-
-    return true;
-}
 } // namespace
-extern "C" void fw_web_shutdown() {
-    if (auto &state = httpRuntime())
-        state->servers.clear();
-}
-extern "C" Object *fw_serve(Frame *frame, Object *route, HttpHandler handler, int64_t port) {
-    try {
-        if (port < 0 || port > 65535)
-            fail("HTTP port must be in 0..65535");
-        if (route->text.empty() || route->text[0] != '/')
-            fail("HTTP route must start with '/'");
-        auto &storage = httpRuntime();
-        if (!storage)
-            storage = std::make_unique<HttpRuntime>();
-        auto &state = *storage;
-        if (state.servers.size() >= FD_SETSIZE)
-            fail("too many HTTP listeners");
-        SocketOwner socketOwner(socket(AF_INET, SOCK_STREAM, 0));
-        auto listener = socketOwner.value;
-        if (listener == invalidSocket)
-            fail("cannot create HTTP socket");
-#ifndef _WIN32
-        if (listener >= FD_SETSIZE)
-            fail("HTTP socket exceeds select descriptor limit");
-#endif
-        int reuse = 1;
-#ifdef _WIN32
-        setsockopt(listener, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
-                   reinterpret_cast<const char *>(&reuse), sizeof(reuse));
-#else
-        setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&reuse),
-                   sizeof(reuse));
-#endif
-        sockaddr_in address{};
-        address.sin_family = AF_INET;
-        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        address.sin_port = htons(static_cast<uint16_t>(port));
-        if (bind(listener, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0)
-            fail("cannot bind HTTP port " + std::to_string(port));
-        if (listen(listener, 16) != 0)
-            fail("cannot listen on HTTP socket");
-#ifdef _WIN32
-        int length = sizeof(address);
-#else
-        socklen_t length = sizeof(address);
-#endif
-        if (getsockname(listener, reinterpret_cast<sockaddr *>(&address), &length) != 0)
-            fail("cannot determine HTTP address");
-        auto encodedPath = httpPath(route->text);
-        auto server = std::make_unique<HttpServer>(std::move(socketOwner), encodedPath, handler);
-        auto url = string(frame, "http://127.0.0.1:" + std::to_string(ntohs(address.sin_port)) +
-                                     encodedPath);
-        state.servers.push_back(std::move(server));
-        return url;
-    } catch (const NativeFailure &e) {
-        recordFailure(e.type, e.message);
-        return nullptr;
-    } catch (const std::exception &e) {
-        recordFailure("RuntimeError", e.what());
-        return nullptr;
-    }
-}
-extern "C" void fw_web_wait() {
-    bool entered = false;
-    try {
-        auto &storage = httpRuntime();
-        if (!storage || storage->servers.empty())
-            return;
-        auto &state = *storage;
-        if (state.running)
-            fail("web.wait cannot be called from an HTTP handler");
-        struct Running {
-            bool &value;
-            explicit Running(bool &value) : value(value) {
-                value = true;
-            }
-            ~Running() {
-                value = false;
-            }
-        } running(state.running);
-        entered = true;
-        std::cout.flush();
-        while (!state.servers.empty()) {
-            fd_set readable;
-            FD_ZERO(&readable);
-            Socket maximum = 0;
-            for (auto &server : state.servers) {
-                FD_SET(server->socket.value, &readable);
-                if (server->socket.value > maximum)
-                    maximum = server->socket.value;
-            }
-#ifdef _WIN32
-            int ready = select(0, &readable, nullptr, nullptr, nullptr);
-#else
-            int ready = select(maximum + 1, &readable, nullptr, nullptr, nullptr);
-#endif
-            if (ready < 0) {
-#ifdef _WIN32
-                if (WSAGetLastError() == WSAEINTR)
-                    continue;
-#else
-                if (errno == EINTR)
-                    continue;
-#endif
-                fail("HTTP listener wait failed");
-            }
-            std::vector<HttpServer *> selected;
-            for (auto &server : state.servers)
-                if (FD_ISSET(server->socket.value, &readable))
-                    selected.push_back(server.get());
-            for (auto server : selected)
-                if (!serveRequest(*server)) {
-                    fw_web_shutdown();
-                    return;
-                }
-        }
-    } catch (const NativeFailure &e) {
-        if (entered)
-            fw_web_shutdown();
-        recordFailure(e.type, e.message);
-    } catch (const std::exception &e) {
-        if (entered)
-            fw_web_shutdown();
-        recordFailure("RuntimeError", e.what());
-    }
-}
 extern "C" {
 int64_t fw_parse_int(Object *s) {
     try {
@@ -1518,13 +1288,49 @@ double fw_parse_real(Object *s) {
 }
 }
 namespace {
-int64_t findKey(Object *map, int64_t integer, Object *object) {
-    for (size_t i = 0; i < map->keys.size(); ++i) {
-        auto &key = map->keys[i];
-        if (map->objectKeys ? fw_equal(key.object, object) : key.integer == integer)
-            return static_cast<int64_t>(i);
+bool textKey(const Slot &key) {
+    return key.object && key.object->kind == Object::String;
+}
+void indexKey(Object *map, size_t position) {
+    auto &key = map->keys[position];
+    if (!map->objectKeys)
+        map->index->integers[key.integer] = position;
+    else if (textKey(key))
+        map->index->strings[key.object->text] = position;
+}
+// The index is rebuilt whenever its count no longer matches the key vector.
+MapIndex &mapIndex(Object *map) {
+    if (!map->index || map->index->count != map->keys.size()) {
+        map->index = std::make_unique<MapIndex>();
+        for (size_t i = 0; i < map->keys.size(); ++i)
+            indexKey(map, i);
+        map->index->count = map->keys.size();
     }
+    return *map->index;
+}
+int64_t findKey(Object *map, int64_t integer, Object *object) {
+    auto &index = mapIndex(map);
+    if (!map->objectKeys) {
+        auto it = index.integers.find(integer);
+        return it == index.integers.end() ? -1 : static_cast<int64_t>(it->second);
+    }
+    if (object && object->kind == Object::String) {
+        auto it = index.strings.find(object->text);
+        return it == index.strings.end() ? -1 : static_cast<int64_t>(it->second);
+    }
+    for (size_t i = 0; i < map->keys.size(); ++i)
+        if (fw_equal(map->keys[i].object, object))
+            return static_cast<int64_t>(i);
     return -1;
+}
+size_t appendKey(Object *map, Slot key, Slot value) {
+    mapIndex(map);
+    map->keys.push_back(std::move(key));
+    map->slots.push_back(std::move(value));
+    auto position = map->keys.size() - 1;
+    indexKey(map, position);
+    map->index->count = map->keys.size();
+    return position;
 }
 } // namespace
 extern "C" {
@@ -1557,9 +1363,7 @@ int64_t fw_map_index(Object *p, int64_t integer, Object *object, int64_t insert)
             key.kind = Slot::Reference;
         } else
             key.integer = integer;
-        p->keys.push_back(std::move(key));
-        p->slots.emplace_back();
-        return static_cast<int64_t>(p->slots.size() - 1);
+        return static_cast<int64_t>(appendKey(p, std::move(key), Slot{}));
     } catch (const NativeFailure &e) {
         recordFailure(e.type, e.message);
         return {};
@@ -1584,8 +1388,17 @@ int64_t fw_map_remove(Object *p, int64_t integer, Object *object) {
         auto i = findKey(p, integer, object);
         if (i < 0)
             return 0;
+        auto &index = mapIndex(p);
+        if (p->objectKeys) {
+            if (textKey(p->keys[static_cast<size_t>(i)]))
+                index.strings.erase(p->keys[static_cast<size_t>(i)].object->text);
+        } else
+            index.integers.erase(p->keys[static_cast<size_t>(i)].integer);
         p->keys.erase(p->keys.begin() + i);
         p->slots.erase(p->slots.begin() + i);
+        for (auto j = static_cast<size_t>(i); j < p->keys.size(); ++j)
+            indexKey(p, j);
+        index.count = p->keys.size();
         return 1;
     } catch (const NativeFailure &e) {
         recordFailure(e.type, e.message);
@@ -1637,6 +1450,7 @@ void fw_collection_clear(Object *p) {
     try {
         p->slots.clear();
         p->keys.clear();
+        p->index.reset();
     } catch (const NativeFailure &e) {
         recordFailure(e.type, e.message);
         return;
@@ -1778,3 +1592,5 @@ extern "C" Object *fw_try_read(Frame *frame, Object *path) {
 #include "process.inc"
 
 #include "desktop.inc"
+
+#include "web.inc"

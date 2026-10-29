@@ -504,8 +504,7 @@ Object *fw_dom_attributes(Frame *frame, Object *root) {
         out->objectKeys = true;
         out->keyKind = Slot::Reference;
         for (auto &[key, value] : root->attributes) {
-            out->keys.push_back(reference(string(frame, key)));
-            out->slots.push_back(reference(string(frame, value)));
+            appendKey(out, reference(string(frame, key)), reference(string(frame, value)));
         }
         return out;
     });

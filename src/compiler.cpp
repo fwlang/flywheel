@@ -40,6 +40,34 @@ std::string displayName(const std::string &text) {
         }
         result += text[i++];
     }
+    // function<R,A,B> is spelled function(A, B) returns R in source and diagnostics.
+    for (auto at = result.find("function<"); at != std::string::npos;
+         at = result.find("function<", at + 1)) {
+        size_t end = at + 9;
+        int depth = 1;
+        std::vector<std::string> parts;
+        size_t begin = end;
+        for (; end < result.size() && depth; ++end) {
+            char c = result[end];
+            if (c == '<' || c == '[' || c == '(')
+                ++depth;
+            else if (c == '>' || c == ']' || c == ')')
+                --depth;
+            if ((c == ',' && depth == 1) || depth == 0) {
+                parts.push_back(result.substr(begin, end - begin));
+                begin = end + 1;
+            }
+        }
+        if (depth || parts.empty())
+            break;
+        std::string spelled = "function(";
+        for (size_t i = 1; i < parts.size(); ++i)
+            spelled += (i > 1 ? ", " : "") + parts[i];
+        spelled += ")";
+        if (parts[0] != "void")
+            spelled += " returns " + parts[0];
+        result.replace(at, end - at, spelled);
+    }
     return result;
 }
 std::vector<std::string> typeParts(const std::string &text) {
@@ -48,9 +76,9 @@ std::vector<std::string> typeParts(const std::string &text) {
     size_t start = 0;
     for (size_t i = 0; i < text.size(); ++i) {
         char c = text[i];
-        if (c == '<' || c == '[')
+        if (c == '<' || c == '[' || c == '(')
             ++depth;
-        else if (c == '>' || c == ']')
+        else if (c == '>' || c == ']' || c == ')')
             --depth;
         else if (c == ',' && depth == 0) {
             result.push_back(text.substr(start, i - start));
@@ -107,6 +135,13 @@ struct Ty {
     bool result() const {
         return name.rfind("Result<", 0) == 0 && name.back() == '>';
     }
+    // function<R,A...>: an ARC-managed closure taking A... and returning R.
+    bool function() const {
+        return name.rfind("function<", 0) == 0 && name.back() == '>';
+    }
+    bool weak() const {
+        return name.rfind("weak<", 0) == 0 && name.back() == '>';
+    }
     std::vector<Ty> parts() const {
         size_t first = tuple() ? 1 : name.find('<') + 1;
         std::vector<Ty> r;
@@ -139,6 +174,16 @@ struct Var {
     Ty type;
     bool constant = false;
     llvm::Value *initialized = nullptr;
+    bool captured = false;
+};
+// A lambda being compiled. Enclosing locals it reads are copied into its environment.
+struct LambdaContext {
+    std::vector<std::map<std::string, Var>> *outerScopes = nullptr;
+    llvm::Function *function = nullptr;
+    llvm::Value *frame = nullptr, *env = nullptr;
+    llvm::Instruction *initPoint = nullptr;
+    std::vector<std::pair<std::string, Var>> captures;
+    std::map<std::string, Var> captured;
 };
 struct Signature {
     Function *ast = nullptr;
@@ -189,6 +234,86 @@ class Compiler {
         size_t depth;
     };
     std::vector<ProtectedValue> protectedValues;
+    std::vector<LambdaContext *> lambdaStack;
+    std::map<std::string, llvm::Function *> trampolines;
+    uint64_t lambdaCount = 0;
+    // Per-function code generation state, saved while another function body is emitted.
+    struct FunctionState {
+        llvm::IRBuilderBase::InsertPoint ip;
+        bool borrowed, infer, top;
+        llvm::Function *current;
+        llvm::Value *frame;
+        std::vector<std::map<std::string, Val>> attrs;
+        std::vector<std::string> componentNames;
+        std::vector<std::map<std::string, Var>> scopes;
+        std::vector<Handler> handlers;
+        std::vector<Finalizer> finalizers;
+        std::vector<size_t> loopScopes;
+        llvm::BasicBlock *failure;
+        std::vector<ProtectedValue> protectedValues;
+        std::vector<std::pair<llvm::BasicBlock *, llvm::BasicBlock *>> loops;
+        std::string owner;
+        Ty returnType;
+        std::vector<Ty> returns;
+        Location location;
+        std::vector<LambdaContext *> lambdaStack;
+    };
+    FunctionState saveFunction() {
+        FunctionState s{b.saveIP(),
+                        borrowed,
+                        infer,
+                        top,
+                        current,
+                        frame,
+                        std::move(attrs),
+                        std::move(componentNames),
+                        std::move(scopes),
+                        std::move(handlers),
+                        std::move(finalizers),
+                        std::move(loopScopes),
+                        failure,
+                        std::move(protectedValues),
+                        std::move(loops),
+                        owner,
+                        returnType,
+                        std::move(returns),
+                        location,
+                        std::move(lambdaStack)};
+        borrowed = false;
+        attrs.clear();
+        componentNames.clear();
+        scopes.clear();
+        handlers.clear();
+        finalizers.clear();
+        loopScopes.clear();
+        protectedValues.clear();
+        loops.clear();
+        returns.clear();
+        lambdaStack.clear();
+        return s;
+    }
+    void restoreFunction(FunctionState &s) {
+        borrowed = s.borrowed;
+        infer = s.infer;
+        top = s.top;
+        current = s.current;
+        frame = s.frame;
+        attrs = std::move(s.attrs);
+        componentNames = std::move(s.componentNames);
+        scopes = std::move(s.scopes);
+        handlers = std::move(s.handlers);
+        finalizers = std::move(s.finalizers);
+        loopScopes = std::move(s.loopScopes);
+        failure = s.failure;
+        protectedValues = std::move(s.protectedValues);
+        loops = std::move(s.loops);
+        owner = s.owner;
+        returnType = s.returnType;
+        returns = std::move(s.returns);
+        location = s.location;
+        lambdaStack = std::move(s.lambdaStack);
+        b.restoreIP(s.ip);
+    }
     void releaseProtected(size_t depth) {
         for (auto &value : protectedValues)
             if (value.depth >= depth)
@@ -229,6 +354,26 @@ class Compiler {
             return Ty{inner.name + "?"};
         }
         Ty t{name};
+        if (t.function()) {
+            auto parts = t.parts();
+            std::string r = "function<" + type(parts[0].name).name;
+            for (size_t i = 1; i < parts.size(); ++i) {
+                auto part = type(parts[i].name);
+                if (part.name == "void")
+                    error("function parameters cannot be void");
+                r += "," + part.name;
+            }
+            return Ty{r + ">"};
+        }
+        if (t.weak()) {
+            auto parts = t.parts();
+            if (parts.size() != 1)
+                error("weak<T> requires one type");
+            auto target = type(parts[0].name);
+            if (!target.object() || target.nullable() || target.weak())
+                error("weak<T> requires a non-null reference type such as a class or element");
+            return Ty{"weak<" + target.name + ">"};
+        }
         if (t.tuple() || t.homogeneousTuple() || t.map() || t.result()) {
             auto parts = t.parts();
             if ((t.map() || t.result()) && parts.size() != 2)
@@ -300,6 +445,30 @@ class Compiler {
                 return true;
         }
         return false;
+    }
+    // web.request and web.response are ordinary classes; runtime/web.inc relies on this
+    // field order when it builds requests and reads responses.
+    void webClasses() {
+        auto program = Parser(lex(R"(class Request
+    string method = "GET"
+    string path = "/"
+    map<string, string> query = {}
+    map<string, string> headers = {}
+    string body = ""
+    map<string, string> params = {}
+    map<string, string> form = {}
+end
+class Response
+    int status = 200
+    string body = ""
+    map<string, string> headers = {}
+end
+)"))
+                           .parse();
+        program.classes[0].name = "web.request";
+        program.classes[1].name = "web.response";
+        for (auto &c : program.classes)
+            p.classes.push_back(std::move(c));
     }
     void emitFailure() {
         auto saved = b.saveIP();
@@ -378,7 +547,7 @@ class Compiler {
                   "the assignment right-hand side");
         if (explicit_ && x.t.nullable() && x.t.name == to.name + "?") {
             guard(b.CreateICmpNE(x.v, llvm::ConstantPointerNull::get(b.getPtrTy())),
-                  "cannot cast null to " + to.name, "CastError");
+                  "cannot cast null to " + displayName(to.name), "CastError");
             return {x.v, to};
         }
         if (explicit_ && x.t.name == "bool" && to.numeric())
@@ -391,6 +560,11 @@ class Compiler {
             return {x.v, to};
         if (x.t.name == "fragment" && to.name == "element")
             return {x.v, to};
+        if (x.t.name.rfind("fn:", 0) == 0 && to.function())
+            return functionValue(x.t.name.substr(3), to);
+        if (to.weak() && (x.t.name == "null" || x.t.name == to.parts()[0].name ||
+                          x.t.name == to.parts()[0].name + "?"))
+            return {objectCall("fw_weak_new", {frame, x.v}), to};
         if (x.t.numeric() && to.numeric()) {
             bool fits = false;
             if (auto ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(x.v); ci && to.integer()) {
@@ -439,6 +613,72 @@ class Compiler {
         }
         error("cannot convert " + x.t.name + " to " + to.name);
     }
+    // Nullable references are unwrapped for member access; null raises CastError.
+    Val unwrap(Val x) {
+        if (!x.t.nullable() || x.t.name == "null")
+            return x;
+        Ty base{x.t.name.substr(0, x.t.name.size() - 1)};
+        if (classes.count(base.name) || base.name == "element" || base.name == "fragment" ||
+            base.name == "desktop.window")
+            return convert(x, base, true);
+        return x;
+    }
+    // A named function used as a function value: a capture-free closure around a trampoline.
+    Val functionValue(const std::string &name, Ty to) {
+        auto &sig = signature(name);
+        auto parts = to.parts();
+        if (!sig.ast->owner.empty())
+            error("methods cannot be used as function values yet; wrap the call in a lambda");
+        bool same = sig.ast->params.size() + 1 == parts.size() && sig.result == parts[0];
+        for (size_t i = 0; same && i < sig.ast->params.size(); ++i)
+            same = type(sig.ast->params[i].type) == parts[i + 1];
+        if (!same)
+            error("function '" + name + "' does not match type " + to.name);
+        auto &code = trampolines[name];
+        if (!code) {
+            std::vector<llvm::Type *> types{b.getPtrTy()};
+            for (size_t i = 1; i < parts.size(); ++i)
+                types.push_back(ll(parts[i]));
+            code = llvm::Function::Create(llvm::FunctionType::get(ll(parts[0]), types, false),
+                                          llvm::GlobalValue::InternalLinkage, "fly.ref." + name,
+                                          module);
+            llvm::IRBuilder<> body(llvm::BasicBlock::Create(ctx, "entry", code));
+            std::vector<llvm::Value *> args;
+            for (size_t i = 1; i < parts.size(); ++i)
+                args.push_back(code->getArg(static_cast<unsigned>(i)));
+            auto result = body.CreateCall(sig.function, args);
+            if (parts[0].name == "void")
+                body.CreateRetVoid();
+            else
+                body.CreateRet(result);
+        }
+        return {objectCall("fw_closure_new", {frame, code, i64(0)}), to};
+    }
+    Val callClosure(Val callee, std::vector<Expr *> arguments) {
+        auto parts = callee.t.parts();
+        if (arguments.size() + 1 != parts.size())
+            error("function value expects " + std::to_string(parts.size() - 1) + " argument(s)");
+        std::vector<Val> args;
+        for (size_t i = 0; i < arguments.size(); ++i)
+            args.push_back(convert(value(*arguments[i], parts[i + 1]), parts[i + 1]));
+        return callClosure(callee, args);
+    }
+    Val callClosure(Val callee, std::vector<Val> args) {
+        auto parts = callee.t.parts();
+        std::vector<llvm::Type *> types{b.getPtrTy()};
+        std::vector<llvm::Value *> values{callee.v};
+        for (size_t i = 0; i < args.size(); ++i) {
+            types.push_back(ll(parts[i + 1]));
+            values.push_back(convert(args[i], parts[i + 1]).v);
+        }
+        auto code = call("fw_closure_code", b.getPtrTy(), {callee.v});
+        auto result =
+            b.CreateCall(llvm::FunctionType::get(ll(parts[0]), types, false), code, values);
+        checkError();
+        if (parts[0].object())
+            objectCall("fw_adopt", {frame, result});
+        return {result, parts[0]};
+    }
     Val stringify(Val x) {
         if (x.t.name == "string")
             return x;
@@ -475,8 +715,62 @@ class Compiler {
             if (v != i->end())
                 return &v->second;
         }
+        if (!lambdaStack.empty())
+            if (auto v = capture(lambdaStack.size() - 1, name))
+                return v;
         auto g = globals.find(name);
         return g == globals.end() ? nullptr : &g->second;
+    }
+    // Finds an enclosing local for lambda `level` and copies it into the environment.
+    Var *capture(size_t level, const std::string &name) {
+        auto &context = *lambdaStack[level];
+        if (auto it = context.captured.find(name); it != context.captured.end())
+            return &it->second;
+        std::optional<Var> outer;
+        for (auto i = context.outerScopes->rbegin(); i != context.outerScopes->rend(); ++i)
+            if (auto v = i->find(name); v != i->end()) {
+                outer = v->second;
+                break;
+            }
+        if (!outer && level > 0)
+            if (auto v = capture(level - 1, name))
+                outer = *v;
+        if (!outer)
+            return nullptr;
+        if (outer->type.classReference() || outer->type.name.rfind("fn:", 0) == 0)
+            error("lambdas cannot capture '" + name +
+                  "' because it is a constructor or function reference; use the name directly");
+        auto index = context.captures.size();
+        context.captures.emplace_back(name, *outer);
+        auto savedCurrent = current;
+        auto savedFrame = frame;
+        current = context.function;
+        frame = context.frame;
+        auto address = allocate(outer->type, name);
+        current = savedCurrent;
+        frame = savedFrame;
+        llvm::IRBuilder<> init(context.initPoint);
+        auto get = [&](const std::string &function, llvm::Type *result) {
+            return init.CreateCall(
+                module.getOrInsertFunction(
+                    function,
+                    llvm::FunctionType::get(result, {b.getPtrTy(), b.getInt64Ty()}, false)),
+                {context.env, i64(static_cast<int64_t>(index))});
+        };
+        auto t = outer->type;
+        if (t.object())
+            init.CreateCall(module.getOrInsertFunction(
+                                "fw_store", llvm::FunctionType::get(
+                                                b.getVoidTy(), {b.getPtrTy(), b.getPtrTy()}, false)),
+                            {address, get("fw_get_object", b.getPtrTy())});
+        else if (t.real())
+            init.CreateStore(init.CreateFPCast(get("fw_get_real", b.getDoubleTy()), ll(t)), address);
+        else
+            init.CreateStore(init.CreateIntCast(get("fw_get_int", b.getInt64Ty()), ll(t), false),
+                             address);
+        Var local{address, t, true};
+        local.captured = true;
+        return &(context.captured[name] = local);
     }
     llvm::Value *allocate(Ty t, const std::string &name) {
         llvm::IRBuilder<> entry(&current->getEntryBlock(), current->getEntryBlock().begin());
@@ -707,14 +1001,17 @@ class Compiler {
         auto saved = std::move(scopes);
         auto savedAttrs = std::move(attrs);
         auto savedNames = std::move(componentNames);
+        auto savedLambdas = std::move(lambdaStack);
         scopes.clear();
         scopes.emplace_back();
         attrs.clear();
         componentNames.clear();
+        lambdaStack.clear();
         auto result = value(e, expected);
         scopes = std::move(saved);
         attrs = std::move(savedAttrs);
         componentNames = std::move(savedNames);
+        lambdaStack = std::move(savedLambdas);
         return result;
     }
     llvm::Value *mapIndex(Val map, Val key, bool insert) {
@@ -813,7 +1110,7 @@ class Compiler {
         return !b.GetInsertBlock()->empty() && b.GetInsertBlock()->back().isTerminator();
     }
     bool borrowable(Expr &e) {
-        if (e.kind == "element" && p.components.count(e.text))
+        if ((e.kind == "element" && p.components.count(e.text)) || e.kind == "lambda")
             return false;
         if (e.outer && !e.grouped && (e.kind == "name" || e.kind == "member")) {
             auto name = callable(e);
@@ -894,6 +1191,35 @@ class Compiler {
         return sig;
     }
     void buildFunction(Signature &sig, bool inference);
+    Ty inferredResult(bool fallsThrough) {
+        Ty result;
+        for (auto t : returns) {
+            if (result.name == "void" && t.name != "void")
+                result = t;
+            else if (t != result) {
+                if (widening(t, result))
+                    continue;
+                if (widening(result, t))
+                    result = t;
+                else
+                    error("inconsistent inferred return types");
+            }
+        }
+        if (result.name != "void") {
+            if (fallsThrough)
+                error("inferred non-void function must return on all paths");
+            for (auto t : returns)
+                if (t.name == "void")
+                    error("cannot mix value and bare returns");
+        }
+        if (result.name == "null")
+            error("return null requires an explicit nullable return type");
+        return result;
+    }
+    Val lambda(Expr &e, Ty expected);
+    Ty lambdaBody(Function &f, const std::vector<Ty> &params, Ty result, bool inference,
+                  LambdaContext &context);
+    Val sequenceMethod(Val sequence, const std::string &method, Expr &call);
     void declareFunction(Function &f) {
         std::string key = f.owner.empty() ? f.name : f.owner + "." + f.name;
         if (functions.count(key) || (!f.owner.empty() && f.name == "init"))
@@ -932,6 +1258,8 @@ class Compiler {
         module.setTargetTriple(llvm::Triple(triple));
 
         module.setDataLayout(machine->createDataLayout());
+        if (usesWeb())
+            webClasses();
         for (auto &c : p.classes) {
             location = c.loc;
             if (classes.count(c.name))
@@ -1014,16 +1342,29 @@ class Compiler {
                 throw std::runtime_error(ec.message());
             module.print(output, nullptr);
         }
-        if (!opts.object.empty()) {
-            std::error_code ec;
-            llvm::raw_fd_ostream output(opts.object, ec, llvm::sys::fs::OF_None);
-            if (ec)
-                throw std::runtime_error(ec.message());
+        auto emit = [&](llvm::raw_pwrite_stream &output) {
+            // -O0 uses the fast instruction selector and skips machine-level optimization.
+            machine->setOptLevel(opts.optimization == 0   ? llvm::CodeGenOptLevel::None
+                                 : opts.optimization == 1 ? llvm::CodeGenOptLevel::Less
+                                 : opts.optimization == 2 ? llvm::CodeGenOptLevel::Default
+                                                          : llvm::CodeGenOptLevel::Aggressive);
             llvm::legacy::PassManager pm;
             if (machine->addPassesToEmitFile(pm, output, nullptr,
                                              llvm::CodeGenFileType::ObjectFile))
                 throw std::runtime_error("target cannot emit object files");
             pm.run(module);
+        };
+        if (opts.objectData) {
+            llvm::SmallVector<char, 0> buffer;
+            llvm::raw_svector_ostream output(buffer);
+            emit(output);
+            opts.objectData->assign(buffer.begin(), buffer.end());
+        } else if (!opts.object.empty()) {
+            std::error_code ec;
+            llvm::raw_fd_ostream output(opts.object, ec, llvm::sys::fs::OF_None);
+            if (ec)
+                throw std::runtime_error(ec.message());
+            emit(output);
             output.flush();
         }
     }
@@ -1212,9 +1553,7 @@ Val Compiler::value(Expr &e, Ty expected) {
         return get(obj, i64(i), type(c->fields[i].type));
     }
     if (e.kind == "member") {
-        auto obj = value(*e.args[0]);
-        if (obj.t.name == "element?" || obj.t.name == "fragment?")
-            obj = convert(obj, Ty{obj.t.name.substr(0, obj.t.name.size() - 1)}, true);
+        auto obj = unwrap(value(*e.args[0]));
         if (obj.t.name == "module:math" && e.text == "PI")
             return {llvm::ConstantFP::get(b.getDoubleTy(), 3.141592653589793), Ty{"double"}};
         if (obj.t.name == "module:desktop")
@@ -1245,6 +1584,8 @@ Val Compiler::value(Expr &e, Ty expected) {
     }
     if (e.kind == "call")
         return invoke(e, expected);
+    if (e.kind == "lambda")
+        return lambda(e, expected);
     if (e.kind == "array") {
         std::vector<Val> items;
         auto parts = expected.tuple() ? expected.parts() : std::vector<Ty>{};
@@ -1663,12 +2004,23 @@ std::optional<Val> Compiler::domCall(const std::string &name, std::vector<Val> a
 }
 Val Compiler::invoke(Expr &e, Ty expected) {
     auto &callee = *e.args[0];
+    std::vector<Expr *> rest;
+    for (size_t i = 1; i < e.args.size(); ++i)
+        rest.push_back(e.args[i].get());
+    if (callee.kind != "name" && callee.kind != "member") {
+        auto function = value(callee);
+        if (!function.t.function())
+            error("value of type " + function.t.name + " is not callable");
+        return callClosure(function, rest);
+    }
     std::string name = callable(callee);
-    if (callee.kind == "name")
+    if (callee.kind == "name") {
         if (auto variable = lookup(name); variable && variable->type.classReference()) {
             load(*variable);
             name = variable->type.name.substr(6);
-        }
+        } else if (variable && variable->type.function())
+            return callClosure(load(*variable), rest);
+    }
     std::vector<Val> args;
     // Receivers are evaluated before arguments. Module references have no runtime evaluation.
     Val receiverValue;
@@ -1722,9 +2074,35 @@ Val Compiler::invoke(Expr &e, Ty expected) {
     if (name.empty() && callee.kind == "member" &&
         !(callee.args[0]->kind == "name" && callee.args[0]->text == "Result")) {
         receiverValue = value(*callee.args[0]);
+        if (receiverValue.t.nullable() &&
+            classes.count(receiverValue.t.name.substr(0, receiverValue.t.name.size() - 1)))
+            receiverValue = unwrap(receiverValue);
         name = receiverValue.t.name + "." + callee.text;
         method = true;
     }
+    if (method && classes.count(receiverValue.t.name) && !functions.count(name)) {
+        auto c = classes.at(receiverValue.t.name);
+        for (size_t i = 0; i < c->fields.size(); ++i)
+            if (c->fields[i].name == callee.text && type(c->fields[i].type).function())
+                return callClosure(get(receiverValue, i64(static_cast<int64_t>(i)),
+                                       type(c->fields[i].type)),
+                                   rest);
+    }
+    if (method && receiverValue.t.weak()) {
+        if (e.args.size() != 1 || (callee.text != "get" && callee.text != "alive"))
+            error("weak references support get() and alive()");
+        auto target = objectCall("fw_weak_get", {frame, receiverValue.v});
+        if (callee.text == "alive")
+            return {b.CreateICmpNE(target, llvm::ConstantPointerNull::get(b.getPtrTy())),
+                    Ty{"bool"}};
+        return {target, Ty{receiverValue.t.parts()[0].name + "?"}};
+    }
+    if (method && receiverValue.t.function() && callee.text == "call")
+        return callClosure(receiverValue, rest);
+    if (method && receiverValue.t.sequence() &&
+        (callee.text == "map" || callee.text == "filter" || callee.text == "each" ||
+         callee.text == "reduce" || callee.text == "any" || callee.text == "all"))
+        return sequenceMethod(receiverValue, callee.text, e);
     if (method && receiverValue.t.classReference())
         error("constructor reference '" + displayName(receiverValue.t.name.substr(6)) +
               "' has no instance methods; construct an instance with () first");
@@ -1880,6 +2258,15 @@ Val Compiler::invoke(Expr &e, Ty expected) {
             error("len expects string or array");
         return {call("fw_length", b.getInt64Ty(), {a.v}), Ty{"i64"}};
     }
+    if (name == "weak") {
+        if (e.args.size() != 2)
+            error("weak expects one reference");
+        auto target = value(*e.args[1]);
+        if (target.t.nullable() && target.t.name != "null")
+            target.t = Ty{target.t.name.substr(0, target.t.name.size() - 1)};
+        auto t = type("weak<" + target.t.name + ">");
+        return {objectCall("fw_weak_new", {frame, target.v}), t};
+    }
     std::string constructor = name.substr(0, name.find('<'));
     if (constructor == "array" || constructor == "tuple" || constructor == "map") {
         if (e.args.size() > 2)
@@ -1924,6 +2311,8 @@ Val Compiler::invoke(Expr &e, Ty expected) {
         (!name.empty() && lookup(name))) {
         if (auto v = lookup(name); v && v->type.name.rfind("fn:", 0) == 0)
             name = v->type.name.substr(3);
+        else if (v)
+            error("value of type " + v->type.name + " is not callable");
         auto &sig = signature(name);
         if (!sig.ast->owner.empty() && !method)
             error("method requires a receiver");
@@ -1996,16 +2385,65 @@ Val Compiler::invoke(Expr &e, Ty expected) {
     }
     if (auto result = domCall(name, args))
         return *result;
-    if (name == "web.serve") {
-        count(3);
-        if (args[1].t.name.rfind("fn:", 0) != 0)
-            error("HTTP handler must be a function reference");
-        auto &sig = signature(args[1].t.name.substr(3));
-        if (!sig.ast->params.empty() || (!sig.ast->owner.empty()) ||
-            (sig.result.name != "element" && sig.result.name != "fragment"))
-            error("HTTP handler must take no arguments and return element or fragment");
-        return {objectCall("fw_serve", {frame, str(0), args[1].v, convert(args[2], Ty{"i64"}).v}),
+    if (name == "web.serve" || name == "web.route") {
+        size_t offset = name == "web.route" ? 1 : 0;
+        count(3 + offset);
+        auto method = offset ? str(0) : literal("GET").v;
+        auto handler = args[offset + 1];
+        if (handler.t.name.rfind("fn:", 0) == 0) {
+            auto &sig = signature(handler.t.name.substr(3));
+            std::string t = "function<" + sig.result.name;
+            for (auto &param : sig.ast->params)
+                t += "," + type(param.type).name;
+            if (sig.ast->owner.empty() && sig.ast->params.size() <= 1)
+                handler = convert(handler, Ty{t + ">"});
+        }
+        auto parts = handler.t.function() ? handler.t.parts() : std::vector<Ty>{};
+        static const std::set<std::string> results = {"element", "fragment", "string",
+                                                      "web.response"};
+        if (parts.empty() || !results.count(parts[0].name) || parts.size() > 2 ||
+            (parts.size() == 2 && parts[1].name != "web.request"))
+            error("HTTP handler must take no arguments or one web.request and return element, "
+                  "fragment, string, or web.response");
+        return {objectCall("fw_serve",
+                           {frame, method, str(offset), handler.v,
+                            i64(static_cast<int64_t>(parts.size() - 1)),
+                            convert(args[offset + 2], Ty{"i64"}).v}),
                 Ty{"string"}};
+    }
+    if (name == "web.static") {
+        count(3);
+        return {objectCall("fw_serve_static", {frame, str(0), str(1), convert(args[2], Ty{"i64"}).v}),
+                Ty{"string"}};
+    }
+    if (name == "web.text" || name == "web.html" || name == "web.json" || name == "web.redirect") {
+        if (args.size() != 1 && args.size() != 2)
+            error(name + " expects a body and an optional status");
+        Val body = args[0];
+        std::string type = name == "web.html" ? "text/html; charset=utf-8"
+                           : name == "web.json" ? "application/json"
+                                                : "text/plain; charset=utf-8";
+        if (name == "web.html" && (body.t.name == "element" || body.t.name == "fragment"))
+            body = stringify(body);
+        else if (name == "web.json" && body.t.name == "json.value")
+            body = {objectCall("fw_json_stringify", {frame, body.v}), Ty{"string"}};
+        body = convert(body, Ty{"string"});
+        auto status = args.size() == 2 ? convert(args[1], Ty{"i64"})
+                                       : Val{i64(name == "web.redirect" ? 302 : 200), Ty{"i64"}};
+        Val headers{objectCall("fw_map_new", {frame, i64(4)}), Ty{"map<string,string>"}};
+        auto header = [&](const std::string &key, Val value) {
+            set(headers, mapIndex(headers, literal(key), true), value);
+        };
+        Val response = newInstance(*classes.at("web.response"));
+        if (name == "web.redirect") {
+            header("location", body);
+            body = literal("");
+        }
+        header("content-type", literal(type));
+        set(response, i64(0), status);
+        set(response, i64(1), body);
+        set(response, i64(2), headers);
+        return response;
     }
     if (name == "web.wait") {
         count(0);
@@ -2247,14 +2685,14 @@ void Compiler::statement(Stmt &s) {
             if (!variable)
                 error("assignment to undeclared identifier '" + s.target->text +
                       "'; use var or an explicit type");
+            if (variable->captured)
+                error("cannot assign to captured variable '" + s.target->text +
+                      "'; lambdas capture copies, so share state through an object or collection");
             if (variable->constant)
                 error("cannot assign to const '" + s.target->text + "'");
             target = variable->type;
         } else if (s.target->kind == "member" || s.target->kind == "inst") {
-            object = s.target->kind == "inst" ? receiver() : value(*s.target->args[0]);
-            if (object.t.name == "element?" || object.t.name == "fragment?")
-                object =
-                    convert(object, Ty{object.t.name.substr(0, object.t.name.size() - 1)}, true);
+            object = unwrap(s.target->kind == "inst" ? receiver() : value(*s.target->args[0]));
             if ((object.t.name == "element" || object.t.name == "fragment") &&
                 (s.target->text == "text_content" || s.target->text == "id" ||
                  s.target->text == "class_name")) {
@@ -2475,39 +2913,12 @@ void Compiler::buildFunction(Signature &sig, bool inference) {
     if (sig.building)
         error("recursive functions require an explicit 'returns T'");
     sig.building = true;
-    auto savedIP = b.saveIP();
-    auto savedBorrowed = borrowed;
-    borrowed = false;
-    auto savedCurrent = current;
-    auto savedFrame = frame;
-    auto savedAttrs = std::move(attrs);
-    auto savedComponentNames = std::move(componentNames);
-    attrs.clear();
-    componentNames.clear();
-    auto savedScopes = std::move(scopes);
-    auto savedHandlers = std::move(handlers);
-    auto savedFinalizers = std::move(finalizers);
-    auto savedLoopScopes = std::move(loopScopes);
-    auto savedFailure = failure;
-    auto savedProtected = std::move(protectedValues);
-    protectedValues.clear();
-    handlers.clear();
-    finalizers.clear();
-    loopScopes.clear();
-    auto savedLoops = std::move(loops);
-    auto savedOwner = owner;
-    auto savedReturn = returnType;
-    auto savedReturns = std::move(returns);
-    bool savedInfer = infer, savedTop = top;
-    auto savedLocation = location;
+    auto saved = saveFunction();
     owner = sig.ast->owner;
     top = false;
     infer = inference;
     returnType = inference ? Ty{"void"} : sig.result;
-    returns.clear();
-    scopes.clear();
     scopes.emplace_back();
-    loops.clear();
     std::vector<llvm::Type *> paramTypes;
     if (!owner.empty())
         paramTypes.push_back(b.getPtrTy());
@@ -2543,28 +2954,7 @@ void Compiler::buildFunction(Signature &sig, bool inference) {
     }
     emitFailure();
     if (inference) {
-        Ty result;
-        for (auto t : returns) {
-            if (result.name == "void" && t.name != "void")
-                result = t;
-            else if (t != result) {
-                if (widening(t, result))
-                    continue;
-                if (widening(result, t))
-                    result = t;
-                else
-                    error("inconsistent inferred return types");
-            }
-        }
-        if (result.name != "void") {
-            if (fallsThrough)
-                error("inferred non-void function must return on all paths");
-            for (auto t : returns)
-                if (t.name == "void")
-                    error("cannot mix value and bare returns");
-        }
-        if (result.name == "null")
-            error("return null requires an explicit nullable return type");
+        auto result = inferredResult(fallsThrough);
         sig.result = result;
         current->eraseFromParent();
         sig.function = llvm::Function::Create(
@@ -2573,26 +2963,173 @@ void Compiler::buildFunction(Signature &sig, bool inference) {
             "fly." + (owner.empty() ? "" : owner + ".") + sig.ast->name, module);
     } else
         sig.done = true;
-    borrowed = savedBorrowed;
-    current = savedCurrent;
-    frame = savedFrame;
-    scopes = std::move(savedScopes);
-    attrs = std::move(savedAttrs);
-    componentNames = std::move(savedComponentNames);
-    loops = std::move(savedLoops);
-    handlers = std::move(savedHandlers);
-    finalizers = std::move(savedFinalizers);
-    loopScopes = std::move(savedLoopScopes);
-    failure = savedFailure;
-    protectedValues = std::move(savedProtected);
-    owner = savedOwner;
-    returnType = savedReturn;
-    returns = std::move(savedReturns);
-    infer = savedInfer;
-    top = savedTop;
-    location = savedLocation;
-    b.restoreIP(savedIP);
+    restoreFunction(saved);
     sig.building = false;
+}
+Val Compiler::sequenceMethod(Val sequence, const std::string &method, Expr &e) {
+    auto item = sequence.t.item();
+    bool reduce = method == "reduce", predicate = method == "filter" || method == "any" ||
+                                                  method == "all";
+    if (e.args.size() != (reduce ? 3u : 2u))
+        error(method + (reduce ? " expects an initial value and a function" : " expects a function"));
+    Val initial = reduce ? value(*e.args[1]) : Val{};
+    Ty hint{predicate          ? "function<bool," + item.name + ">"
+            : method == "each" ? "function<void," + item.name + ">"
+            : reduce ? "function<" + initial.t.name + "," + initial.t.name + "," + item.name + ">"
+                     : ""};
+    auto function = value(*e.args.back(), hint);
+    if (function.t.name.rfind("fn:", 0) == 0) {
+        auto &sig = signature(function.t.name.substr(3));
+        std::string t = "function<" + sig.result.name;
+        for (auto &param : sig.ast->params)
+            t += "," + type(param.type).name;
+        function = convert(function, Ty{t + ">"});
+    }
+    if (!function.t.function() || function.t.parts().size() != (reduce ? 3u : 2u))
+        error(method + " expects a function taking " + (reduce ? "an accumulator and " : "") +
+              "one " + item.name);
+    auto parts = function.t.parts();
+    auto result = parts[0];
+    if (predicate && result.name != "bool")
+        error(method + " expects a function returning bool");
+    if (method == "map" && result.name == "void")
+        error("map expects a function returning a value");
+    Ty accumulator = reduce ? parts[1] : Ty{};
+    if (reduce && result != accumulator)
+        error("reduce function must return its accumulator type");
+    Val out;
+    if (method == "map" || method == "filter")
+        out = {objectCall("fw_new", {frame, i64(0), i64(1)}),
+               Ty{(method == "map" ? result : item).name + "[]"}};
+    Var state{nullptr, reduce ? accumulator : Ty{"bool"}};
+    if (reduce || method == "any" || method == "all") {
+        state.address = allocate(state.type, method);
+        store(state.address, reduce ? convert(initial, accumulator)
+                                    : Val{b.getInt1(method == "all"), Ty{"bool"}});
+    }
+    auto size = call("fw_length", b.getInt64Ty(), {sequence.v});
+    auto index = allocate(Ty{"i64"}, "index");
+    b.CreateStore(i64(0), index);
+    auto cond = llvm::BasicBlock::Create(ctx, method + ".condition", current);
+    auto body = llvm::BasicBlock::Create(ctx, method + ".body", current);
+    auto next = llvm::BasicBlock::Create(ctx, method + ".next", current);
+    auto end = llvm::BasicBlock::Create(ctx, method + ".end", current);
+    b.CreateBr(cond);
+    b.SetInsertPoint(cond);
+    auto i = b.CreateLoad(b.getInt64Ty(), index);
+    b.CreateCondBr(b.CreateICmpSLT(i, size), body, end);
+    b.SetInsertPoint(body);
+    auto x = get(sequence, i, item);
+    auto r = reduce ? callClosure(function, {load(state), x}) : callClosure(function, {x});
+    auto append = [&](Val v) { set(out, call("fw_array_append", b.getInt64Ty(), {out.v}), v); };
+    if (method == "map")
+        append(r);
+    else if (reduce)
+        store(state.address, r);
+    else if (method == "filter") {
+        auto keep = llvm::BasicBlock::Create(ctx, "filter.keep", current);
+        b.CreateCondBr(r.v, keep, next);
+        b.SetInsertPoint(keep);
+        append(x);
+    } else if (predicate) {
+        auto decided = llvm::BasicBlock::Create(ctx, method + ".decided", current);
+        bool any = method == "any";
+        b.CreateCondBr(r.v, any ? decided : next, any ? next : decided);
+        b.SetInsertPoint(decided);
+        b.CreateStore(b.getInt1(any), state.address);
+        b.CreateBr(end);
+    }
+    if (!terminated())
+        b.CreateBr(next);
+    b.SetInsertPoint(next);
+    b.CreateStore(b.CreateAdd(b.CreateLoad(b.getInt64Ty(), index), i64(1)), index);
+    b.CreateBr(cond);
+    b.SetInsertPoint(end);
+    if (method == "map" || method == "filter")
+        return out;
+    if (method == "each")
+        return {};
+    auto final = load(state);
+    if (state.type.object())
+        store(state.address, {llvm::ConstantPointerNull::get(b.getPtrTy()), state.type});
+    return final;
+}
+Val Compiler::lambda(Expr &e, Ty expected) {
+    auto &f = *e.lambda;
+    location = e.loc;
+    std::vector<Ty> params;
+    for (auto &param : f.params) {
+        auto t = type(param.type);
+        if (t.name == "void")
+            error("lambda parameters cannot be void");
+        params.push_back(t);
+    }
+    Ty result;
+    if (!f.result.empty())
+        result = type(f.result);
+    else if (expected.function() && expected.parts().size() == params.size() + 1)
+        result = expected.parts()[0];
+    else {
+        LambdaContext probe;
+        result = lambdaBody(f, params, Ty{}, true, probe);
+    }
+    LambdaContext context;
+    lambdaBody(f, params, result, false, context);
+    std::string name = "function<" + result.name;
+    for (auto &param : params)
+        name += "," + param.name;
+    Val closure{objectCall("fw_closure_new", {frame, context.function,
+                                              i64(static_cast<int64_t>(context.captures.size()))}),
+                Ty{name + ">"}};
+    for (size_t i = 0; i < context.captures.size(); ++i)
+        set(closure, i64(static_cast<int64_t>(i)), load(context.captures[i].second));
+    return closure;
+}
+Ty Compiler::lambdaBody(Function &f, const std::vector<Ty> &params, Ty result, bool inference,
+                        LambdaContext &context) {
+    auto saved = saveFunction();
+    context.outerScopes = &saved.scopes;
+    lambdaStack = saved.lambdaStack;
+    lambdaStack.push_back(&context);
+    top = false;
+    infer = inference;
+    returnType = inference ? Ty{"void"} : result;
+    scopes.emplace_back();
+    std::vector<llvm::Type *> types{b.getPtrTy()};
+    for (auto &param : params)
+        types.push_back(ll(param));
+    current = llvm::Function::Create(
+        llvm::FunctionType::get(inference ? b.getVoidTy() : ll(result), types, false),
+        llvm::GlobalValue::InternalLinkage, "fly.lambda." + std::to_string(lambdaCount++), module);
+    b.SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", current));
+    frame = objectCall("fw_frame", {});
+    auto body = llvm::BasicBlock::Create(ctx, "body", current);
+    context.initPoint = b.CreateBr(body);
+    context.function = current;
+    context.frame = frame;
+    context.env = current->getArg(0);
+    b.SetInsertPoint(body);
+    failure = llvm::BasicBlock::Create(ctx, "propagate.error", current);
+    for (size_t i = 0; i < params.size(); ++i) {
+        location = f.params[i].loc;
+        bind(f.params[i].name, {current->getArg(static_cast<unsigned>(i + 1)), params[i]});
+    }
+    block(f.body, false);
+    bool fallsThrough = !terminated();
+    if (fallsThrough) {
+        if (!inference && result.name != "void")
+            error("non-void lambda must return on all paths");
+        call("fw_drop", b.getVoidTy(), {frame});
+        b.CreateRetVoid();
+    }
+    emitFailure();
+    if (inference) {
+        result = inferredResult(fallsThrough);
+        current->eraseFromParent();
+        context.function = nullptr;
+    }
+    restoreFunction(saved);
+    return result;
 }
 } // namespace
 void compile(Program &p, const std::string &filename, const Options &options) {

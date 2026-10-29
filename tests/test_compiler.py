@@ -893,6 +893,188 @@ print testing.live_objects()==base""",
     }
 )
 
+POSITIVE.update(
+    {
+        "closures_higher_order": (
+            """function double(int x) returns int
+    return x * 2
+end
+function apply(function(int) returns int f, int x) returns int
+    return f(x)
+end
+print apply(double, 21)
+function run() returns void
+    int base = 10
+    var add = function(int x) returns int => x + base
+    print add(5)
+    print apply(add, 1)
+    var nums = [1, 2, 3, 4, 5]
+    print nums.map(function(int x) => x * x)
+    print nums.filter(function(int x) => x % 2 == 1)
+    print nums.reduce(0, function(int total, int x) => total + x)
+    print nums.any(function(int x) => x > 4)
+    print nums.all(function(int x) => x > 4)
+    nums.each(function(int x)
+        if x == 3 then
+            print "three"
+        end
+    end)
+    print nums.map(double)
+    print nums.map(function(int n) returns string
+        var label = "n"
+        return label + string(n)
+    end)
+    array<function(int) returns int> ops = [double, add]
+    for op in ops do
+        print op(3)
+    end
+    var three = (function(int x) => x + 1)(2)
+    print three
+    print add.call(1)
+    print typeof(add)
+    print add
+end
+run()
+function counter() returns function() returns int
+    int[] count = [0]
+    return function() returns int
+        count[0] += 1
+        return count[0]
+    end
+end
+var next = counter()
+next()
+next
+print next()""",
+            '42\n15\n11\n[1, 4, 9, 16, 25]\n[1, 3, 5]\n15\ntrue\nfalse\nthree\n[2, 4, 6, 8, 10]\n["n1", "n2", "n3", "n4", "n5"]\n6\n13\n3\n11\nfunction(i64) returns i64\n<function>\n3\n',
+        ),
+        "closure_fields_and_nesting": (
+            """import testing
+class Button
+    string label
+    function() returns void on_click = function() => print("default")
+    function greeter() returns function(string) returns string
+        return function(string who) returns string => "{inst label} greets {who}"
+    end
+end
+function outer(int a) returns int
+    var mid = function(int b) returns int
+        var inner = function(int c) returns int => a + b + c
+        return inner(100)
+    end
+    return mid(10)
+end
+function scenario() returns void
+    var button = Button("OK")
+    button.on_click()
+    weak<Button> self = button
+    button.on_click = function()
+        var target = self.get()
+        if target != null then
+            print "clicked {target.label}"
+        end
+    end
+    button.on_click()
+    print button.greeter()("Ann")
+    print outer(1)
+    var fail = function(int x) returns int
+        try
+            if x > 1 then
+                throw RuntimeError("too big")
+            end
+            return x
+        finally
+            print "finally {x}"
+        end
+    end
+    print fail(1)
+    try
+        fail(2)
+    catch RuntimeError error
+        print error.message
+    end
+end
+var before = testing.live_objects()
+scenario()
+print testing.live_objects() == before""",
+            "default\nclicked OK\nOK greets Ann\n111\nfinally 1\n1\nfinally 2\ntoo big\ntrue\n",
+        ),
+        "weak_references": (
+            """import testing
+import html.*
+class Node
+    string name
+    weak<Node> parent = null
+    Node[] children = []
+end
+function tree() returns void
+    var root = Node("root")
+    var child = Node("child", root)
+    root.children.push(child)
+    var parent = child.parent.get()
+    if parent != null then
+        print parent.name
+    end
+    print child.parent.alive()
+    print child.parent
+end
+var before = testing.live_objects()
+tree()
+print testing.live_objects() == before
+weak<Node> temporary = weak(Node("temp"))
+print temporary.alive()
+print temporary.get() == null
+print temporary
+try
+    print temporary.get().name
+catch CastError error
+    print error.message
+end
+var kept = Node("kept")
+weak<Node> alias = kept
+print alias.get().name
+weak<element> page = weak(<p>hi</p>)
+print page.alive()
+var div = <div>x</div>
+weak<element> view = div
+print view.get()""",
+            'root\ntrue\nweak(Node(name="root", parent=weak(null), children=[Node(name="child", parent=weak(<cycle>), children=[])]))\ntrue\nfalse\ntrue\nweak(null)\ncannot cast null to Node\nkept\nfalse\n<div>x</div>\n',
+        ),
+        "hashed_maps": (
+            """map<string, int> words = {}
+int i = 0
+while i < 3000 do
+    words["k" + string(i)] = i
+    i += 1
+end
+int total = 0
+for key in words do
+    total += words[key]
+end
+print total
+print words.remove("k1500")
+print "k1500" in words
+print words["k2999"]
+words["k1500"] = -1
+print words.keys()[2999]
+print len(words)
+map<int, string> small = {3: "c", 1: "a", 2: "b"}
+print small.remove(1)
+small[1] = "z"
+small[3] = "C"
+print small
+small.clear()
+small[7] = "x"
+print small
+map<bool, int> flags = {true: 1}
+flags[false] = 0
+print flags[false]
+print map<string,int>([["a", "1"], ["b", "2"], ["a", "3"]])""",
+            '4498500\ntrue\nfalse\n2999\nk1500\n3000\ntrue\n{3: "C", 2: "b", 1: "z"}\n{7: "x"}\n0\n{"a": 3, "b": 2}\n',
+        ),
+    }
+)
+
 DESKTOP_FAILURE = """import desktop
 import html.*
 import testing
@@ -1139,7 +1321,55 @@ NEGATIVE.update(
     }
 )
 
+NEGATIVE.update(
+    {
+        "captured_assignment": (
+            "function f() returns void\nint x = 1\nvar g = function() returns void\nx = 2\nend\nend",
+            "cannot assign to captured variable 'x'",
+        ),
+        "closure_arity": (
+            "var f = function(int x) => x\nprint f(1, 2)",
+            "expects 1 argument",
+        ),
+        "closure_argument_type": (
+            'var f = function(int x) => x\nprint f("a")',
+            "cannot convert string to i64",
+        ),
+        "function_value_mismatch": (
+            "function g(int a, int b) returns int\nreturn a\nend\nfunction(int) returns int f = g",
+            "does not match type function(i64) returns i64",
+        ),
+        "not_callable": ("var n = 5\nprint n(1)", "is not callable"),
+        "weak_primitive": ("weak<int> w = 1", "weak<T> requires a non-null reference type"),
+        "filter_predicate": (
+            "print [1, 2].filter(function(int x) => x)",
+            "cannot convert i64 to bool",
+        ),
+        "lambda_default": ("var f = function(int x = 1) => x", "cannot have defaults"),
+        "lambda_all_paths": (
+            "var f = function(int x)\nif x > 0 then\nreturn 1\nend\nend",
+            "must return on all paths",
+        ),
+        "weak_methods": (
+            "class A\nint x = 0\nend\nweak<A> w = A()\nw.reset()",
+            "weak references support get() and alive()",
+        ),
+        "web_handler_signature": (
+            'import web\nweb.serve("/", function(int x) => "a", 0)',
+            "HTTP handler must take no arguments or one web.request",
+        ),
+    }
+)
+
 MODULE_CASES = [
+    (
+        "module_lambdas",
+        {
+            "main.fw": "import tools\nprint tools.scaled([1, 2, 3])\nvar f = tools.adder(5)\nprint f(1)",
+            "tools.fw": "private int factor = 3\npublic function scaled(int[] items) returns int[]\nreturn items.map(function(int x) => x * factor)\nend\npublic function adder(int n) returns function(int) returns int\nreturn function(int x) => x + n\nend",
+        },
+        "[3, 6, 9]\n6\n",
+    ),
     (
         "local_alias",
         {
@@ -1730,6 +1960,109 @@ class CompilerTests(unittest.TestCase):
             connection.close()
         process.terminate()
         process.wait(timeout=10)
+
+    def test_web_routing_requests_and_static(self):
+        import http.client
+        import socket
+        import urllib.parse
+
+        public = self.root / "public"
+        (public / "css").mkdir(parents=True)
+        (public / "css" / "app.css").write_text("body{color:red}", encoding="utf-8")
+        (public / "index.html").write_text("<p>index</p>", encoding="utf-8")
+        (self.root / "secret.txt").write_text("secret", encoding="utf-8")
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        source = f"""import web
+import html.*
+
+map<string, string> users = {{"1": "Ann", "2": "Bo"}}
+
+function home returns element
+    return <h1>Home</h1>
+end
+function user(web.request req) returns web.response
+    var id = req.params["id"]
+    if id in users then
+        return web.html(<p>User {{users[id]}}</p>)
+    end
+    return web.text("no user " + id, 404)
+end
+function create(web.request req) returns web.response
+    users[req.form["id"]] = req.form["name"]
+    return web.redirect("/users/" + req.form["id"], 303)
+end
+web.serve("/", home, {port})
+web.serve("/users/:id", user, {port})
+web.route("POST", "/users", create, {port})
+web.serve("/api/echo", function(web.request req) returns web.response
+    var r = web.json("{{{{\\"q\\":\\"" + req.query["q"] + "\\",\\"agent\\":\\"" + req.headers["x-test"] + "\\"}}}}")
+    r.headers["x-powered-by"] = "flywheel"
+    return r
+end, {port})
+web.serve("/hello", function(web.request req) => "hi " + req.method, {port})
+print web.static("/assets", "public", {port})
+"""
+        process, lines = self.start_url_server(source, "-O3")
+        url = lines.get(timeout=10)
+        self.assertEqual(url, f"http://127.0.0.1:{port}/assets/")
+
+        def fetch(method, path, body=None, headers=None):
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+            connection.request(method, path, body=body, headers=headers or {})
+            response = connection.getresponse()
+            data = response.read()
+            connection.close()
+            return response, data
+
+        response, data = fetch("GET", "/")
+        self.assertEqual((response.status, data), (200, b"<h1>Home</h1>"))
+        response, data = fetch("GET", "/users/2")
+        self.assertEqual((response.status, data), (200, b"<p>User Bo</p>"))
+        self.assertEqual(response.getheader("Content-Type"), "text/html; charset=utf-8")
+        response, data = fetch("GET", "/users/9")
+        self.assertEqual((response.status, data), (404, b"no user 9"))
+        self.assertEqual(response.getheader("Content-Type"), "text/plain; charset=utf-8")
+
+        form = urllib.parse.urlencode({"id": "3", "name": "Cy Dé"})
+        response, data = fetch(
+            "POST",
+            "/users",
+            form,
+            {"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(response.status, 303)
+        self.assertEqual(response.getheader("Location"), "/users/3")
+        response, data = fetch("GET", "/users/3")
+        self.assertEqual(data.decode(), "<p>User Cy Dé</p>")
+
+        response, data = fetch("GET", "/api/echo?q=a%20b", headers={"X-Test": "yes"})
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.getheader("Content-Type"), "application/json")
+        self.assertEqual(response.getheader("x-powered-by"), "flywheel")
+        self.assertEqual(data, b'{"q":"a b","agent":"yes"}')
+
+        response, data = fetch("DELETE", "/users")
+        self.assertEqual(response.status, 405)
+        self.assertEqual(response.getheader("Allow"), "POST")
+        response, data = fetch("GET", "/hello")
+        self.assertEqual(data, b"hi GET")
+        response, data = fetch("HEAD", "/hello")
+        self.assertEqual((response.status, data), (200, b""))
+        response, data = fetch("PUT", "/hello")
+        self.assertEqual(response.status, 405)
+
+        response, data = fetch("GET", "/assets/css/app.css")
+        self.assertEqual((response.status, data), (200, b"body{color:red}"))
+        self.assertEqual(response.getheader("Content-Type"), "text/css; charset=utf-8")
+        response, data = fetch("GET", "/assets/")
+        self.assertEqual(data, b"<p>index</p>")
+        for escape in ("/assets/../secret.txt", "/assets/%2e%2e/secret.txt"):
+            response, data = fetch("GET", escape)
+            self.assertEqual(response.status, 404, escape)
+        response, data = fetch("GET", "/missing")
+        self.assertEqual(response.status, 404)
 
     def test_web_startup_failure(self):
         import socket

@@ -45,6 +45,10 @@ class Loader {
                 u.program.imports.at(name.substr(0, dot)) == "desktop" &&
                 (name.substr(dot + 1) == "window" || name.substr(dot + 1) == "Window"))
                 return "desktop.window";
+            if (u.builtins.count(name.substr(0, dot)) &&
+                u.program.imports.at(name.substr(0, dot)) == "web" &&
+                (name.substr(dot + 1) == "request" || name.substr(dot + 1) == "response"))
+                return "web." + name.substr(dot + 1);
         }
         auto it = u.names.find(name);
         return it == u.names.end() ? name : it->second;
@@ -103,6 +107,19 @@ class Loader {
         }
         for (auto &a : e.args)
             expression(u, *a, locals);
+        if (e.lambda) {
+            // Parameters and enclosing locals shadow module names inside the body.
+            auto inner = locals;
+            auto &f = *e.lambda;
+            f.loc.file = u.path;
+            f.result = type(u, f.result, f.loc);
+            for (auto &param : f.params) {
+                param.loc.file = u.path;
+                param.type = type(u, param.type, param.loc);
+                inner.insert(param.name);
+            }
+            statements(u, f.body, inner);
+        }
     }
     void statements(Unit &u, std::vector<SP> &body, std::set<std::string> locals,
                     bool global = false) {
