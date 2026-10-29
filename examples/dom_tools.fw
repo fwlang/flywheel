@@ -1,0 +1,20 @@
+import html.*
+
+var page = <main>
+    <h1 id="main-title">Welcome</h1>
+    <section class="card"><p>First</p><p>Second</p></section>
+</main>
+
+var title = page.get_by_id("main-title")
+if title != null then
+    title.text_content = "Hello & welcome!"
+end
+
+array<element> paragraphs = html.query_all(page, ".card p")
+for paragraph in paragraphs do
+    paragraph.add_class("selected")
+end
+
+page.append(<footer>Native tree tools</footer>)
+print page
+print paragraphs[0].attributes

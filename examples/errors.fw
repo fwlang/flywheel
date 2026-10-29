@@ -1,0 +1,21 @@
+function divide(int value, int divisor) returns Result<int, string>
+    if divisor == 0 then
+        return Result.error("division by zero")
+    end
+    return Result.ok(value // divisor)
+end
+
+var result = divide(42, 0)
+if result.is_ok then
+    print result.unwrap()
+else
+    print result.error()
+end
+
+try
+    throw FileError("example error")
+catch FileError error
+    print "Caught: {error.message}"
+finally
+    print "Finished"
+end

@@ -1,0 +1,11 @@
+import os
+
+try
+    var name = input("Name: ")
+    print "Hello, {name}!"
+catch InputError error
+    print "No input: {error.message}"
+end
+
+var status = os.shell("echo Hello from the shell")
+print "Shell exit status: {status}"

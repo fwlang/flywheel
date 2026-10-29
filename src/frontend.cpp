@@ -24,7 +24,8 @@ bool markupArgumentStart(const std::string &source, size_t p) {
     if (!start(source[p]))
         return false;
     auto name = [&] {
-        while (p < source.size() && (part(source[p]) || source[p] == '-' || source[p] == ':'))
+        while (p < source.size() &&
+               (part(source[p]) || source[p] == '-' || source[p] == ':' || source[p] == '.'))
             ++p;
     };
     auto space = [&] {
@@ -124,10 +125,12 @@ int precedence(const std::string &s) {
         return 3;
     if (s == "<" || s == ">" || s == "<=" || s == ">=" || s == "in")
         return 4;
-    if (s == "+" || s == "-")
+    if (s == ".." || s == "..<")
         return 5;
-    if (s == "*" || s == "/" || s == "//" || s == "%")
+    if (s == "+" || s == "-")
         return 6;
+    if (s == "*" || s == "/" || s == "//" || s == "%")
+        return 7;
     return 0;
 }
 void utf8(std::string &out, unsigned value, Location l) {
@@ -258,8 +261,11 @@ std::vector<Token> lex(const std::string &source) {
             expected = false;
             continue;
         }
-        if (c == '<' && (expected || markupArgumentStart(source, p)) && p + 1 < source.size() &&
-            (start(source[p + 1]) || source[p + 1] == '>')) {
+        bool genericType = !out.empty() && out.back().kind == "id" &&
+                           (out.back().text == "array" || out.back().text == "tuple" ||
+                            out.back().text == "map" || out.back().text == "Result");
+        if (c == '<' && !genericType && (expected || markupArgumentStart(source, p)) &&
+            p + 1 < source.size() && (start(source[p + 1]) || source[p + 1] == '>')) {
             auto end = markupEnd(source, p);
             emit("markup", source.substr(p, end - p + 1), end + 1);
             expected = false;
@@ -306,9 +312,12 @@ std::vector<Token> lex(const std::string &source) {
         if (p + 1 < source.size()) {
             auto two = source.substr(p, 2);
             if (two == "==" || two == "!=" || two == "<=" || two == ">=" || two == "+=" ||
-                two == "-=" || two == "*=" || two == "/=" || two == "%=" || two == "//")
+                two == "-=" || two == "*=" || two == "/=" || two == "%=" || two == "//" ||
+                two == "..")
                 op = two;
         }
+        if (op == ".." && p + 2 < source.size() && source[p + 2] == '<')
+            op = "..<";
         if (std::string("+-*/%=!<>()[]{}.,?:").find(c) == std::string::npos)
             throw Error(loc, "invalid character (identifiers currently use ASCII)");
         if (c == '(' || c == '[' || c == '{')
@@ -349,11 +358,11 @@ Token Parser::expect(const std::string &s) {
 Token Parser::identifier() {
     auto t = take();
     static const std::set<std::string> reserved = {
-        "import",  "as",     "var",  "const", "class",    "function", "component",
-        "returns", "return", "if",   "then",  "else",     "while",    "do",
-        "for",     "in",     "end",  "break", "continue", "try",      "catch",
-        "finally", "throw",  "inst", "attr",  "true",     "false",    "null",
-        "void",    "weak",   "and",  "or",    "not"};
+        "import",  "as",      "var",  "const", "class",    "function", "component",
+        "returns", "return",  "if",   "then",  "else",     "while",    "do",
+        "for",     "in",      "end",  "break", "continue", "try",      "catch",
+        "finally", "throw",   "inst", "attr",  "true",     "false",    "null",
+        "public",  "private", "void", "weak",  "and",      "or",       "not"};
     if (t.kind != "id" || reserved.count(t.text))
         throw Error(t.loc, "expected identifier");
     return t;
@@ -368,19 +377,27 @@ void Parser::finish() {
     newlines();
 }
 std::string Parser::type() {
-    auto t = take();
-    if (t.kind != "id")
-        throw Error(t.loc, "expected type");
-    std::string r = t.text;
-    if (accept("<")) {
-        r += '<';
-        r += type();
-        while (accept(",")) {
-            r += ',';
-            r += type();
+    std::string r;
+    if (accept("[")) {
+        r = "[" + type();
+        while (accept(","))
+            r += "," + type();
+        expect("]");
+        r += "]";
+    } else {
+        auto t = take();
+        if (t.kind != "id")
+            throw Error(t.loc, "expected type");
+        r = t.text;
+        while (accept("."))
+            r += "." + identifier().text;
+        if (accept("<")) {
+            r += "<" + type();
+            while (accept(","))
+                r += "," + type();
+            expect(">");
+            r += ">";
         }
-        expect(">");
-        r += '>';
     }
     while (true) {
         if (accept("?"))
@@ -494,7 +511,7 @@ EP Parser::markup() {
     };
     auto name = [&]() {
         size_t begin = p;
-        while (p < s.size() && (part(s[p]) || s[p] == '-' || s[p] == ':'))
+        while (p < s.size() && (part(s[p]) || s[p] == '-' || s[p] == ':' || s[p] == '.'))
             ++p;
         if (begin == p)
             throw Error(token.loc, "expected markup name");
@@ -615,11 +632,12 @@ EP Parser::prefix() {
         e = node("null", "", t.loc);
     else if (accept("-") || accept("+") || accept("not")) {
         e = node("unary", t.text, t.loc);
-        e->args.push_back(expression(t.text == "not" ? 2 : 7));
+        e->args.push_back(expression(t.text == "not" ? 2 : 8));
         return e;
     } else if (accept("(")) {
         e = expression();
         expect(")");
+        e->grouped = true;
     } else if (accept("[")) {
         e = node("array", "", t.loc);
         if (!accept("]")) {
@@ -628,11 +646,32 @@ EP Parser::prefix() {
             } while (accept(","));
             expect("]");
         }
+    } else if (accept("{")) {
+        e = node("map", "", t.loc);
+        if (!accept("}")) {
+            do {
+                e->args.push_back(expression());
+                expect(":");
+                e->args.push_back(expression());
+            } while (accept(","));
+            expect("}");
+        }
     } else if (accept("inst") || accept("attr")) {
         e = node(t.text, identifier().text, t.loc);
     } else if (t.kind == "id") {
+        static const std::set<std::string> structural = {
+            "function", "class", "component", "import",   "public", "private", "returns",
+            "return",   "if",    "then",      "else",     "while",  "do",      "for",
+            "in",       "end",   "break",     "continue", "try",    "catch",   "finally",
+            "throw",    "as",    "void",      "weak",     "and",    "or"};
+        if (structural.count(t.text))
+            throw Error(t.loc, "unexpected keyword '" + t.text + "' in expression");
         take();
-        e = node("name", t.text, t.loc);
+        if ((t.text == "array" || t.text == "tuple" || t.text == "map") && peek().text == "<") {
+            --pos;
+            e = node("name", type(), t.loc);
+        } else
+            e = node("name", t.text, t.loc);
     } else
         throw Error(t.loc, "expected expression, got '" + t.text + "'");
     while (true) {
@@ -681,7 +720,8 @@ EP Parser::outer() {
             tokens[i + 1].text == peek().text)
             callable = true;
     EP e;
-    if (callable && (peek(1).text == "-" || peek(1).text == "+" || peek(1).text == "not")) {
+    if (callable && (peek(1).text == "-" || peek(1).text == "+" || peek(1).text == "not" ||
+                     peek(1).text == "[")) {
         auto t = take();
         e = node("name", t.text, t.loc);
     } else
@@ -702,21 +742,61 @@ EP Parser::outer() {
             throw Error(peek().loc, "nested calls require parentheses around their arguments");
         e = std::move(n);
     }
+    e->outer = true;
     return e;
 }
 std::vector<SP> Parser::block() {
     std::vector<SP> out;
     newlines();
-    while (peek().kind != "eof" && peek().text != "end" && peek().text != "else")
+    while (peek().kind != "eof" && peek().text != "end" && peek().text != "else" &&
+           peek().text != "catch" && peek().text != "finally")
         out.push_back(statement());
     return out;
 }
 SP Parser::statement() {
     auto s = std::make_unique<Stmt>();
     s->loc = peek().loc;
-    if (peek().text == "try" || peek().text == "catch" || peek().text == "finally" ||
-        peek().text == "throw")
-        throw Error(peek().loc, "exceptions are not implemented yet");
+    if (accept("throw")) {
+        s->kind = "throw";
+        s->expr = expression();
+        finish();
+        return s;
+    }
+    if (accept("try")) {
+        s->kind = "try";
+        finish();
+        s->body = block();
+        bool catchAll = false;
+        while (accept("catch")) {
+            if (catchAll)
+                throw Error(peek().loc, "catch-all must be the last catch clause");
+            auto saved = pos;
+            std::string t, name;
+            try {
+                t = type();
+                name = identifier().text;
+            } catch (const Error &) {
+                pos = saved;
+                t = "Error";
+                name = identifier().text;
+            }
+            if (t == "Error")
+                catchAll = true;
+            s->catchTypes.push_back(t);
+            s->catchNames.push_back(name);
+            finish();
+            s->catches.push_back(block());
+        }
+        if (accept("finally")) {
+            finish();
+            s->finalizer = block();
+        }
+        if (s->catches.empty() && s->finalizer.empty())
+            throw Error(s->loc, "try requires catch or finally");
+        expect("end");
+        finish();
+        return s;
+    }
     if (accept("if")) {
         s->kind = "if";
         s->expr = expression();
@@ -802,18 +882,21 @@ Function Parser::function(const std::string &owner) {
     f.loc = t.loc;
     f.owner = owner;
     f.name = identifier().text;
-    expect("(");
-    if (!accept(")")) {
-        do {
-            Param p;
-            p.loc = peek().loc;
-            p.type = type();
-            p.name = identifier().text;
-            if (accept("="))
-                p.value = expression();
-            f.params.push_back(std::move(p));
-        } while (accept(","));
-        expect(")");
+    if (accept("(")) {
+        if (!accept(")")) {
+            do {
+                Param p;
+                p.loc = peek().loc;
+                p.type = type();
+                p.name = identifier().text;
+                if (accept("="))
+                    p.value = expression();
+                f.params.push_back(std::move(p));
+            } while (accept(","));
+            expect(")");
+        }
+    } else if (peek().text != "returns" && peek().kind != "nl" && peek().kind != "eof") {
+        throw Error(peek().loc, "function declarations with parameters require parentheses");
     }
     if (accept("returns"))
         f.result = type();
@@ -827,20 +910,41 @@ Program Parser::parse() {
     Program p;
     newlines();
     while (peek().kind != "eof") {
+        bool hidden = accept("private"), visible = !hidden && accept("public");
+        size_t nf = p.functions.size(), nc = p.classes.size(), nb = p.body.size();
+        std::set<std::string> components;
+        for (auto &[name, e] : p.components) {
+            (void)e;
+            components.insert(name);
+        }
+        if ((hidden || visible) && peek().text == "import")
+            throw Error(peek().loc, "visibility applies to declarations, not imports");
         if (accept("import")) {
             auto name = identifier().text;
-            std::string alias = name;
-            if (accept(".")) {
-                expect("*");
-                if (name == "html")
-                    p.html = true;
-                else
-                    throw Error(peek().loc, "wildcard imports currently supported only for html");
-            } else if (accept("as"))
+            bool wildcard = false;
+            while (accept(".")) {
+                if (accept("*")) {
+                    wildcard = true;
+                    break;
+                }
+                name += "." + identifier().text;
+            }
+            std::string alias = name.substr(
+                name.find_last_of('.') == std::string::npos ? 0 : name.find_last_of('.') + 1);
+            if (accept("as")) {
+                if (wildcard)
+                    throw Error(peek().loc, "wildcard imports cannot have an alias");
                 alias = identifier().text;
+            }
+            if (wildcard)
+                p.wildcards.insert(alias);
+            if (wildcard && name == "html")
+                p.html = true;
             if (p.imports.count(alias))
                 throw Error(peek().loc, "duplicate import '" + alias + "'");
             p.imports[alias] = name;
+            p.importOrder.push_back(alias);
+            p.importLocations[alias] = tokens[pos - 1].loc;
             finish();
         } else if (peek().text == "function")
             p.functions.push_back(function());
@@ -875,6 +979,21 @@ Program Parser::parse() {
             finish();
         } else
             p.body.push_back(statement());
+        std::string declared;
+        if (p.functions.size() > nf)
+            declared = p.functions.back().name;
+        else if (p.classes.size() > nc)
+            declared = p.classes.back().name;
+        else if (p.body.size() > nb && p.body.back()->kind == "declare")
+            declared = p.body.back()->name;
+        else
+            for (auto &[name, e] : p.components)
+                if (!components.count(name))
+                    declared = name;
+        if ((hidden || visible) && declared.empty())
+            throw Error(peek().loc, "visibility requires a declaration");
+        if (hidden)
+            p.privateNames.insert(declared);
     }
     return p;
 }

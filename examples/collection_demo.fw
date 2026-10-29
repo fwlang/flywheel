@@ -1,0 +1,15 @@
+import collections
+
+var numbers = collections.range(0, 3)
+numbers.push(3)
+print numbers.pop()
+
+map<string, int> scores = {"Danny": 15}
+scores["Danny"] += 1
+for name in scores do
+    print "{name}: {scores[name]}"
+end
+
+[string, int] person = ["Danny", scores["Danny"]]
+print person[0]
+print person[1]

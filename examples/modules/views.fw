@@ -1,0 +1,12 @@
+import html.*
+
+private const string brand = "Native modules and markup"
+
+public component Title = <h1>{attr inner}</h1>
+
+public function page(string name) returns element
+    return <>
+        <Title>Hello, {name}!</Title>
+        <p>{brand}</p>
+    </>
+end

@@ -1,5 +1,7 @@
+#include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -8,21 +10,26 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <map>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 namespace {
-[[noreturn]] void fail(const std::string &message) {
-    std::cerr << "Flywheel runtime error: " << message << '\n';
-    std::exit(1);
+struct NativeFailure {
+    std::string type, message;
+};
+[[noreturn]] void fail(const std::string &message, const std::string &type = "RuntimeError") {
+    throw NativeFailure{type, message};
 }
 struct Json {
     enum Kind { Null, Boolean, Number, Text, List, Dictionary } kind = Null;
@@ -34,20 +41,23 @@ struct Object;
 void retain(Object *);
 void release(Object *);
 struct Slot {
+    enum Kind { Integer, Unsigned, Real, Boolean, Reference } kind = Integer;
     int64_t integer = 0;
     double real = 0;
     Object *object = nullptr;
     Slot() = default;
-    Slot(const Slot &s) : integer(s.integer), real(s.real), object(s.object) {
+    Slot(const Slot &s) : kind(s.kind), integer(s.integer), real(s.real), object(s.object) {
         retain(object);
     }
     Slot(Slot &&s) noexcept
-        : integer(s.integer), real(s.real), object(std::exchange(s.object, nullptr)) {}
+        : kind(s.kind), integer(s.integer), real(s.real), object(std::exchange(s.object, nullptr)) {
+    }
     Slot &operator=(const Slot &s) {
         if (this != &s) {
             retain(s.object);
             release(object);
             object = s.object;
+            kind = s.kind;
             integer = s.integer;
             real = s.real;
         }
@@ -57,14 +67,41 @@ struct Slot {
         release(object);
     }
 };
+std::atomic<int64_t> liveObjects{0};
+struct DesktopState {
+    std::string title;
+    int width = 960, height = 640;
+    bool running = false;
+};
 struct Object {
     std::atomic<size_t> refs{1};
-    enum Kind { String, Array, Instance, Element, JsonValue } kind;
+    enum Kind {
+        String,
+        Array,
+        Instance,
+        Element,
+        JsonValue,
+        Map,
+        ErrorValue,
+        Tuple,
+        Result,
+        DesktopWindow
+    } kind;
+    std::unique_ptr<DesktopState> desktop;
     std::string text;
     std::shared_ptr<Json> json;
-    std::vector<Slot> slots;
+    std::vector<Slot> slots, keys;
+    bool objectKeys = false;
+    Slot::Kind keyKind = Slot::Integer;
+    std::string errorType, typeName;
+    std::vector<std::string> fieldNames;
     std::vector<std::pair<std::string, std::string>> attributes;
-    explicit Object(Kind k) : kind(k) {}
+    explicit Object(Kind k) : kind(k) {
+        ++liveObjects;
+    }
+    ~Object() {
+        --liveObjects;
+    }
 };
 void retain(Object *p) {
     if (p)
@@ -73,6 +110,32 @@ void retain(Object *p) {
 void release(Object *p) {
     if (p && p->refs.fetch_sub(1, std::memory_order_acq_rel) == 1)
         delete p;
+}
+struct PendingError {
+    std::string type;
+    Object *value = nullptr;
+    void clear() {
+        release(value);
+        value = nullptr;
+        type.clear();
+    }
+    void set(const std::string &t, Object *v) {
+        retain(v);
+        clear();
+        type = t;
+        value = v;
+    }
+    ~PendingError() {
+        clear();
+    }
+};
+thread_local PendingError pendingError;
+void recordFailure(const std::string &type, const std::string &message) {
+    auto p = new Object(Object::ErrorValue);
+    p->text = message;
+    p->errorType = type;
+    pendingError.set(type, p);
+    release(p);
 }
 struct Frame {
     std::vector<Object *> owned;
@@ -158,7 +221,7 @@ void render(Object *p, std::string &out) {
 }
 Slot &slot(Object *p, int64_t index) {
     if (!p || index < 0 || static_cast<uint64_t>(index) >= p->slots.size())
-        fail("index out of bounds");
+        fail("index out of bounds", "IndexError");
     return p->slots[static_cast<size_t>(index)];
 }
 } // namespace
@@ -191,189 +254,499 @@ Object *fw_adopt(Frame *f, Object *p) {
     return own(f, p);
 }
 Object *fw_literal(Frame *f, const char *s, int64_t length) {
-    return string(f, std::string(s, static_cast<size_t>(length)));
+    try {
+        return string(f, std::string(s, static_cast<size_t>(length)));
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 Object *fw_concat(Frame *f, Object *a, Object *b) {
-    return string(f, a->text + b->text);
+    try {
+        return string(f, a->text + b->text);
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 Object *fw_int_string(Frame *f, int64_t n) {
-    return string(f, std::to_string(n));
+    try {
+        return string(f, std::to_string(n));
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 Object *fw_uint_string(Frame *f, uint64_t n) {
-    return string(f, std::to_string(n));
+    try {
+        return string(f, std::to_string(n));
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 Object *fw_real_string(Frame *f, double n) {
-    std::ostringstream s;
-    s << std::setprecision(15) << n;
-    return string(f, s.str());
+    try {
+        std::ostringstream s;
+        s << std::setprecision(15) << n;
+        return string(f, s.str());
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 Object *fw_bool_string(Frame *f, int64_t n) {
-    return string(f, n ? "true" : "false");
+    try {
+        return string(f, n ? "true" : "false");
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 void fw_print(Object *p) {
-    std::cout << p->text << '\n';
+    try {
+        std::cout << p->text << '\n';
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return;
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return;
+    }
 }
 int64_t fw_equal(Object *a, Object *b) {
-    if (!a || !b)
-        return a == b;
-    return a->kind == Object::String && b->kind == Object::String ? a->text == b->text : a == b;
+    try {
+        if (!a || !b)
+            return a == b;
+        return a->kind == Object::String && b->kind == Object::String ? a->text == b->text : a == b;
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 int64_t fw_length(Object *p) {
-    if (!p)
-        fail("null length");
-    return static_cast<int64_t>(p->kind == Object::String ? p->text.size() : p->slots.size());
+    try {
+        if (!p)
+            fail("null length");
+        return static_cast<int64_t>(p->kind == Object::String ? p->text.size() : p->slots.size());
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 Object *fw_new(Frame *f, int64_t count, int64_t kind) {
-    if (count < 0)
-        fail("negative object size");
-    auto p = new Object(static_cast<Object::Kind>(kind));
-    p->slots.resize(static_cast<size_t>(count));
-    return own(f, p);
+    try {
+        if (count < 0)
+            fail("negative object size");
+        auto p = new Object(static_cast<Object::Kind>(kind));
+        p->slots.resize(static_cast<size_t>(count));
+        return own(f, p);
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 int64_t fw_get_int(Object *p, int64_t index) {
-    return slot(p, index).integer;
+    try {
+        return slot(p, index).integer;
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 double fw_get_real(Object *p, int64_t index) {
-    return slot(p, index).real;
+    try {
+        return slot(p, index).real;
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 Object *fw_get_object(Object *p, int64_t index) {
-    return slot(p, index).object;
+    try {
+        return slot(p, index).object;
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
-void fw_set_int(Object *p, int64_t index, int64_t value) {
-    slot(p, index).integer = value;
+void fw_set_int(Object *p, int64_t index, int64_t value, int64_t kind) {
+    try {
+        auto &target = slot(p, index);
+        target.integer = value;
+        target.kind = static_cast<Slot::Kind>(kind);
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return;
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return;
+    }
 }
 void fw_set_real(Object *p, int64_t index, double value) {
-    slot(p, index).real = value;
+    try {
+        auto &target = slot(p, index);
+        target.real = value;
+        target.kind = Slot::Real;
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return;
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return;
+    }
 }
 void fw_set_object(Object *p, int64_t index, Object *value) {
-    auto &s = slot(p, index);
-    retain(value);
-    release(s.object);
-    s.object = value;
+    try {
+        auto &s = slot(p, index);
+        retain(value);
+        release(s.object);
+        s.object = value;
+        s.kind = Slot::Reference;
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return;
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return;
+    }
 }
 Object *fw_element(Frame *f, Object *tag) {
-    auto p = new Object(Object::Element);
-    p->text = tag->text;
-    return own(f, p);
+    try {
+        auto p = new Object(Object::Element);
+        p->text = tag->text;
+        return own(f, p);
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 void fw_child(Object *p, Object *child) {
-    Slot s;
-    s.object = child;
-    retain(child);
-    p->slots.push_back(std::move(s));
+    try {
+        Slot s;
+        s.object = child;
+        s.kind = Slot::Reference;
+        retain(child);
+        p->slots.push_back(std::move(s));
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return;
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return;
+    }
 }
 void fw_attribute(Object *p, Object *name, Object *value) {
-    p->attributes.emplace_back(name->text, value->text);
+    try {
+        p->attributes.emplace_back(name->text, value->text);
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return;
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return;
+    }
 }
 Object *fw_render(Frame *f, Object *p) {
-    std::string out;
-    render(p, out);
-    return string(f, std::move(out));
+    try {
+        std::string out;
+        render(p, out);
+        return string(f, std::move(out));
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 Object *fw_tag(Frame *f, Object *p) {
-    return string(f, p->text);
+    try {
+        return string(f, p->text);
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 Object *fw_children(Frame *f, Object *p) {
-    auto a = new Object(Object::Array);
-    a->slots = p->slots;
-    return own(f, a);
+    try {
+        auto a = new Object(Object::Array);
+        a->slots = p->slots;
+        return own(f, a);
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 int64_t fw_exists(Object *path) {
-    std::error_code ec;
-    bool yes = std::filesystem::exists(
-        std::filesystem::path(
-            std::u8string(reinterpret_cast<const char8_t *>(path->text.data()), path->text.size())),
-        ec);
-    if (ec)
-        fail(ec.message());
-    return yes;
+    try {
+        std::error_code ec;
+        bool yes = std::filesystem::exists(
+            std::filesystem::path(std::u8string(
+                reinterpret_cast<const char8_t *>(path->text.data()), path->text.size())),
+            ec);
+        if (ec)
+            fail("file operation failed: " + ec.message(), "FileError");
+        return yes;
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 Object *fw_read(Frame *f, Object *path) {
-    std::ifstream stream(
-        std::filesystem::path(
-            std::u8string(reinterpret_cast<const char8_t *>(path->text.data()), path->text.size())),
-        std::ios::binary);
-    if (!stream)
-        fail("cannot read '" + path->text + "'");
-    std::ostringstream out;
-    out << stream.rdbuf();
-    if (stream.bad())
-        fail("read failed");
-    return string(f, out.str());
+    try {
+        std::ifstream stream(
+            std::filesystem::path(std::u8string(
+                reinterpret_cast<const char8_t *>(path->text.data()), path->text.size())),
+            std::ios::binary);
+        if (!stream)
+            fail("cannot read '" + path->text + "'", "FileError");
+        std::ostringstream out;
+        out << stream.rdbuf();
+        if (stream.bad())
+            fail("read failed", "FileError");
+        return string(f, out.str());
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 void fw_write(Object *path, Object *data) {
-    std::ofstream stream(
-        std::filesystem::path(
-            std::u8string(reinterpret_cast<const char8_t *>(path->text.data()), path->text.size())),
-        std::ios::binary);
-    if (!stream)
-        fail("cannot write '" + path->text + "'");
-    stream.write(data->text.data(), static_cast<std::streamsize>(data->text.size()));
-    if (!stream)
-        fail("write failed");
+    try {
+        std::ofstream stream(
+            std::filesystem::path(std::u8string(
+                reinterpret_cast<const char8_t *>(path->text.data()), path->text.size())),
+            std::ios::binary);
+        if (!stream)
+            fail("cannot write '" + path->text + "'", "FileError");
+        stream.write(data->text.data(), static_cast<std::streamsize>(data->text.size()));
+        if (!stream)
+            fail("write failed", "FileError");
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return;
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return;
+    }
 }
 void fw_remove(Object *path) {
-    std::error_code ec;
-    std::filesystem::remove(
-        std::filesystem::path(
-            std::u8string(reinterpret_cast<const char8_t *>(path->text.data()), path->text.size())),
-        ec);
-    if (ec)
-        fail(ec.message());
+    try {
+        std::error_code ec;
+        std::filesystem::remove(
+            std::filesystem::path(std::u8string(
+                reinterpret_cast<const char8_t *>(path->text.data()), path->text.size())),
+            ec);
+        if (ec)
+            fail("file operation failed: " + ec.message(), "FileError");
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return;
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return;
+    }
 }
 Object *fw_env(Frame *f, Object *name) {
-    auto p = std::getenv(name->text.c_str());
-    if (!p)
-        fail("environment variable is not set");
-    return string(f, p);
+    try {
+        auto p = std::getenv(name->text.c_str());
+        if (!p)
+            fail("environment variable is not set");
+        return string(f, p);
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 double fw_clock() {
-    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
-        .count();
+    try {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 void fw_sleep(double seconds) {
-    if (!std::isfinite(seconds) || seconds < 0)
-        fail("invalid sleep duration");
-    std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
+    try {
+        if (!std::isfinite(seconds) || seconds < 0)
+            fail("invalid sleep duration", "NumericError");
+        std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return;
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return;
+    }
 }
 double fw_sqrt(double n) {
-    return std::sqrt(n);
+    try {
+        return std::sqrt(n);
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 double fw_sin(double n) {
-    return std::sin(n);
+    try {
+        return std::sin(n);
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 double fw_cos(double n) {
-    return std::cos(n);
+    try {
+        return std::cos(n);
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 double fw_pow(double a, double b) {
-    return std::pow(a, b);
+    try {
+        return std::pow(a, b);
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 void fw_assert(int64_t ok, Object *message) {
-    if (!ok)
-        fail("assertion failed: " + message->text);
+    try {
+        if (!ok)
+            fail("assertion failed: " + message->text, "AssertionError");
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return;
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return;
+    }
 }
-void fw_panic(const char *message) {
-    fail(message);
+void fw_panic(const char *message, const char *type) {
+    try {
+        fail(message, type);
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return;
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return;
+    }
 }
 }
 extern "C" {
 int64_t fw_contains_int(Object *p, int64_t item) {
-    for (auto &s : p->slots)
-        if (s.integer == item)
-            return 1;
-    return 0;
+    try {
+        for (auto &s : p->slots)
+            if (s.integer == item)
+                return 1;
+        return 0;
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 int64_t fw_contains_real(Object *p, double item) {
-    for (auto &s : p->slots)
-        if (s.real == item)
-            return 1;
-    return 0;
+    try {
+        for (auto &s : p->slots)
+            if (s.real == item)
+                return 1;
+        return 0;
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 int64_t fw_contains_object(Object *p, Object *item) {
-    for (auto &s : p->slots)
-        if (fw_equal(s.object, item))
-            return 1;
-    return 0;
+    try {
+        for (auto &s : p->slots)
+            if (fw_equal(s.object, item))
+                return 1;
+        return 0;
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 }
 namespace {
@@ -381,7 +754,7 @@ class JsonParser {
     const std::string &source;
     size_t pos = 0;
     [[noreturn]] void error() {
-        fail("invalid JSON at byte " + std::to_string(pos));
+        fail("invalid JSON at byte " + std::to_string(pos), "JsonError");
     }
     void space() {
         while (pos < source.size() && (source[pos] == ' ' || source[pos] == '\r' ||
@@ -493,7 +866,7 @@ class JsonParser {
     }
     std::shared_ptr<Json> value(int depth) {
         if (depth > 256)
-            fail("JSON nesting exceeds 256");
+            fail("JSON nesting exceeds 256", "JsonError");
         space();
         if (pos == source.size())
             error();
@@ -514,7 +887,7 @@ class JsonParser {
                     error();
                 auto v = value(depth + 1);
                 if (!result->fields.emplace(key, v).second)
-                    fail("duplicate JSON object key '" + key + "'");
+                    fail("duplicate JSON object key '" + key + "'", "JsonError");
             } while (accept(','));
             if (!accept('}'))
                 error();
@@ -593,7 +966,17 @@ std::string jsonQuote(const std::string &s) {
         if (c == '"' || c == '\\') {
             out += '\\';
             out += char(c);
-        } else if (c < 32) {
+        } else if (c == '\n')
+            out += "\\n";
+        else if (c == '\r')
+            out += "\\r";
+        else if (c == '\t')
+            out += "\\t";
+        else if (c == '\b')
+            out += "\\b";
+        else if (c == '\f')
+            out += "\\f";
+        else if (c < 32) {
             out += "\\u00";
             out += hex[c >> 4];
             out += hex[c & 15];
@@ -630,7 +1013,7 @@ std::string jsonRender(const Json &j) {
         return out + "}";
     }
     }
-    fail("invalid JSON value");
+    fail("invalid JSON value", "JsonError");
 }
 Object *jsonObject(Frame *frame, std::shared_ptr<Json> json) {
     auto p = new Object(Object::JsonValue);
@@ -639,71 +1022,143 @@ Object *jsonObject(Frame *frame, std::shared_ptr<Json> json) {
 }
 Json &requireJson(Object *p) {
     if (!p || p->kind != Object::JsonValue || !p->json)
-        fail("expected JSON value");
+        fail("expected JSON value", "JsonError");
     return *p->json;
 }
 } // namespace
 extern "C" {
 Object *fw_json_parse(Frame *frame, Object *text) {
-    return jsonObject(frame, JsonParser(text->text).parse());
+    try {
+        return jsonObject(frame, JsonParser(text->text).parse());
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 Object *fw_json_stringify(Frame *frame, Object *value) {
-    return string(frame, jsonRender(requireJson(value)));
+    try {
+        return string(frame, jsonRender(requireJson(value)));
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 Object *fw_json_kind(Frame *frame, Object *value) {
-    static const char *names[] = {"null", "bool", "number", "string", "array", "object"};
-    return string(frame, names[requireJson(value).kind]);
+    try {
+        static const char *names[] = {"null", "bool", "number", "string", "array", "object"};
+        return string(frame, names[requireJson(value).kind]);
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 int64_t fw_json_has(Object *value, Object *key) {
-    auto &j = requireJson(value);
-    if (j.kind != Json::Dictionary)
-        fail("expected JSON object");
-    return j.fields.count(key->text) != 0;
+    try {
+        auto &j = requireJson(value);
+        if (j.kind != Json::Dictionary)
+            fail("expected JSON object", "JsonError");
+        return j.fields.count(key->text) != 0;
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 Object *fw_json_get(Frame *frame, Object *value, Object *key) {
-    auto &j = requireJson(value);
-    if (j.kind != Json::Dictionary)
-        fail("expected JSON object");
-    auto it = j.fields.find(key->text);
-    if (it == j.fields.end())
-        fail("missing JSON field '" + key->text + "'");
-    return jsonObject(frame, it->second);
+    try {
+        auto &j = requireJson(value);
+        if (j.kind != Json::Dictionary)
+            fail("expected JSON object", "JsonError");
+        auto it = j.fields.find(key->text);
+        if (it == j.fields.end())
+            fail("missing JSON field '" + key->text + "'", "JsonError");
+        return jsonObject(frame, it->second);
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 Object *fw_json_string(Frame *frame, Object *value) {
-    auto &j = requireJson(value);
-    if (j.kind != Json::Text)
-        fail("expected JSON string");
-    return string(frame, j.text);
+    try {
+        auto &j = requireJson(value);
+        if (j.kind != Json::Text)
+            fail("expected JSON string", "JsonError");
+        return string(frame, j.text);
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 int64_t fw_json_int(Object *value) {
-    auto &j = requireJson(value);
-    if (j.kind != Json::Number)
-        fail("expected JSON integer");
-    int64_t n = 0;
-    auto [end, ec] = std::from_chars(j.text.data(), j.text.data() + j.text.size(), n);
-    if (ec != std::errc{} || end != j.text.data() + j.text.size())
-        fail("JSON integer out of range or non-integral");
-    return n;
+    try {
+        auto &j = requireJson(value);
+        if (j.kind != Json::Number)
+            fail("expected JSON integer", "JsonError");
+        int64_t n = 0;
+        auto [end, ec] = std::from_chars(j.text.data(), j.text.data() + j.text.size(), n);
+        if (ec != std::errc{} || end != j.text.data() + j.text.size())
+            fail("JSON integer out of range or non-integral", "JsonError");
+        return n;
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 double fw_json_real(Object *value) {
-    auto &j = requireJson(value);
-    if (j.kind != Json::Number)
-        fail("expected JSON number");
-    double n;
     try {
-        n = std::stod(j.text);
-    } catch (...) {
-        fail("JSON number out of range");
+        auto &j = requireJson(value);
+        if (j.kind != Json::Number)
+            fail("expected JSON number", "JsonError");
+        double n;
+        try {
+            n = std::stod(j.text);
+        } catch (...) {
+            fail("JSON number out of range", "JsonError");
+        }
+        if (!std::isfinite(n))
+            fail("JSON number out of range", "JsonError");
+        return n;
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
     }
-    if (!std::isfinite(n))
-        fail("JSON number out of range");
-    return n;
 }
 int64_t fw_json_bool(Object *value) {
-    auto &j = requireJson(value);
-    if (j.kind != Json::Boolean)
-        fail("expected JSON boolean");
-    return j.text == "true";
+    try {
+        auto &j = requireJson(value);
+        if (j.kind != Json::Boolean)
+            fail("expected JSON boolean", "JsonError");
+        return j.text == "true";
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 }
 #ifdef _WIN32
@@ -722,6 +1177,7 @@ void closeSocket(Socket s) {
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
 namespace {
@@ -732,127 +1188,593 @@ void closeSocket(Socket s) {
 }
 } // namespace
 #endif
-extern "C" void fw_serve(Object *route, Object *(*handler)(), int64_t port) {
-    if (port < 1 || port > 65535)
-        fail("HTTP port must be in 1..65535");
-    if (route->text.empty() || route->text[0] != '/')
-        fail("HTTP route must start with '/'");
+namespace {
+std::string httpPath(const std::string &path) {
+    const char *hex = "0123456789ABCDEF";
+    std::string out;
+    auto digit = [](unsigned char c) -> int {
+        if (c >= '0' && c <= '9')
+            return c - '0';
+        if (c >= 'a' && c <= 'f')
+            return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F')
+            return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < path.size(); ++i) {
+        auto c = static_cast<unsigned char>(path[i]);
+        if (c == '%' && i + 2 < path.size() && digit(path[i + 1]) >= 0 && digit(path[i + 2]) >= 0) {
+            out += '%';
+            out += hex[digit(path[i + 1])];
+            out += hex[digit(path[i + 2])];
+            i += 2;
+        } else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                   std::string("/-._~!$&'()*+,;=:@").find(static_cast<char>(c)) !=
+                       std::string::npos)
+            out += static_cast<char>(c);
+        else {
+            out += '%';
+            out += hex[c >> 4];
+            out += hex[c & 15];
+        }
+    }
+    return out;
+}
+using HttpHandler = Object *(*)();
+struct SocketOwner {
+    Socket value = invalidSocket;
+    explicit SocketOwner(Socket socket) : value(socket) {}
+    SocketOwner(SocketOwner &&other) noexcept : value(std::exchange(other.value, invalidSocket)) {}
+    SocketOwner(const SocketOwner &) = delete;
+    ~SocketOwner() {
+        if (value != invalidSocket)
+            closeSocket(value);
+    }
+};
+struct Network {
+    Network() {
 #ifdef _WIN32
-    WSADATA data;
-    if (WSAStartup(MAKEWORD(2, 2), &data) != 0)
-        fail("socket initialization failed");
+        WSADATA data;
+        if (WSAStartup(MAKEWORD(2, 2), &data) != 0)
+            fail("socket initialization failed");
 #endif
-    Socket server = socket(AF_INET, SOCK_STREAM, 0);
-    if (server == invalidSocket)
-        fail("cannot create HTTP socket");
-    int reuse = 1;
-    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&reuse),
-               sizeof(reuse));
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    address.sin_port = htons(static_cast<uint16_t>(port));
-    if (bind(server, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0) {
-        closeSocket(server);
-        fail("cannot bind HTTP port " + std::to_string(port));
     }
-    if (listen(server, 16) != 0) {
-        closeSocket(server);
-        fail("cannot listen on HTTP socket");
-    }
-    for (;;) {
-        Socket client = accept(server, nullptr, nullptr);
-        if (client == invalidSocket)
-            continue;
+    ~Network() {
 #ifdef _WIN32
-        DWORD timeout = 5000;
-        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char *>(&timeout),
-                   sizeof(timeout));
-        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char *>(&timeout),
-                   sizeof(timeout));
+        WSACleanup();
+#endif
+    }
+};
+struct HttpServer {
+    SocketOwner socket;
+    std::string route;
+    HttpHandler handler;
+    HttpServer(SocketOwner &&socket, std::string route, HttpHandler handler)
+        : socket(std::move(socket)), route(std::move(route)), handler(handler) {}
+};
+struct HttpRuntime {
+    Network network;
+    std::vector<std::unique_ptr<HttpServer>> servers;
+    bool running = false;
+};
+std::unique_ptr<HttpRuntime> &httpRuntime() {
+    static std::unique_ptr<HttpRuntime> state;
+    return state;
+}
+bool serveRequest(HttpServer &server) {
+    SocketOwner connection(accept(server.socket.value, nullptr, nullptr));
+    Socket client = connection.value;
+    if (client == invalidSocket)
+        return true;
+#ifdef _WIN32
+    DWORD timeout = 5000;
+    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char *>(&timeout),
+               sizeof(timeout));
+    setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char *>(&timeout),
+               sizeof(timeout));
 #else
-        timeval timeout{5, 0};
-        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    timeval timeout{5, 0};
+    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 #ifdef SO_NOSIGPIPE
-        int noSignal = 1;
-        setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, sizeof(noSignal));
+    int noSignal = 1;
+    setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, sizeof(noSignal));
 #endif
 #endif
-        std::string request;
-        char buffer[4096];
-        while (request.find("\r\n\r\n") == std::string::npos && request.size() < 16384) {
-            int n = static_cast<int>(recv(client, buffer, sizeof(buffer), 0));
-            if (n <= 0)
-                break;
-            request.append(buffer, static_cast<size_t>(n));
-        }
-        std::string status = "400 Bad Request", body = "Bad Request",
-                    content = "text/plain; charset=utf-8";
-        auto first = request.find(' '),
-             second = first == std::string::npos ? first : request.find(' ', first + 1);
-        if (request.find("\r\n\r\n") != std::string::npos && first != std::string::npos &&
-            second != std::string::npos) {
-            auto method = request.substr(0, first);
-            auto path = request.substr(first + 1, second - first - 1);
-            auto query = path.find('?');
-            if (query != std::string::npos)
-                path.resize(query);
-            if (method != "GET") {
-                status = "405 Method Not Allowed";
-                body = "Method Not Allowed";
-            } else if (path != route->text) {
-                status = "404 Not Found";
-                body = "Not Found";
-            } else {
-                Object *result = handler();
-                body.clear();
-                render(result, body);
-                release(result);
-                status = "200 OK";
-                content = "text/html; charset=utf-8";
+    std::string request;
+    char buffer[4096];
+    while (request.find("\r\n\r\n") == std::string::npos && request.size() < 16384) {
+        int n = static_cast<int>(recv(client, buffer, sizeof(buffer), 0));
+        if (n <= 0)
+            break;
+        request.append(buffer, static_cast<size_t>(n));
+    }
+    std::string status = "400 Bad Request", body = "Bad Request",
+                content = "text/plain; charset=utf-8";
+    auto first = request.find(' '),
+         second = first == std::string::npos ? first : request.find(' ', first + 1);
+    if (request.find("\r\n\r\n") != std::string::npos && first != std::string::npos &&
+        second != std::string::npos) {
+        auto method = request.substr(0, first);
+        auto path = request.substr(first + 1, second - first - 1);
+        auto query = path.find('?');
+        if (query != std::string::npos)
+            path.resize(query);
+        path = httpPath(path);
+        if (method != "GET") {
+            status = "405 Method Not Allowed";
+            body = "Method Not Allowed";
+        } else if (path != server.route) {
+            status = "404 Not Found";
+            body = "Not Found";
+        } else {
+            Object *result = server.handler();
+            if (pendingError.value) {
+                return false;
             }
+            struct ResultOwner {
+                Object *value;
+                ~ResultOwner() {
+                    release(value);
+                }
+            } owned{result};
+            body.clear();
+            render(result, body);
+            status = "200 OK";
+            content = "text/html; charset=utf-8";
         }
-        std::string response = "HTTP/1.1 " + status + "\r\nContent-Type: " + content +
-                               "\r\nContent-Length: " + std::to_string(body.size()) +
-                               "\r\nConnection: close\r\n\r\n" + body;
-        size_t sent = 0;
-        while (sent < response.size()) {
+    }
+    std::string response = "HTTP/1.1 " + status + "\r\nContent-Type: " + content +
+                           "\r\nContent-Length: " + std::to_string(body.size()) +
+                           "\r\nConnection: close\r\n\r\n" + body;
+    size_t sent = 0;
+    while (sent < response.size()) {
 #ifdef MSG_NOSIGNAL
-            constexpr int flags = MSG_NOSIGNAL;
+        constexpr int flags = MSG_NOSIGNAL;
 #else
-            constexpr int flags = 0;
+        constexpr int flags = 0;
 #endif
-            int n = static_cast<int>(
-                send(client, response.data() + sent,
-                     static_cast<int>(std::min<size_t>(response.size() - sent, 65536)), flags));
-            if (n <= 0)
-                break;
-            sent += static_cast<size_t>(n);
+        int n = static_cast<int>(
+            send(client, response.data() + sent,
+                 static_cast<int>(std::min<size_t>(response.size() - sent, 65536)), flags));
+        if (n <= 0)
+            break;
+        sent += static_cast<size_t>(n);
+    }
+
+    return true;
+}
+} // namespace
+extern "C" void fw_web_shutdown() {
+    if (auto &state = httpRuntime())
+        state->servers.clear();
+}
+extern "C" Object *fw_serve(Frame *frame, Object *route, HttpHandler handler, int64_t port) {
+    try {
+        if (port < 0 || port > 65535)
+            fail("HTTP port must be in 0..65535");
+        if (route->text.empty() || route->text[0] != '/')
+            fail("HTTP route must start with '/'");
+        auto &storage = httpRuntime();
+        if (!storage)
+            storage = std::make_unique<HttpRuntime>();
+        auto &state = *storage;
+        if (state.servers.size() >= FD_SETSIZE)
+            fail("too many HTTP listeners");
+        SocketOwner socketOwner(socket(AF_INET, SOCK_STREAM, 0));
+        auto listener = socketOwner.value;
+        if (listener == invalidSocket)
+            fail("cannot create HTTP socket");
+#ifndef _WIN32
+        if (listener >= FD_SETSIZE)
+            fail("HTTP socket exceeds select descriptor limit");
+#endif
+        int reuse = 1;
+#ifdef _WIN32
+        setsockopt(listener, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                   reinterpret_cast<const char *>(&reuse), sizeof(reuse));
+#else
+        setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&reuse),
+                   sizeof(reuse));
+#endif
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = htons(static_cast<uint16_t>(port));
+        if (bind(listener, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0)
+            fail("cannot bind HTTP port " + std::to_string(port));
+        if (listen(listener, 16) != 0)
+            fail("cannot listen on HTTP socket");
+#ifdef _WIN32
+        int length = sizeof(address);
+#else
+        socklen_t length = sizeof(address);
+#endif
+        if (getsockname(listener, reinterpret_cast<sockaddr *>(&address), &length) != 0)
+            fail("cannot determine HTTP address");
+        auto encodedPath = httpPath(route->text);
+        auto server = std::make_unique<HttpServer>(std::move(socketOwner), encodedPath, handler);
+        auto url = string(frame, "http://127.0.0.1:" + std::to_string(ntohs(address.sin_port)) +
+                                     encodedPath);
+        state.servers.push_back(std::move(server));
+        return url;
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return nullptr;
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return nullptr;
+    }
+}
+extern "C" void fw_web_wait() {
+    bool entered = false;
+    try {
+        auto &storage = httpRuntime();
+        if (!storage || storage->servers.empty())
+            return;
+        auto &state = *storage;
+        if (state.running)
+            fail("web.wait cannot be called from an HTTP handler");
+        struct Running {
+            bool &value;
+            explicit Running(bool &value) : value(value) {
+                value = true;
+            }
+            ~Running() {
+                value = false;
+            }
+        } running(state.running);
+        entered = true;
+        std::cout.flush();
+        while (!state.servers.empty()) {
+            fd_set readable;
+            FD_ZERO(&readable);
+            Socket maximum = 0;
+            for (auto &server : state.servers) {
+                FD_SET(server->socket.value, &readable);
+                if (server->socket.value > maximum)
+                    maximum = server->socket.value;
+            }
+#ifdef _WIN32
+            int ready = select(0, &readable, nullptr, nullptr, nullptr);
+#else
+            int ready = select(maximum + 1, &readable, nullptr, nullptr, nullptr);
+#endif
+            if (ready < 0) {
+#ifdef _WIN32
+                if (WSAGetLastError() == WSAEINTR)
+                    continue;
+#else
+                if (errno == EINTR)
+                    continue;
+#endif
+                fail("HTTP listener wait failed");
+            }
+            std::vector<HttpServer *> selected;
+            for (auto &server : state.servers)
+                if (FD_ISSET(server->socket.value, &readable))
+                    selected.push_back(server.get());
+            for (auto server : selected)
+                if (!serveRequest(*server)) {
+                    fw_web_shutdown();
+                    return;
+                }
         }
-        closeSocket(client);
+    } catch (const NativeFailure &e) {
+        if (entered)
+            fw_web_shutdown();
+        recordFailure(e.type, e.message);
+    } catch (const std::exception &e) {
+        if (entered)
+            fw_web_shutdown();
+        recordFailure("RuntimeError", e.what());
     }
 }
 extern "C" {
 int64_t fw_parse_int(Object *s) {
-    int64_t n;
-    auto [end, ec] = std::from_chars(s->text.data(), s->text.data() + s->text.size(), n);
-    if (ec != std::errc{} || end != s->text.data() + s->text.size())
-        fail("invalid or out-of-range integer string");
-    return n;
+    try {
+        int64_t n;
+        auto [end, ec] = std::from_chars(s->text.data(), s->text.data() + s->text.size(), n);
+        if (ec != std::errc{} || end != s->text.data() + s->text.size())
+            fail("invalid or out-of-range integer string", "NumericError");
+        return n;
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 uint64_t fw_parse_uint(Object *s) {
-    uint64_t n;
-    auto [end, ec] = std::from_chars(s->text.data(), s->text.data() + s->text.size(), n);
-    if (ec != std::errc{} || end != s->text.data() + s->text.size())
-        fail("invalid or out-of-range unsigned integer string");
-    return n;
+    try {
+        uint64_t n;
+        auto [end, ec] = std::from_chars(s->text.data(), s->text.data() + s->text.size(), n);
+        if (ec != std::errc{} || end != s->text.data() + s->text.size())
+            fail("invalid or out-of-range unsigned integer string", "NumericError");
+        return n;
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 double fw_parse_real(Object *s) {
-    double n;
-    auto [end, ec] = std::from_chars(s->text.data(), s->text.data() + s->text.size(), n);
-    if (ec != std::errc{} || end != s->text.data() + s->text.size() || !std::isfinite(n))
-        fail("invalid or out-of-range real string");
-    return n;
+    try {
+        double n;
+        auto [end, ec] = std::from_chars(s->text.data(), s->text.data() + s->text.size(), n);
+        if (ec != std::errc{} || end != s->text.data() + s->text.size() || !std::isfinite(n))
+            fail("invalid or out-of-range real string", "NumericError");
+        return n;
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
 }
 }
+namespace {
+int64_t findKey(Object *map, int64_t integer, Object *object) {
+    for (size_t i = 0; i < map->keys.size(); ++i) {
+        auto &key = map->keys[i];
+        if (map->objectKeys ? fw_equal(key.object, object) : key.integer == integer)
+            return static_cast<int64_t>(i);
+    }
+    return -1;
+}
+} // namespace
+extern "C" {
+Object *fw_map_new(Frame *frame, int64_t objects) {
+    try {
+        auto p = new Object(Object::Map);
+        p->keyKind = static_cast<Slot::Kind>(objects);
+        p->objectKeys = objects == 4;
+        return own(frame, p);
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
+}
+int64_t fw_map_index(Object *p, int64_t integer, Object *object, int64_t insert) {
+    try {
+        auto index = findKey(p, integer, object);
+        if (index >= 0)
+            return index;
+        if (!insert)
+            fail("map key not found", "KeyError");
+        Slot key;
+        key.kind = p->keyKind;
+        if (p->objectKeys) {
+            retain(object);
+            key.object = object;
+            key.kind = Slot::Reference;
+        } else
+            key.integer = integer;
+        p->keys.push_back(std::move(key));
+        p->slots.emplace_back();
+        return static_cast<int64_t>(p->slots.size() - 1);
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
+}
+int64_t fw_map_has(Object *p, int64_t integer, Object *object) {
+    try {
+        return findKey(p, integer, object) >= 0;
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
+}
+int64_t fw_map_remove(Object *p, int64_t integer, Object *object) {
+    try {
+        auto i = findKey(p, integer, object);
+        if (i < 0)
+            return 0;
+        p->keys.erase(p->keys.begin() + i);
+        p->slots.erase(p->slots.begin() + i);
+        return 1;
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
+}
+Object *fw_map_keys(Frame *frame, Object *p) {
+    try {
+        auto keys = new Object(Object::Array);
+        keys->slots = p->keys;
+        return own(frame, keys);
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
+}
+int64_t fw_array_append(Object *p) {
+    try {
+        p->slots.emplace_back();
+        return static_cast<int64_t>(p->slots.size() - 1);
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
+}
+void fw_array_pop(Object *p) {
+    try {
+        if (p->slots.empty())
+            fail("pop from empty array", "IndexError");
+        p->slots.pop_back();
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return;
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return;
+    }
+}
+void fw_collection_clear(Object *p) {
+    try {
+        p->slots.clear();
+        p->keys.clear();
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return;
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return;
+    }
+}
+}
+
+extern "C" {
+int64_t fw_error_pending() {
+    return pendingError.value != nullptr;
+}
+int64_t fw_error_matches(const char *type) {
+    return pendingError.value && (std::string(type) == "Error" || pendingError.type == type);
+}
+void fw_throw(const char *type, Object *value) {
+    if (std::string(type) == "Error" && value && value->kind == Object::ErrorValue &&
+        !value->errorType.empty()) {
+        pendingError.set(value->errorType, value->slots.empty() ? value : value->slots[0].object);
+    } else
+        pendingError.set(type, value);
+}
+void fw_error_report() {
+    if (pendingError.value) {
+        std::cerr << "Flywheel runtime error: " << pendingError.type << ": "
+                  << (pendingError.value->text.empty() ? "exception" : pendingError.value->text)
+                  << '\n';
+        pendingError.clear();
+    }
+}
+Object *fw_error_value(Frame *frame) {
+    auto value = pendingError.value;
+    retain(value);
+    pendingError.clear();
+    return own(frame, value);
+}
+Object *fw_error_take(Frame *frame) {
+    auto p = new Object(Object::ErrorValue);
+    p->errorType = pendingError.type;
+    p->text = pendingError.value && !pendingError.value->text.empty()
+                  ? pendingError.value->text
+                  : "exception of type " + pendingError.type;
+    p->slots.emplace_back();
+    p->slots[0].object = pendingError.value;
+    p->slots[0].kind = Slot::Reference;
+    retain(pendingError.value);
+    pendingError.clear();
+    return own(frame, p);
+}
+void fw_error_restore(Object *p) {
+    pendingError.set(p->errorType, p->slots[0].object);
+}
+Object *fw_error_message(Frame *frame, Object *p) {
+    try {
+        return string(frame, p->text);
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
+}
+Object *fw_error_new(Frame *frame, Object *message, const char *type) {
+    try {
+        auto p = new Object(Object::ErrorValue);
+        p->text = message->text;
+        p->errorType = type;
+        return own(frame, p);
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
+}
+}
+
+extern "C" int64_t fw_live_objects() {
+    return liveObjects.load();
+}
+
+extern "C" Object *fw_range(Frame *frame, int64_t start, int64_t end) {
+    try {
+        if (end < start)
+            end = start;
+        auto count = static_cast<uint64_t>(end) - static_cast<uint64_t>(start);
+        if (count > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+            fail("range size overflow", "NumericError");
+        auto p = new Object(Object::Array);
+        own(frame, p);
+        p->slots.resize(static_cast<size_t>(count));
+        for (size_t i = 0; i < p->slots.size(); ++i)
+            p->slots[i].integer = start + static_cast<int64_t>(i);
+        return p;
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return nullptr;
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return nullptr;
+    }
+}
+
+extern "C" Object *fw_try_read(Frame *frame, Object *path) {
+    try {
+        auto value = fw_read(frame, path);
+        bool ok = !pendingError.value;
+        if (!ok) {
+            if (pendingError.type != "FileError")
+                return nullptr;
+            value = fw_error_value(frame);
+        }
+        auto result = new Object(Object::Result);
+        own(frame, result);
+        result->slots.resize(2);
+        result->slots[0].integer = ok ? 1 : 0;
+        result->slots[0].kind = Slot::Boolean;
+        result->slots[1].object = value;
+        result->slots[1].kind = Slot::Reference;
+        retain(value);
+        return result;
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return nullptr;
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return nullptr;
+    }
+}
+
+#include "collections.inc"
+
+#include "dom.inc"
+
+#include "process.inc"
+
+#include "desktop.inc"

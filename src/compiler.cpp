@@ -1,5 +1,6 @@
 #include "flywheel/frontend.hpp"
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <limits>
 #include <llvm/Config/llvm-config.h>
@@ -15,11 +16,55 @@
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/Target/TargetOptions.h>
 #include <llvm/TargetParser/Host.h>
+#include <optional>
 #include <set>
 #include <unordered_map>
 
 namespace fw {
 namespace {
+std::string displayName(const std::string &text) {
+    std::string result;
+    for (size_t i = 0; i < text.size();) {
+        if (text.compare(i, 8, "$native$") == 0) {
+            i += 8;
+            continue;
+        }
+        if (text.compare(i, 2, "$m") == 0) {
+            size_t end = i + 2;
+            while (end < text.size() && std::isdigit(static_cast<unsigned char>(text[end])))
+                ++end;
+            if (end > i + 2 && end < text.size() && text[end] == '$') {
+                i = end + 1;
+                continue;
+            }
+        }
+        result += text[i++];
+    }
+    return result;
+}
+std::vector<std::string> typeParts(const std::string &text) {
+    std::vector<std::string> result;
+    int depth = 0;
+    size_t start = 0;
+    for (size_t i = 0; i < text.size(); ++i) {
+        char c = text[i];
+        if (c == '<' || c == '[')
+            ++depth;
+        else if (c == '>' || c == ']')
+            --depth;
+        else if (c == ',' && depth == 0) {
+            result.push_back(text.substr(start, i - start));
+            start = i + 1;
+        }
+    }
+    if (start < text.size())
+        result.push_back(text.substr(start));
+    return result;
+}
+const std::set<std::string> errorTypes = {
+    "Error",         "RuntimeError",   "FileError",    "IndexError",  "KeyError",
+    "NumericError",  "AssertionError", "JsonError",    "ResultError", "CastError",
+    "SelectorError", "InputError",     "ProcessError", "DesktopError"};
 struct Ty {
     std::string name = "void";
     bool operator==(const Ty &t) const {
@@ -47,8 +92,30 @@ struct Ty {
     bool array() const {
         return name.size() > 2 && name.substr(name.size() - 2) == "[]";
     }
+    bool homogeneousTuple() const {
+        return name.rfind("tuple<", 0) == 0 && name.back() == '>';
+    }
+    bool sequence() const {
+        return array() || homogeneousTuple();
+    }
+    bool tuple() const {
+        return !name.empty() && !array() && name.front() == '[' && name.back() == ']';
+    }
+    bool map() const {
+        return name.rfind("map<", 0) == 0 && name.back() == '>';
+    }
+    bool result() const {
+        return name.rfind("Result<", 0) == 0 && name.back() == '>';
+    }
+    std::vector<Ty> parts() const {
+        size_t first = tuple() ? 1 : name.find('<') + 1;
+        std::vector<Ty> r;
+        for (auto &p : typeParts(name.substr(first, name.size() - first - 1)))
+            r.push_back(Ty{p});
+        return r;
+    }
     Ty item() const {
-        return Ty{name.substr(0, name.size() - 2)};
+        return homogeneousTuple() ? parts()[0] : Ty{name.substr(0, name.size() - 2)};
     }
     int bits() const {
         if (integer())
@@ -57,7 +124,10 @@ struct Ty {
     }
     bool object() const {
         return !numeric() && name != "bool" && name != "void" && name.rfind("fn:", 0) != 0 &&
-               name.rfind("module:", 0) != 0;
+               name.rfind("module:", 0) != 0 && !classReference();
+    }
+    bool classReference() const {
+        return name.rfind("class:", 0) == 0;
     }
 };
 struct Val {
@@ -68,6 +138,7 @@ struct Var {
     llvm::Value *address;
     Ty type;
     bool constant = false;
+    llvm::Value *initialized = nullptr;
 };
 struct Signature {
     Function *ast = nullptr;
@@ -94,12 +165,38 @@ class Compiler {
     std::map<std::string, std::map<std::string, Ty>> componentTypes;
     Ty returnType;
     bool infer = false, top = false;
-    std::string owner;
+    std::string owner, desktopBackend;
     std::vector<Ty> returns;
     Location location;
     uint64_t tempGeneration = 0;
+    bool borrowed = false;
+    struct Handler {
+        llvm::BasicBlock *target;
+        size_t depth;
+    };
+    struct Finalizer {
+        std::vector<SP> *body;
+        Handler outer;
+        size_t loopDepth;
+        size_t depth;
+    };
+    std::vector<Handler> handlers;
+    std::vector<Finalizer> finalizers;
+    std::vector<size_t> loopScopes;
+    llvm::BasicBlock *failure = nullptr;
+    struct ProtectedValue {
+        llvm::Value *address;
+        size_t depth;
+    };
+    std::vector<ProtectedValue> protectedValues;
+    void releaseProtected(size_t depth) {
+        for (auto &value : protectedValues)
+            if (value.depth >= depth)
+                call("fw_store", b.getVoidTy(),
+                     {value.address, llvm::ConstantPointerNull::get(b.getPtrTy())});
+    }
     [[noreturn]] void error(const std::string &s) {
-        throw Error(location, s);
+        throw Error(location, displayName(s));
     }
     llvm::Type *ll(Ty t) {
         if (t.integer())
@@ -115,6 +212,12 @@ class Compiler {
         return b.getPtrTy();
     }
     Ty type(std::string name) {
+        if (name.rfind("array<", 0) == 0 && name.back() == '>') {
+            auto parts = Ty{name}.parts();
+            if (parts.size() != 1)
+                error("array<T> requires one element type");
+            return type(parts[0].name + "[]");
+        }
         if (name == "int")
             name = "i64";
         if (name.size() > 2 && name.substr(name.size() - 2) == "[]")
@@ -126,13 +229,93 @@ class Compiler {
             return Ty{inner.name + "?"};
         }
         Ty t{name};
+        if (t.tuple() || t.homogeneousTuple() || t.map() || t.result()) {
+            auto parts = t.parts();
+            if ((t.map() || t.result()) && parts.size() != 2)
+                error("generic collection/Result requires two types");
+            if (t.homogeneousTuple() && parts.size() != 1)
+                error("tuple<T> requires one element type");
+            std::string r = t.tuple()              ? "["
+                            : t.map()              ? "map<"
+                            : t.homogeneousTuple() ? "tuple<"
+                                                   : "Result<";
+            for (size_t i = 0; i < parts.size(); ++i) {
+                auto part = type(parts[i].name);
+                if (part.name == "void")
+                    error("collection and Result payloads cannot be void");
+                if (i)
+                    r += ",";
+                r += part.name;
+            }
+            r += t.tuple() ? "]" : ">";
+            Ty out{r};
+            if (out.map()) {
+                auto key = out.parts()[0];
+                if (!key.integer() && key.name != "string" && key.name != "bool")
+                    error("map keys must be integers, bool, or string");
+            }
+            return out;
+        }
         if (t.numeric() || name == "bool" || name == "string" || name == "void" ||
-            name == "element" || name == "fragment" || classes.count(name))
+            name == "element" || name == "fragment" || name == "json.value" ||
+            name == "desktop.window" || errorTypes.count(name) || classes.count(name))
             return t;
         error("unknown or unsupported type '" + name + "'");
     }
     llvm::ConstantInt *i64(int64_t x) {
         return b.getInt64(x);
+    }
+    Handler errorHandler() {
+        return handlers.empty() ? Handler{failure, 0} : handlers.back();
+    }
+    void releaseScopes(size_t depth) {
+        for (size_t i = scopes.size(); i > depth; --i)
+            for (auto &[name, var] : scopes[i - 1]) {
+                (void)name;
+                if (var.type.object())
+                    call("fw_store", b.getVoidTy(),
+                         {var.address, llvm::ConstantPointerNull::get(b.getPtrTy())});
+            }
+    }
+    void checkError() {
+        auto handler = errorHandler();
+        if (!handler.target)
+            return;
+        auto status = call("fw_error_pending", b.getInt64Ty(), {});
+        auto ok = llvm::BasicBlock::Create(ctx, "success", current);
+        auto cleanup = llvm::BasicBlock::Create(ctx, "error.cleanup", current);
+        b.CreateCondBr(b.CreateICmpNE(status, i64(0)), cleanup, ok);
+        b.SetInsertPoint(cleanup);
+        releaseProtected(handler.depth);
+        if (handler.target != failure)
+            releaseScopes(handler.depth);
+        call("fw_sweep", b.getVoidTy(), {frame});
+        b.CreateBr(handler.target);
+        b.SetInsertPoint(ok);
+    }
+    bool usesWeb() const {
+        for (auto &[alias, name] : p.imports) {
+            (void)alias;
+            if (name == "web")
+                return true;
+        }
+        return false;
+    }
+    void emitFailure() {
+        auto saved = b.saveIP();
+        b.SetInsertPoint(failure);
+        if (top && usesWeb())
+            call("fw_web_shutdown", b.getVoidTy(), {});
+        if (top)
+            call("fw_error_report", b.getVoidTy(), {});
+        call("fw_drop", b.getVoidTy(), {frame});
+        if (top)
+            b.CreateRet(b.getInt32(1));
+        else if (infer || returnType.name == "void")
+            b.CreateRetVoid();
+        else
+            b.CreateRet(llvm::Constant::getNullValue(ll(returnType)));
+        b.restoreIP(saved);
     }
     llvm::Value *call(const std::string &name, llvm::Type *result,
                       std::vector<llvm::Value *> args) {
@@ -140,7 +323,15 @@ class Compiler {
         for (auto a : args)
             types.push_back(a->getType());
         auto f = module.getOrInsertFunction(name, llvm::FunctionType::get(result, types, false));
-        return b.CreateCall(f, args);
+        auto resultValue = b.CreateCall(f, args);
+        static const std::set<std::string> safe = {
+            "fw_frame",         "fw_drop",          "fw_root",          "fw_sweep",
+            "fw_store",         "fw_retain",        "fw_adopt",         "fw_keep",
+            "fw_error_pending", "fw_error_matches", "fw_throw",         "fw_error_report",
+            "fw_error_value",   "fw_error_take",    "fw_error_restore", "fw_web_shutdown"};
+        if (!safe.count(name))
+            checkError();
+        return resultValue;
     }
     llvm::Value *objectCall(const std::string &name, std::vector<llvm::Value *> args) {
         if (name != "fw_frame")
@@ -153,12 +344,14 @@ class Compiler {
                             i64(static_cast<int64_t>(s.size()))}),
                 Ty{"string"}};
     }
-    void guard(llvm::Value *condition, const std::string &message) {
+    void guard(llvm::Value *condition, const std::string &message,
+               const std::string &errorType = "NumericError") {
         auto ok = llvm::BasicBlock::Create(ctx, "checked", current);
         auto bad = llvm::BasicBlock::Create(ctx, "error", current);
         b.CreateCondBr(condition, ok, bad);
         b.SetInsertPoint(bad);
-        call("fw_panic", b.getVoidTy(), {b.CreateGlobalString(message)});
+        call("fw_panic", b.getVoidTy(),
+             {b.CreateGlobalString(message), b.CreateGlobalString(errorType)});
         b.CreateUnreachable();
         b.SetInsertPoint(ok);
     }
@@ -179,12 +372,25 @@ class Compiler {
     Val convert(Val x, Ty to, bool explicit_ = false) {
         if (x.t == to)
             return x;
+        if (x.t.classReference())
+            error("constructor reference '" + displayName(x.t.name.substr(6)) +
+                  "' is not an instance; call it with () or use the unparenthesized class name on "
+                  "the assignment right-hand side");
+        if (explicit_ && x.t.nullable() && x.t.name == to.name + "?") {
+            guard(b.CreateICmpNE(x.v, llvm::ConstantPointerNull::get(b.getPtrTy())),
+                  "cannot cast null to " + to.name, "CastError");
+            return {x.v, to};
+        }
+        if (explicit_ && x.t.name == "bool" && to.numeric())
+            return convert({b.CreateZExt(x.v, b.getInt8Ty()), Ty{"u8"}}, to, true);
+        if (to.name == "Error" && errorTypes.count(x.t.name))
+            return {x.v, to};
         if (x.t.name == "null" && to.nullable())
             return {x.v, to};
         if (to.nullable() && to.name == x.t.name + "?")
             return {x.v, to};
         if (x.t.name == "fragment" && to.name == "element")
-            error("fragment is not an element");
+            return {x.v, to};
         if (x.t.numeric() && to.numeric()) {
             bool fits = false;
             if (auto ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(x.v); ci && to.integer()) {
@@ -197,7 +403,7 @@ class Compiler {
                 error("cannot implicitly convert " + x.t.name + " to " + to.name +
                       "; use an explicit checked cast");
             if (x.t.integer() && to.integer()) {
-                auto out = b.CreateIntCast(x.v, ll(to), !x.t.unsigned_());
+                auto out = b.CreateIntCast(x.v, ll(to), x.t.name != "bool" && !x.t.unsigned_());
                 if (explicit_ && !widening(x.t, to)) {
                     auto restored = b.CreateIntCast(out, ll(x.t), !to.unsigned_());
                     auto valid = b.CreateICmpEQ(restored, x.v);
@@ -236,10 +442,12 @@ class Compiler {
     Val stringify(Val x) {
         if (x.t.name == "string")
             return x;
+        if (errorTypes.count(x.t.name))
+            return {objectCall("fw_error_message", {frame, x.v}), Ty{"string"}};
         if (x.t.name == "element" || x.t.name == "fragment")
             return {objectCall("fw_render", {frame, x.v}), Ty{"string"}};
         if (x.t.integer()) {
-            auto y = b.CreateIntCast(x.v, b.getInt64Ty(), !x.t.unsigned_());
+            auto y = b.CreateIntCast(x.v, b.getInt64Ty(), x.t.name != "bool" && !x.t.unsigned_());
             return {objectCall(x.t.unsigned_() ? "fw_uint_string" : "fw_int_string", {frame, y}),
                     Ty{"string"}};
         }
@@ -251,6 +459,14 @@ class Compiler {
                     Ty{"string"}};
         if (x.t.name == "null")
             return literal("null");
+        if (x.t.name.rfind("fn:", 0) == 0)
+            return literal("<function " + displayName(x.t.name.substr(3)) + ">");
+        if (x.t.classReference())
+            return literal("<class " + displayName(x.t.name.substr(6)) + ">");
+        if (x.t.name.rfind("module:", 0) == 0)
+            return literal("<module " + x.t.name.substr(7) + ">");
+        if (x.t.object())
+            return {objectCall("fw_format", {frame, x.v}), Ty{"string"}};
         error("cannot format value of type " + x.t.name);
     }
     Var *lookup(const std::string &name) {
@@ -292,8 +508,11 @@ class Compiler {
         scopes.back()[name] = {a, v.t, constant};
     }
     Val load(Var &v) {
+        if (v.initialized && !top)
+            guard(b.CreateLoad(b.getInt1Ty(), v.initialized),
+                  "module global read before initialization", "RuntimeError");
         auto result = b.CreateLoad(ll(v.type), v.address);
-        if (v.type.object())
+        if (v.type.object() && !borrowed)
             return {objectCall("fw_keep", {frame, result}), v.type};
         return {result, v.type};
     }
@@ -309,7 +528,7 @@ class Compiler {
     Val get(Val obj, llvm::Value *index, Ty t) {
         if (t.object()) {
             auto object = objectCall("fw_get_object", {obj.v, index});
-            return {objectCall("fw_keep", {frame, object}), t};
+            return {borrowed ? object : objectCall("fw_keep", {frame, object}), t};
         }
         if (t.real()) {
             auto x = call("fw_get_real", b.getDoubleTy(), {obj.v, index});
@@ -319,6 +538,8 @@ class Compiler {
         return {b.CreateIntCast(x, ll(t), !t.unsigned_()), t};
     }
     void set(Val obj, llvm::Value *index, Val x) {
+        if (x.t.classReference())
+            error("constructor references cannot be stored in collections or object fields");
         if (x.t.object())
             call("fw_set_object", b.getVoidTy(), {obj.v, index, x.v});
         else if (x.t.real())
@@ -326,7 +547,11 @@ class Compiler {
                  {obj.v, index, b.CreateFPCast(x.v, b.getDoubleTy())});
         else
             call("fw_set_int", b.getVoidTy(),
-                 {obj.v, index, b.CreateIntCast(x.v, b.getInt64Ty(), !x.t.unsigned_())});
+                 {obj.v, index,
+                  b.CreateIntCast(x.v, b.getInt64Ty(), x.t.name != "bool" && !x.t.unsigned_()),
+                  i64(x.t.name == "bool" ? 3
+                      : x.t.unsigned_()  ? 1
+                                         : 0)});
     }
     Val receiver() {
         auto v = lookup("$inst");
@@ -459,7 +684,24 @@ class Compiler {
         }
         return "";
     }
-    Val invoke(Expr &e);
+    Val newInstance(Class &c) {
+        std::string fields;
+        for (auto &f : c.fields) {
+            if (!fields.empty())
+                fields += ",";
+            fields += f.name;
+        }
+        return {
+            objectCall("fw_instance",
+                       {frame, i64(c.fields.size()), b.CreateGlobalString(c.name),
+                        b.CreateGlobalString(displayName(c.name)), b.CreateGlobalString(fields)}),
+            Ty{c.name}};
+    }
+    Val collectionCast(Val source, Ty target);
+    Ty inferCollectionCast(const std::string &constructor, Ty source);
+    Val explicitCast(Val source, Ty target);
+    std::optional<Val> domCall(const std::string &name, std::vector<Val> args);
+    Val invoke(Expr &e, Ty expected = Ty{});
     Val value(Expr &e, Ty expected = Ty{});
     Val defaultValue(Expr &e, Ty expected) {
         auto saved = std::move(scopes);
@@ -475,9 +717,152 @@ class Compiler {
         componentNames = std::move(savedNames);
         return result;
     }
+    llvm::Value *mapIndex(Val map, Val key, bool insert) {
+        auto integer = key.t.object() ? i64(0)
+                                      : b.CreateIntCast(key.v, b.getInt64Ty(),
+                                                        key.t.name != "bool" && !key.t.unsigned_());
+        auto object = key.t.object() ? key.v : llvm::ConstantPointerNull::get(b.getPtrTy());
+        return call("fw_map_index", b.getInt64Ty(), {map.v, integer, object, i64(insert ? 1 : 0)});
+    }
+    std::optional<int64_t> constantIndex(Expr &e) {
+        if (e.kind == "int") {
+            try {
+                return std::stoll(e.text);
+            } catch (...) {
+                return std::nullopt;
+            }
+        }
+        if (e.kind == "unary" && (e.text == "+" || e.text == "-")) {
+            auto n = constantIndex(*e.args[0]);
+            if (!n)
+                return std::nullopt;
+            if (e.text == "+")
+                return n;
+            if (*n == std::numeric_limits<int64_t>::min())
+                error("tuple index overflow");
+            return -*n;
+        }
+        if (e.kind != "binary")
+            return std::nullopt;
+        auto a = constantIndex(*e.args[0]), c = constantIndex(*e.args[1]);
+        if (!a || !c)
+            return std::nullopt;
+        llvm::APInt left(64, static_cast<uint64_t>(*a), true),
+            right(64, static_cast<uint64_t>(*c), true), out(64, 0);
+        bool overflow = false;
+        if (e.text == "+")
+            out = left.sadd_ov(right, overflow);
+        else if (e.text == "-")
+            out = left.ssub_ov(right, overflow);
+        else if (e.text == "*")
+            out = left.smul_ov(right, overflow);
+        else if (e.text == "//" || e.text == "%") {
+            if (*c == 0 || (*a == std::numeric_limits<int64_t>::min() && *c == -1))
+                error("invalid constant tuple index division");
+            out = e.text == "//" ? left.sdiv(right) : left.srem(right);
+        } else
+            return std::nullopt;
+        if (overflow)
+            error("tuple index overflow");
+        return out.getSExtValue();
+    }
+    std::pair<llvm::Value *, Ty> indexOf(Val obj, Expr &e, bool insert) {
+        if (obj.t.map()) {
+            auto parts = obj.t.parts();
+            auto key = convert(value(e, parts[0]), parts[0]);
+            return {mapIndex(obj, key, insert), parts[1]};
+        }
+        if (obj.t.tuple()) {
+            auto index = constantIndex(e);
+            if (!index)
+                error("tuple indices must be compile-time integers");
+            auto parts = obj.t.parts();
+            if (*index < 0 || size_t(*index) >= parts.size())
+                error("tuple index out of bounds");
+            return {i64(*index), parts[size_t(*index)]};
+        }
+        auto index = convert(value(e), Ty{"i64"});
+        if (obj.t.sequence())
+            return {index.v, obj.t.item()};
+        error("indexing requires an array, tuple, or map");
+    }
+    void runFinalizers(size_t minimumLoop = 0) {
+        auto savedFinalizers = finalizers;
+        auto savedHandlers = handlers;
+        auto savedScopes = scopes;
+        for (size_t i = savedFinalizers.size(); i > 0; --i) {
+            auto active = savedFinalizers[i - 1];
+            if (active.loopDepth < minimumLoop)
+                break;
+            releaseScopes(active.depth);
+            finalizers.assign(savedFinalizers.begin(),
+                              savedFinalizers.begin() + static_cast<ptrdiff_t>(i - 1));
+            handlers = {active.outer};
+            scopes.resize(active.depth);
+            block(*active.body);
+            scopes = savedScopes;
+            if (terminated())
+                break;
+        }
+        finalizers = std::move(savedFinalizers);
+        handlers = std::move(savedHandlers);
+        scopes = std::move(savedScopes);
+    }
     void statement(Stmt &s);
     bool terminated() {
         return !b.GetInsertBlock()->empty() && b.GetInsertBlock()->back().isTerminator();
+    }
+    bool borrowable(Expr &e) {
+        if (e.kind == "element" && p.components.count(e.text))
+            return false;
+        if (e.outer && !e.grouped && (e.kind == "name" || e.kind == "member")) {
+            auto name = callable(e);
+            auto variable = lookup(name);
+            if (classes.count(name) || name == "desktop.window" || name == "desktop.Window" ||
+                (variable && variable->type.classReference()))
+                return false;
+        }
+        if (e.kind == "call") {
+            auto name = callable(*e.args[0]);
+            if (functions.count(name) || classes.count(name) || lookup(name))
+                return false;
+            static const std::set<std::string> pure = {"print",    "len",
+                                                       "typeof",   "string",
+                                                       "int",      "i8",
+                                                       "i16",      "i32",
+                                                       "i64",      "u8",
+                                                       "u16",      "u32",
+                                                       "u64",      "float",
+                                                       "double",   "html.render",
+                                                       "render",   "math.sqrt",
+                                                       "math.sin", "math.cos",
+                                                       "math.pow", "testing.live_objects"};
+            if (!pure.count(name)) {
+                auto &callee = *e.args[0];
+                bool markupRender = false;
+                if (callee.kind == "member" && callee.text == "render") {
+                    auto &receiver = *callee.args[0];
+                    markupRender = receiver.kind == "element";
+                    if (receiver.kind == "name")
+                        if (auto var = lookup(receiver.text))
+                            markupRender =
+                                var->type.name == "element" || var->type.name == "fragment";
+                }
+                if (!markupRender)
+                    return false;
+            }
+        }
+        for (auto &a : e.args)
+            if (!borrowable(*a))
+                return false;
+        return true;
+    }
+    bool borrowable(Stmt &s) {
+        if (s.kind == "assign" && s.target && s.target->kind == "member")
+            return false;
+        if (s.kind != "declare" && s.kind != "assign" && s.kind != "expr" && s.kind != "return")
+            return false;
+        return (!s.expr || borrowable(*s.expr)) && (!s.target || borrowable(*s.target));
     }
     void block(std::vector<SP> &body, bool scope = true) {
         if (scope)
@@ -486,12 +871,18 @@ class Compiler {
             if (terminated())
                 error("unreachable statement");
             auto before = tempGeneration;
+            auto savedBorrowed = borrowed;
+            borrowed = borrowable(*s);
             statement(*s);
+            borrowed = savedBorrowed;
             if (!terminated() && tempGeneration != before)
                 call("fw_sweep", b.getVoidTy(), {frame});
         }
-        if (scope)
+        if (scope) {
+            if (!terminated())
+                releaseScopes(scopes.size() - 1);
             scopes.pop_back();
+        }
     }
     Signature &signature(const std::string &name) {
         auto it = functions.find(name);
@@ -551,8 +942,9 @@ class Compiler {
                 if (!fields.insert(f.name).second)
                     error("duplicate field");
         }
-        static const std::set<std::string> modules = {"html", "math", "fs",      "os",  "json",
-                                                      "web",  "time", "testing", "core"};
+        static const std::set<std::string> modules = {"desktop", "html", "math",       "fs",
+                                                      "os",      "json", "web",        "time",
+                                                      "testing", "core", "collections"};
         for (auto &[alias, name] : p.imports) {
             if (!modules.count(name))
                 error("module '" + name +
@@ -566,19 +958,26 @@ class Compiler {
                 declareFunction(f);
     }
     void run(const Options &opts) {
+        desktopBackend = opts.desktopBackend;
         current = llvm::Function::Create(llvm::FunctionType::get(b.getInt32Ty(), false),
                                          llvm::GlobalValue::ExternalLinkage, "main", module);
         auto entry = llvm::BasicBlock::Create(ctx, "entry", current);
         b.SetInsertPoint(entry);
         frame = objectCall("fw_frame", {});
+        failure = llvm::BasicBlock::Create(ctx, "propagate.error", current);
         scopes.emplace_back();
         top = true;
         returnType = Ty{"void"};
         block(p.body, false);
         if (!terminated()) {
+            if (usesWeb()) {
+                call("fw_web_wait", b.getVoidTy(), {});
+                call("fw_web_shutdown", b.getVoidTy(), {});
+            }
             call("fw_drop", b.getVoidTy(), {frame});
             b.CreateRet(b.getInt32(0));
         }
+        emitFailure();
         top = false;
         for (auto &[name, sig] : functions) {
             (void)name;
@@ -629,8 +1028,126 @@ class Compiler {
         }
     }
 };
+Ty Compiler::inferCollectionCast(const std::string &constructor, Ty source) {
+    auto common = [&](std::vector<Ty> parts) -> Ty {
+        if (parts.empty())
+            error("empty collection needs an explicit element type");
+        auto result = parts[0];
+        for (auto &part : parts) {
+            if (result == part)
+                continue;
+            if (widening(result, part))
+                result = part;
+            else if (widening(part, result))
+                continue;
+            else if ((result.name == "element" || result.name == "fragment") &&
+                     (part.name == "element" || part.name == "fragment"))
+                result = Ty{"element"};
+            else
+                error("heterogeneous collection needs an explicit target element type");
+        }
+        return result;
+    };
+    if (constructor == "map") {
+        if (source.map())
+            return source;
+        auto pairTypes = source.tuple()      ? source.parts()
+                         : source.sequence() ? std::vector<Ty>{source.item()}
+                                             : std::vector<Ty>{};
+        std::vector<Ty> keys, values;
+        for (auto &pair : pairTypes) {
+            if (pair.tuple()) {
+                auto parts = pair.parts();
+                if (parts.size() != 2)
+                    error("map casts require two-item pairs");
+                keys.push_back(parts[0]);
+                values.push_back(parts[1]);
+            } else if (pair.sequence()) {
+                keys.push_back(pair.item());
+                values.push_back(pair.item());
+            } else
+                error("map casts require a sequence of pairs");
+        }
+        return type("map<" + common(keys).name + "," + common(values).name + ">");
+    }
+    Ty item;
+    if (source.map()) {
+        auto parts = source.parts();
+        item = Ty{"[" + parts[0].name + "," + parts[1].name + "]"};
+    } else if (source.sequence())
+        item = source.item();
+    else if (source.tuple()) {
+        if (constructor == "tuple")
+            return source;
+        item = common(source.parts());
+    } else
+        item = source;
+    return type(constructor == "array" ? item.name + "[]" : "tuple<" + item.name + ">");
+}
+Val Compiler::collectionCast(Val source, Ty target) {
+    if (source.t.classReference() || source.t.name == "void" ||
+        source.t.name.rfind("fn:", 0) == 0 || source.t.name.rfind("module:", 0) == 0)
+        error("unsupported cast source " + source.t.name);
+    Val box{objectCall("fw_new", {frame, i64(1), i64(2)}), Ty{"Error"}};
+    set(box, i64(0), source);
+    Val converted{
+        objectCall("fw_collection_cast", {frame, box.v, b.CreateGlobalString(source.t.name),
+                                          b.CreateGlobalString(target.name)}),
+        Ty{"Error"}};
+    return get(converted, i64(0), target);
+}
+Val Compiler::explicitCast(Val source, Ty target) {
+    if (target.name == "string")
+        return stringify(source);
+    if (source.t.name == "void" || source.t.name.rfind("module:", 0) == 0)
+        error("unsupported cast source " + source.t.name);
+    if (source.t.name.rfind("fn:", 0) == 0 || source.t.classReference()) {
+        if (target.name == "bool")
+            return {b.getTrue(), Ty{"bool"}};
+        error("unsupported cast source " + source.t.name);
+    }
+    if (source.t == target && !target.array() && !target.tuple() && !target.homogeneousTuple() &&
+        !target.map())
+        return source;
+    if ((source.t.numeric() || source.t.name == "bool") && target.numeric())
+        return convert(source, target, true);
+    return collectionCast(source, target);
+}
 Val Compiler::value(Expr &e, Ty expected) {
     location = e.loc;
+    if (e.kind == "name" || e.kind == "member") {
+        auto name = callable(e);
+        bool referenceVariable = false;
+        if (e.kind == "name")
+            if (auto variable = lookup(name)) {
+                referenceVariable = variable->type.classReference();
+                if (referenceVariable) {
+                    // Check global initialization even though the constructor identity is static.
+                    auto reference = load(*variable);
+                    if (e.grouped || !e.outer)
+                        return reference;
+                    name = variable->type.name.substr(6);
+                } else
+                    name.clear();
+            }
+        if (name == "desktop.Window")
+            name = "desktop.window";
+        if (referenceVariable || classes.count(name) || name == "desktop.window") {
+            if (e.outer && !e.grouped) {
+                Expr call;
+                call.kind = "call";
+                call.loc = e.loc;
+                auto callee = std::make_unique<Expr>();
+                callee->kind = "name";
+                callee->text = name;
+                callee->loc = e.loc;
+                call.args.push_back(std::move(callee));
+                return invoke(call, expected);
+            }
+            // Constructor identity lives in the static type; this payload is never ARC-managed.
+            return {llvm::ConstantPointerNull::get(b.getPtrTy()), Ty{"class:" + name}};
+        }
+    }
     if (e.kind == "int") {
         try {
             size_t used;
@@ -696,54 +1213,108 @@ Val Compiler::value(Expr &e, Ty expected) {
     }
     if (e.kind == "member") {
         auto obj = value(*e.args[0]);
+        if (obj.t.name == "element?" || obj.t.name == "fragment?")
+            obj = convert(obj, Ty{obj.t.name.substr(0, obj.t.name.size() - 1)}, true);
         if (obj.t.name == "module:math" && e.text == "PI")
             return {llvm::ConstantFP::get(b.getDoubleTy(), 3.141592653589793), Ty{"double"}};
-        if ((obj.t.name == "string" || obj.t.array()) && e.text == "length")
+        if (obj.t.name == "module:desktop")
+            error("module 'desktop' has no member '" + e.text +
+                  "'; use desktop.window or desktop.Window");
+        if (obj.t.result() && e.text == "is_ok")
+            return get(obj, i64(0), Ty{"bool"});
+        if ((obj.t.name == "string" || obj.t.sequence() || obj.t.map() || obj.t.tuple()) &&
+            e.text == "length")
             return {call("fw_length", b.getInt64Ty(), {obj.v}), Ty{"i64"}};
         if (obj.t.name == "element" || obj.t.name == "fragment") {
             if (e.text == "tag")
                 return {objectCall("fw_tag", {frame, obj.v}), Ty{"string"}};
-            if (e.text == "children")
-                error("element.children includes text and element nodes; its union type is not "
-                      "implemented yet");
+            if (e.text == "attributes" || e.text == "children" || e.text == "text_content" ||
+                e.text == "inner_html" || e.text == "outer_html" || e.text == "id" ||
+                e.text == "class_name")
+                return *domCall("html." + e.text, {obj});
         }
+        if (errorTypes.count(obj.t.name) && e.text == "message")
+            return {objectCall("fw_error_message", {frame, obj.v}), Ty{"string"}};
         auto [c, i] = field(obj.t, e.text);
         return get(obj, i64(i), type(c->fields[i].type));
     }
     if (e.kind == "index") {
         auto obj = value(*e.args[0]);
-        if (!obj.t.array())
-            error("indexing requires an array");
-        auto index = convert(value(*e.args[1]), Ty{"i64"});
-        return get(obj, index.v, obj.t.item());
+        auto [index, t] = indexOf(obj, *e.args[1], false);
+        return get(obj, index, t);
     }
     if (e.kind == "call")
-        return invoke(e);
+        return invoke(e, expected);
     if (e.kind == "array") {
-        Ty item = expected.array() ? expected.item() : Ty{};
         std::vector<Val> items;
-        for (auto &arg : e.args) {
-            auto v = value(*arg, item);
+        auto parts = expected.tuple() ? expected.parts() : std::vector<Ty>{};
+        if (expected.tuple() && parts.size() != e.args.size())
+            error("tuple length does not match declared type");
+        Ty item = expected.sequence() ? expected.item() : Ty{};
+        bool tuple = expected.tuple();
+        for (size_t i = 0; i < e.args.size(); ++i) {
+            auto v = value(*e.args[i], expected.tuple() ? parts[i] : item);
+            items.push_back(v);
             if (item.name == "void")
                 item = v.t;
-            else if (v.t != item && !expected.array()) {
+            else if (v.t != item && !expected.sequence() && !tuple) {
                 if (widening(item, v.t))
                     item = v.t;
                 else if (!widening(v.t, item))
-                    error("heterogeneous tuple inference is not implemented yet");
+                    tuple = true;
             }
-            items.push_back(v);
         }
-        if (item.name == "void")
+        if (items.empty() && !expected.sequence() && !expected.tuple())
             error("empty arrays require an expected array type");
-        if (item.name == "null" || item.name == "void" ||
-            (!item.object() && !item.numeric() && item.name != "bool"))
-            error("unsupported array element type");
-        Ty t{item.name + "[]"};
-        Val array{objectCall("fw_new", {frame, i64(items.size()), i64(1)}), t};
-        for (size_t i = 0; i < items.size(); ++i)
-            set(array, i64(i), convert(items[i], item));
-        return array;
+        Ty t;
+        if (tuple) {
+            t.name = "[";
+            for (size_t i = 0; i < items.size(); ++i) {
+                if (i)
+                    t.name += ",";
+                t.name += (expected.tuple() ? parts[i] : items[i].t).name;
+            }
+            t.name += "]";
+        } else
+            t.name = expected.homogeneousTuple() ? "tuple<" + item.name + ">" : item.name + "[]";
+        Val out{objectCall("fw_new", {frame, i64(items.size()),
+                                      i64(t.tuple() || t.homogeneousTuple() ? 7 : 1)}),
+                t};
+        for (size_t i = 0; i < items.size(); ++i) {
+            auto target = tuple ? t.parts()[i] : item;
+            if (target.name == "void" || target.name == "null")
+                error("collection item needs a concrete type");
+            set(out, i64(i), convert(items[i], target));
+        }
+        return out;
+    }
+    if (e.kind == "map") {
+        if (e.args.empty() && !expected.map())
+            error("empty maps require an expected map type");
+        std::vector<Val> keys, values;
+        Ty key = expected.map() ? expected.parts()[0] : Ty{},
+           item = expected.map() ? expected.parts()[1] : Ty{};
+        for (size_t i = 0; i < e.args.size(); i += 2) {
+            auto k = value(*e.args[i], key);
+            auto v = value(*e.args[i + 1], item);
+            if (key.name == "void")
+                key = k.t;
+            if (item.name == "void")
+                item = v.t;
+            keys.push_back(k);
+            values.push_back(v);
+        }
+        Ty t = type("map<" + key.name + "," + item.name + ">");
+        Val out{objectCall("fw_map_new", {frame, i64(key.object()         ? 4
+                                                     : key.name == "bool" ? 3
+                                                     : key.unsigned_()    ? 1
+                                                                          : 0)}),
+                t};
+        for (size_t i = 0; i < keys.size(); ++i) {
+            auto index = mapIndex(out, convert(keys[i], key), true);
+            set(out, index, convert(values[i], item));
+        }
+        return out;
     }
     if (e.kind == "unary") {
         if (e.text == "-" && e.args[0]->kind == "int" && e.args[0]->text == "9223372036854775808")
@@ -785,16 +1356,74 @@ Val Compiler::value(Expr &e, Ty expected) {
             return {phi, Ty{"bool"}};
         }
         auto c = value(*e.args[1]);
+        if (e.text == ".." || e.text == "..<") {
+            if (!a.t.integer() || !c.t.integer())
+                error("range endpoints must be integers");
+            a = convert(a, Ty{"i64"});
+            c = convert(c, Ty{"i64"});
+            return {objectCall("fw_tuple_range", {frame, a.v, c.v, i64(e.text == ".." ? 1 : 0)}),
+                    Ty{"tuple<i64>"}};
+        }
+        if (e.text == "*" &&
+            ((a.t.integer() &&
+              (c.t.array() || c.t.tuple() || c.t.homogeneousTuple() || c.t.name == "string")) ||
+             (c.t.integer() &&
+              (a.t.array() || a.t.tuple() || a.t.homogeneousTuple() || a.t.name == "string")))) {
+            Val source = a.t.integer() ? c : a, count = a.t.integer() ? a : c;
+            auto target = source.t;
+            if (target.tuple()) {
+                auto constant = constantIndex(*(a.t.integer() ? e.args[0] : e.args[1]));
+                auto parts = target.parts();
+                if (parts.empty())
+                    target.name = "[]";
+                else if (!constant) {
+                    if (!std::all_of(parts.begin(), parts.end(),
+                                     [&](Ty part) { return part == parts[0]; }))
+                        error("heterogeneous tuple repetition needs a constant count; cast to a "
+                              "homogeneous collection first");
+                    target.name = "tuple<" + parts[0].name + ">";
+                } else {
+                    if (*constant < 0)
+                        error("tuple repetition count must be non-negative");
+                    if (static_cast<uint64_t>(*constant) > 4096 / parts.size())
+                        error("repeated tuple type exceeds 4096 positions");
+                    target.name = "[";
+                    for (int64_t n = 0; n < *constant; ++n)
+                        for (auto &part : parts) {
+                            if (target.name.size() > 1)
+                                target.name += ",";
+                            target.name += part.name;
+                        }
+                    target.name += "]";
+                }
+            }
+            count = convert(count, Ty{"i64"});
+            return {objectCall("fw_repeat", {frame, source.v, count.v}), target};
+        }
+        if (e.text == "*" && (a.t.map() || c.t.map()))
+            error("maps cannot be repeated because keys must be unique");
         if (e.text == "in") {
-            if (!c.t.array())
-                error("membership currently requires an array");
+            if (c.t.map()) {
+                auto key = convert(a, c.t.parts()[0]);
+                auto integer = key.t.object()
+                                   ? i64(0)
+                                   : b.CreateIntCast(key.v, b.getInt64Ty(),
+                                                     key.t.name != "bool" && !key.t.unsigned_());
+                auto object = key.t.object() ? key.v : llvm::ConstantPointerNull::get(b.getPtrTy());
+                return {b.CreateICmpNE(call("fw_map_has", b.getInt64Ty(), {c.v, integer, object}),
+                                       i64(0)),
+                        Ty{"bool"}};
+            }
+            if (!c.t.sequence())
+                error("membership requires an array, homogeneous tuple, or map");
             a = convert(a, c.t.item());
             std::string suffix = a.t.object() ? "object" : a.t.real() ? "real" : "int";
             llvm::Value *item = a.v;
             if (a.t.real())
                 item = b.CreateFPCast(item, b.getDoubleTy());
             else if (!a.t.object())
-                item = b.CreateIntCast(item, b.getInt64Ty(), !a.t.unsigned_());
+                item =
+                    b.CreateIntCast(item, b.getInt64Ty(), a.t.name != "bool" && !a.t.unsigned_());
             return {
                 b.CreateICmpNE(call("fw_contains_" + suffix, b.getInt64Ty(), {c.v, item}), i64(0)),
                 Ty{"bool"}};
@@ -899,9 +1528,147 @@ Val Compiler::value(Expr &e, Ty expected) {
     }
     error("unsupported expression '" + e.kind + "'");
 }
-Val Compiler::invoke(Expr &e) {
+std::optional<Val> Compiler::domCall(const std::string &name, std::vector<Val> args) {
+    if (name.rfind("html.", 0) != 0)
+        return std::nullopt;
+    auto method = name.substr(5);
+    static const std::set<std::string> methods = {"attributes",
+                                                  "query",
+                                                  "query_all",
+                                                  "get_by_id",
+                                                  "matches",
+                                                  "children",
+                                                  "text_content",
+                                                  "get_text",
+                                                  "inner_html",
+                                                  "outer_html",
+                                                  "id",
+                                                  "class_name",
+                                                  "get_attribute",
+                                                  "has_attribute",
+                                                  "set_attribute",
+                                                  "remove_attribute",
+                                                  "set_text",
+                                                  "append",
+                                                  "prepend",
+                                                  "remove_child",
+                                                  "clear",
+                                                  "clone",
+                                                  "has_class",
+                                                  "add_class",
+                                                  "remove_class",
+                                                  "toggle_class"};
+    if (!methods.count(method))
+        return std::nullopt;
+    if (args.empty())
+        error(name + " requires a tree as its first argument");
+    auto root = args[0];
+    if (root.t.name == "element?" || root.t.name == "fragment?")
+        root = convert(root, Ty{root.t.name.substr(0, root.t.name.size() - 1)}, true);
+    if (root.t.name != "element" && root.t.name != "fragment")
+        error(name + " requires an element or fragment tree");
+    auto count = [&](size_t n) {
+        if (args.size() != n)
+            error(name + " expects " + std::to_string(n - 1) + " argument(s) after its tree");
+    };
+    auto text = [&](size_t i) { return convert(args[i], Ty{"string"}).v; };
+    auto flag = [&](const std::string &function, std::vector<llvm::Value *> values) -> Val {
+        return {b.CreateICmpNE(call(function, b.getInt64Ty(), std::move(values)), i64(0)),
+                Ty{"bool"}};
+    };
+    if (method == "query" || method == "query_all") {
+        count(2);
+        return Val{objectCall("fw_dom_query", {frame, root.v, text(1), i64(method == "query_all")}),
+                   Ty{method == "query_all" ? "element[]" : "element?"}};
+    }
+    if (method == "get_by_id") {
+        count(2);
+        return Val{objectCall("fw_dom_get_by_id", {frame, root.v, text(1)}), Ty{"element?"}};
+    }
+    if (method == "matches") {
+        count(2);
+        return flag("fw_dom_matches", {root.v, text(1)});
+    }
+    if (method == "attributes") {
+        count(1);
+        return Val{objectCall("fw_dom_attributes", {frame, root.v}), Ty{"map<string,string>"}};
+    }
+    if (method == "children") {
+        count(1);
+        return Val{objectCall("fw_dom_children", {frame, root.v}), Ty{"element[]"}};
+    }
+    if (method == "text_content" || method == "get_text" || method == "inner_html" ||
+        method == "outer_html" || method == "id" || method == "class_name") {
+        count(1);
+        int code = method == "inner_html"   ? 1
+                   : method == "outer_html" ? 2
+                   : method == "id"         ? 3
+                   : method == "class_name" ? 4
+                                            : 0;
+        return Val{objectCall("fw_dom_text", {frame, root.v, i64(code)}), Ty{"string"}};
+    }
+    if (method == "get_attribute") {
+        count(2);
+        return Val{objectCall("fw_dom_get_attribute", {frame, root.v, text(1)}), Ty{"string?"}};
+    }
+    if (method == "has_attribute" || method == "remove_attribute") {
+        count(2);
+        return flag(method == "has_attribute" ? "fw_dom_has_attribute" : "fw_dom_remove_attribute",
+                    {root.v, text(1)});
+    }
+    if (method == "set_attribute") {
+        count(3);
+        call("fw_dom_set_attribute", b.getVoidTy(), {root.v, text(1), text(2)});
+        return Val{};
+    }
+    if (method == "set_text") {
+        count(2);
+        call("fw_dom_set_text", b.getVoidTy(), {root.v, text(1)});
+        return Val{};
+    }
+    if (method == "append" || method == "prepend") {
+        count(2);
+        auto child = args[1];
+        if (child.t.name != "element" && child.t.name != "fragment" && child.t.name != "element?" &&
+            child.t.name != "fragment?")
+            child = stringify(child);
+        call("fw_dom_append", b.getVoidTy(), {root.v, child.v, i64(method == "prepend")});
+        return Val{};
+    }
+    if (method == "remove_child") {
+        count(2);
+        if (args[1].t.name != "element" && args[1].t.name != "fragment" &&
+            args[1].t.name != "element?" && args[1].t.name != "fragment?")
+            error("remove_child requires an element or fragment reference");
+        return flag("fw_dom_remove_child", {root.v, args[1].v});
+    }
+    if (method == "clear") {
+        count(1);
+        call("fw_dom_clear", b.getVoidTy(), {root.v});
+        return Val{};
+    }
+    if (method == "clone") {
+        if (args.size() != 1 && args.size() != 2)
+            error("clone expects an optional bool deep flag");
+        auto deep = args.size() == 2 ? convert(args[1], Ty{"bool"}).v : b.getTrue();
+        return Val{objectCall("fw_dom_clone", {frame, root.v, b.CreateZExt(deep, b.getInt64Ty())}),
+                   root.t};
+    }
+    count(2);
+    int operation = method == "has_class"      ? 0
+                    : method == "add_class"    ? 1
+                    : method == "remove_class" ? 2
+                                               : 3;
+    return flag("fw_dom_class", {root.v, text(1), i64(operation)});
+}
+Val Compiler::invoke(Expr &e, Ty expected) {
     auto &callee = *e.args[0];
     std::string name = callable(callee);
+    if (callee.kind == "name")
+        if (auto variable = lookup(name); variable && variable->type.classReference()) {
+            load(*variable);
+            name = variable->type.name.substr(6);
+        }
     std::vector<Val> args;
     // Receivers are evaluated before arguments. Module references have no runtime evaluation.
     Val receiverValue;
@@ -913,7 +1680,7 @@ Val Compiler::invoke(Expr &e) {
         auto c = classes.at(callee.args[0]->text);
         auto text = convert(value(*e.args[1]), Ty{"string"});
         auto json = objectCall("fw_json_parse", {frame, text.v});
-        Val obj{objectCall("fw_new", {frame, i64(c->fields.size()), i64(2)}), Ty{c->name}};
+        Val obj = newInstance(*c);
         for (size_t i = 0; i < c->fields.size(); ++i) {
             auto &f = c->fields[i];
             auto t = type(f.type);
@@ -952,16 +1719,140 @@ Val Compiler::invoke(Expr &e) {
         }
         return obj;
     }
-    if (name.empty() && callee.kind == "member") {
+    if (name.empty() && callee.kind == "member" &&
+        !(callee.args[0]->kind == "name" && callee.args[0]->text == "Result")) {
         receiverValue = value(*callee.args[0]);
         name = receiverValue.t.name + "." + callee.text;
         method = true;
+    }
+    if (method && receiverValue.t.classReference())
+        error("constructor reference '" + displayName(receiverValue.t.name.substr(6)) +
+              "' has no instance methods; construct an instance with () first");
+    if (method && (receiverValue.t.name == "element" || receiverValue.t.name == "fragment" ||
+                   receiverValue.t.name == "element?" || receiverValue.t.name == "fragment?")) {
+        std::vector<Val> values{receiverValue};
+        for (size_t i = 1; i < e.args.size(); ++i)
+            values.push_back(value(*e.args[i]));
+        if (auto result = domCall("html." + callee.text, std::move(values)))
+            return *result;
+        if (receiverValue.t.nullable())
+            receiverValue =
+                convert(receiverValue,
+                        Ty{receiverValue.t.name.substr(0, receiverValue.t.name.size() - 1)}, true);
+    }
+    if (method &&
+        (receiverValue.t.name == "desktop.window" || receiverValue.t.name == "desktop.window?")) {
+        if (receiverValue.t.nullable())
+            receiverValue = convert(receiverValue, Ty{"desktop.window"}, true);
+        if (callee.text == "load") {
+            if (e.args.size() != 2)
+                error("desktop.window.load expects one element or fragment");
+            auto tree = value(*e.args[1]);
+            if (tree.t.name != "element" && tree.t.name != "fragment")
+                error("desktop.window.load expects an element or fragment");
+            call("fw_desktop_load", b.getVoidTy(), {receiverValue.v, tree.v});
+            return {};
+        }
+        if (callee.text == "run") {
+            if (e.args.size() != 1)
+                error("desktop.window.run expects no arguments");
+            call("fw_desktop_run", b.getVoidTy(),
+                 {receiverValue.v, b.CreateGlobalString(desktopBackend)});
+            return {};
+        }
+        error("unknown desktop.window method '" + callee.text + "'");
+    }
+    if (method && receiverValue.t.result()) {
+        if (e.args.size() != 1)
+            error("Result inspection expects no arguments");
+        auto ok = get(receiverValue, i64(0), Ty{"bool"});
+        if (callee.text == "is_ok")
+            return ok;
+        if (callee.text == "is_error")
+            return {b.CreateNot(ok.v), Ty{"bool"}};
+        if (callee.text == "unwrap" || callee.text == "error") {
+            bool success = callee.text == "unwrap";
+            guard(success ? ok.v : b.CreateNot(ok.v),
+                  "attempted to unwrap the wrong Result variant", "ResultError");
+            return get(receiverValue, i64(1), receiverValue.t.parts()[success ? 0 : 1]);
+        }
+    }
+    if (method && (receiverValue.t.array() || receiverValue.t.map())) {
+        auto obj = receiverValue;
+        auto methodName = callee.text;
+        if (obj.t.array() && methodName == "push") {
+            if (e.args.size() != 2)
+                error("push expects one value");
+            auto v = convert(value(*e.args[1], obj.t.item()), obj.t.item());
+            auto index = call("fw_array_append", b.getInt64Ty(), {obj.v});
+            set(obj, index, v);
+            return {};
+        }
+        if (obj.t.array() && methodName == "pop") {
+            if (e.args.size() != 1)
+                error("pop expects no arguments");
+            auto length = call("fw_length", b.getInt64Ty(), {obj.v});
+            auto v = get(obj, b.CreateSub(length, i64(1)), obj.t.item());
+            call("fw_array_pop", b.getVoidTy(), {obj.v});
+            return v;
+        }
+        if (methodName == "clear") {
+            if (e.args.size() != 1)
+                error("clear expects no arguments");
+            call("fw_collection_clear", b.getVoidTy(), {obj.v});
+            return {};
+        }
+        if (obj.t.map() && methodName == "keys") {
+            if (e.args.size() != 1)
+                error("keys expects no arguments");
+            return {objectCall("fw_map_keys", {frame, obj.v}), Ty{obj.t.parts()[0].name + "[]"}};
+        }
+        if (obj.t.map() && methodName == "remove") {
+            if (e.args.size() != 2)
+                error("remove expects one key");
+            auto key = convert(value(*e.args[1], obj.t.parts()[0]), obj.t.parts()[0]);
+            auto integer = key.t.object()
+                               ? i64(0)
+                               : b.CreateIntCast(key.v, b.getInt64Ty(),
+                                                 key.t.name != "bool" && !key.t.unsigned_());
+            auto object = key.t.object() ? key.v : llvm::ConstantPointerNull::get(b.getPtrTy());
+            return {b.CreateICmpNE(call("fw_map_remove", b.getInt64Ty(), {obj.v, integer, object}),
+                                   i64(0)),
+                    Ty{"bool"}};
+        }
+    }
+    if (method && callee.text == "render" &&
+        (receiverValue.t.name == "element" || receiverValue.t.name == "fragment")) {
+        if (e.args.size() != 1)
+            error("render expects no arguments");
+        return stringify(receiverValue);
+    }
+    if (callee.kind == "member" && callee.args[0]->kind == "name" &&
+        callee.args[0]->text == "Result") {
+        if (!expected.result())
+            error("Result.ok/error requires an expected Result<T,E> type");
+        if (e.args.size() != 2 || (callee.text != "ok" && callee.text != "error"))
+            error("use Result.ok(value) or Result.error(value)");
+        bool ok = callee.text == "ok";
+        auto parts = expected.parts();
+        auto payload = convert(value(*e.args[1], parts[ok ? 0 : 1]), parts[ok ? 0 : 1]);
+        Val result{objectCall("fw_new", {frame, i64(2), i64(8)}), expected};
+        set(result, i64(0), {b.getInt1(ok), Ty{"bool"}});
+        set(result, i64(1), payload);
+        return result;
+    }
+    if (errorTypes.count(name)) {
+        if (e.args.size() != 2)
+            error("error constructor expects a message string");
+        auto message = convert(value(*e.args[1]), Ty{"string"});
+        return {objectCall("fw_error_new", {frame, message.v, b.CreateGlobalString(name)}),
+                Ty{name}};
     }
     if (classes.count(name)) {
         auto c = classes.at(name);
         if (e.args.size() - 1 > c->fields.size())
             error("too many constructor arguments for " + name);
-        Val obj{objectCall("fw_new", {frame, i64(c->fields.size()), i64(2)}), Ty{name}};
+        Val obj = newInstance(*c);
         for (size_t i = 0; i < c->fields.size(); ++i) {
             auto &f = c->fields[i];
             Ty t = type(f.type);
@@ -979,31 +1870,55 @@ Val Compiler::invoke(Expr &e) {
     if (name == "typeof") {
         if (e.args.size() != 2)
             error("typeof expects one argument");
-        return literal(value(*e.args[1]).t.name);
+        return literal(displayName(value(*e.args[1]).t.name));
     }
     if (name == "len") {
         if (e.args.size() != 2)
             error("len expects one argument");
         auto a = value(*e.args[1]);
-        if (a.t.name != "string" && !a.t.array())
+        if (a.t.name != "string" && !a.t.sequence() && !a.t.map() && !a.t.tuple())
             error("len expects string or array");
         return {call("fw_length", b.getInt64Ty(), {a.v}), Ty{"i64"}};
     }
-    static const std::set<std::string> casts = {"int", "i8",  "i16", "i32",   "i64",    "u8",
-                                                "u16", "u32", "u64", "float", "double", "string"};
+    std::string constructor = name.substr(0, name.find('<'));
+    if (constructor == "array" || constructor == "tuple" || constructor == "map") {
+        if (e.args.size() > 2)
+            error("collection casts expect at most one value");
+        bool typed = name.find('<') != std::string::npos;
+        Ty target =
+            typed ? type(name)
+            : ((constructor == "array" && expected.array()) ||
+               (constructor == "tuple" && (expected.tuple() || expected.homogeneousTuple())) ||
+               (constructor == "map" && expected.map()))
+                ? expected
+                : Ty{};
+        if (e.args.size() == 1) {
+            if (target.name == "void" && constructor == "tuple")
+                target = Ty{"[]"};
+            if (target.name == "void")
+                error("empty collection casts need an expected type or explicit type arguments");
+            if (target.map()) {
+                auto key = target.parts()[0];
+                return {objectCall("fw_map_new", {frame, i64(key.object()         ? 4
+                                                             : key.name == "bool" ? 3
+                                                             : key.unsigned_()    ? 1
+                                                                                  : 0)}),
+                        target};
+            }
+            return {objectCall("fw_new", {frame, i64(0), i64(target.array() ? 1 : 7)}), target};
+        }
+        auto source = value(*e.args[1]);
+        if (target.name == "void")
+            target = inferCollectionCast(constructor, source.t);
+        return collectionCast(source, target);
+    }
+    static const std::set<std::string> casts = {"int",    "i8",   "i16",    "i32",     "i64",
+                                                "u8",     "u16",  "u32",    "u64",     "float",
+                                                "double", "bool", "string", "element", "fragment"};
     if (casts.count(name)) {
         if (e.args.size() != 2)
             error("cast expects exactly one argument");
-        auto a = value(*e.args[1]);
-        if (a.t.name == "string" && name != "string") {
-            auto t = type(name);
-            Ty source = t.integer() ? Ty{t.unsigned_() ? "u64" : "i64"} : Ty{"double"};
-            auto parsed = call(t.integer() ? (t.unsigned_() ? "fw_parse_uint" : "fw_parse_int")
-                                           : "fw_parse_real",
-                               ll(source), {a.v});
-            return convert({parsed, source}, t, true);
-        }
-        return name == "string" ? stringify(a) : convert(a, type(name), true);
+        return explicitCast(value(*e.args[1]), type(name));
     }
     if (functions.count(name) || (name.empty() && callee.kind == "name") ||
         (!name.empty() && lookup(name))) {
@@ -1031,18 +1946,42 @@ Val Compiler::invoke(Expr &e) {
             actual.push_back(convert(v, t).v);
         }
         auto result = b.CreateCall(sig.function, actual);
+        checkError();
         if (sig.result.object())
             objectCall("fw_adopt", {frame, result});
         return {result, sig.result};
     }
     for (size_t i = 1; i < e.args.size(); ++i)
-        args.push_back(value(*e.args[i]));
+        args.push_back(value(*e.args[i], name == "os.command" ? Ty{"string[]"} : Ty{}));
     auto count = [&](size_t n) {
         if (args.size() != n)
             error(name + " expects " + std::to_string(n) + " argument(s)");
     };
     auto str = [&](size_t i) { return convert(args[i], Ty{"string"}).v; };
     auto real = [&](size_t i) { return convert(args[i], Ty{"double"}).v; };
+    if (name == "desktop.window" || name == "desktop.Window") {
+        if (args.size() > 3)
+            error("desktop.window expects optional title, width, and height");
+        auto title = args.empty() ? literal("Flywheel").v : str(0);
+        auto width = args.size() < 2 ? i64(960) : convert(args[1], Ty{"i64"}).v;
+        auto height = args.size() < 3 ? i64(640) : convert(args[2], Ty{"i64"}).v;
+        return {objectCall("fw_desktop_window", {frame, title, width, height}),
+                Ty{"desktop.window"}};
+    }
+    if (name == "input" || name == "core.input") {
+        if (args.size() > 1)
+            error(name + " expects zero or one string argument");
+        auto prompt = args.empty() ? literal("").v : str(0);
+        return {objectCall("fw_input", {frame, prompt}), Ty{"string"}};
+    }
+    if (name == "os.shell" || name == "os.command") {
+        count(1);
+        if (name == "os.shell")
+            return {call("fw_shell", b.getInt64Ty(), {str(0)}), Ty{"i64"}};
+        if (!args[0].t.array() || args[0].t.item().name != "string")
+            error("os.command expects an array of strings");
+        return {call("fw_command", b.getInt64Ty(), {args[0].v}), Ty{"i64"}};
+    }
     if (name == "print" || name == "core.print") {
         count(1);
         auto x = stringify(args[0]);
@@ -1055,6 +1994,8 @@ Val Compiler::invoke(Expr &e) {
             error("render expects element or fragment");
         return {objectCall("fw_render", {frame, args[0].v}), Ty{"string"}};
     }
+    if (auto result = domCall(name, args))
+        return *result;
     if (name == "web.serve") {
         count(3);
         if (args[1].t.name.rfind("fn:", 0) != 0)
@@ -1063,7 +2004,12 @@ Val Compiler::invoke(Expr &e) {
         if (!sig.ast->params.empty() || (!sig.ast->owner.empty()) ||
             (sig.result.name != "element" && sig.result.name != "fragment"))
             error("HTTP handler must take no arguments and return element or fragment");
-        call("fw_serve", b.getVoidTy(), {str(0), args[1].v, convert(args[2], Ty{"i64"}).v});
+        return {objectCall("fw_serve", {frame, str(0), args[1].v, convert(args[2], Ty{"i64"}).v}),
+                Ty{"string"}};
+    }
+    if (name == "web.wait") {
+        count(0);
+        call("fw_web_wait", b.getVoidTy(), {});
         return {};
     }
     if (name == "json.parse") {
@@ -1100,6 +2046,10 @@ Val Compiler::invoke(Expr &e) {
         count(1);
         return {b.CreateICmpNE(call("fw_exists", b.getInt64Ty(), {str(0)}), i64(0)), Ty{"bool"}};
     }
+    if (name == "fs.try_read") {
+        count(1);
+        return {objectCall("fw_try_read", {frame, str(0)}), Ty{"Result<string,FileError>"}};
+    }
     if (name == "fs.read") {
         count(1);
         return {objectCall("fw_read", {frame, str(0)}), Ty{"string"}};
@@ -1135,6 +2085,17 @@ Val Compiler::invoke(Expr &e) {
         count(2);
         return {call("fw_pow", b.getDoubleTy(), {real(0), real(1)}), Ty{"double"}};
     }
+    if (name == "collections.range") {
+        if (args.size() != 1 && args.size() != 2)
+            error("range expects end or start,end");
+        auto start = args.size() == 2 ? convert(args[0], Ty{"i64"}).v : i64(0);
+        auto end = convert(args.back(), Ty{"i64"}).v;
+        return {objectCall("fw_range", {frame, start, end}), Ty{"i64[]"}};
+    }
+    if (name == "testing.live_objects") {
+        count(0);
+        return {call("fw_live_objects", b.getInt64Ty(), {}), Ty{"i64"}};
+    }
     if (name == "testing.assert") {
         if (args.size() != 1 && args.size() != 2)
             error("testing.assert expects bool and optional string");
@@ -1148,6 +2109,107 @@ Val Compiler::invoke(Expr &e) {
 }
 void Compiler::statement(Stmt &s) {
     location = s.loc;
+    if (s.kind == "throw") {
+        auto x = value(*s.expr);
+        if (x.t.classReference() || x.t.name == "void" || x.t.nullable() ||
+            x.t.name.rfind("fn:", 0) == 0 || x.t.name.rfind("module:", 0) == 0)
+            error("throw requires a non-null value");
+        auto payload = x.v;
+        if (!x.t.object()) {
+            Val box{objectCall("fw_new", {frame, i64(1), i64(2)}), Ty{"Error"}};
+            set(box, i64(0), x);
+            payload = box.v;
+        }
+        call("fw_throw", b.getVoidTy(), {b.CreateGlobalString(x.t.name), payload});
+        auto target = errorHandler();
+        releaseProtected(target.depth);
+        if (target.target != failure)
+            releaseScopes(target.depth);
+        call("fw_sweep", b.getVoidTy(), {frame});
+        b.CreateBr(target.target);
+        return;
+    }
+    if (s.kind == "try") {
+        auto outer = errorHandler();
+        size_t depth = scopes.size();
+        auto dispatch = llvm::BasicBlock::Create(ctx, "catch.dispatch", current);
+        auto failed = llvm::BasicBlock::Create(ctx, "finally.error", current);
+        auto end = llvm::BasicBlock::Create(ctx, "try.end", current);
+        Finalizer active{&s.finalizer, outer, loops.size(), depth};
+        handlers.push_back({dispatch, depth});
+        finalizers.push_back(active);
+        block(s.body);
+        finalizers.pop_back();
+        handlers.pop_back();
+        bool reachesEnd = false;
+        if (!terminated()) {
+            handlers.push_back(outer);
+            block(s.finalizer);
+            handlers.pop_back();
+            if (!terminated()) {
+                b.CreateBr(end);
+                reachesEnd = true;
+            }
+        }
+        b.SetInsertPoint(dispatch);
+        for (size_t i = 0; i < s.catches.size(); ++i) {
+            auto t = type(s.catchTypes[i]);
+            if (t.name == "void")
+                error("catch cannot use void");
+            auto match = llvm::BasicBlock::Create(ctx, "catch.body", current);
+            auto next = llvm::BasicBlock::Create(ctx, "catch.next", current);
+            auto test = call("fw_error_matches", b.getInt64Ty(), {b.CreateGlobalString(t.name)});
+            b.CreateCondBr(b.CreateICmpNE(test, i64(0)), match, next);
+            b.SetInsertPoint(match);
+            scopes.emplace_back();
+            auto caught =
+                objectCall(t.name == "Error" ? "fw_error_take" : "fw_error_value", {frame});
+            Val caughtValue{caught, t};
+            if (!t.object())
+                caughtValue = get({caught, Ty{"Error"}}, i64(0), t);
+            bind(s.catchNames[i], caughtValue);
+            handlers.push_back({failed, depth});
+            finalizers.push_back(active);
+            block(s.catches[i], false);
+            finalizers.pop_back();
+            handlers.pop_back();
+            if (!terminated())
+                releaseScopes(depth);
+            scopes.pop_back();
+            if (!terminated()) {
+                handlers.push_back(outer);
+                block(s.finalizer);
+                handlers.pop_back();
+                if (!terminated()) {
+                    b.CreateBr(end);
+                    reachesEnd = true;
+                }
+            }
+            b.SetInsertPoint(next);
+        }
+        b.CreateBr(failed);
+        b.SetInsertPoint(failed);
+        auto exception = objectCall("fw_error_take", {frame});
+        auto anchor = allocate(Ty{"Error"}, "pending.exception");
+        store(anchor, {exception, Ty{"Error"}});
+        protectedValues.push_back({anchor, depth});
+        handlers.push_back(outer);
+        block(s.finalizer);
+        handlers.pop_back();
+        protectedValues.pop_back();
+        if (!terminated()) {
+            call("fw_error_restore", b.getVoidTy(), {exception});
+            store(anchor, {llvm::ConstantPointerNull::get(b.getPtrTy()), Ty{"Error"}});
+            if (outer.target != failure)
+                releaseScopes(outer.depth);
+            call("fw_sweep", b.getVoidTy(), {frame});
+            b.CreateBr(outer.target);
+        }
+        b.SetInsertPoint(end);
+        if (!reachesEnd)
+            b.CreateUnreachable();
+        return;
+    }
     if (s.kind == "declare") {
         Ty t = s.type.empty() ? Ty{} : type(s.type);
         auto x = value(*s.expr, t);
@@ -1162,17 +2224,22 @@ void Compiler::statement(Stmt &s) {
             auto g =
                 new llvm::GlobalVariable(module, ll(x.t), false, llvm::GlobalValue::InternalLinkage,
                                          llvm::Constant::getNullValue(ll(x.t)), "global." + s.name);
-            globals[s.name] = {g, x.t, s.op == "const"};
+            auto initialized = new llvm::GlobalVariable(module, b.getInt1Ty(), false,
+                                                        llvm::GlobalValue::InternalLinkage,
+                                                        b.getFalse(), "initialized." + s.name);
+            globals[s.name] = {g, x.t, s.op == "const", initialized};
             if (x.t.object())
                 call("fw_root", b.getVoidTy(), {frame, g});
             store(g, x);
+            b.CreateStore(b.getTrue(), initialized);
         } else
             bind(s.name, x, s.op == "const");
         return;
     }
     if (s.kind == "assign") {
         Var *variable = nullptr;
-        Val object;
+        Val object, mapKey;
+        std::string domProperty;
         llvm::Value *index = nullptr;
         Ty target;
         if (s.target->kind == "name") {
@@ -1185,32 +2252,66 @@ void Compiler::statement(Stmt &s) {
             target = variable->type;
         } else if (s.target->kind == "member" || s.target->kind == "inst") {
             object = s.target->kind == "inst" ? receiver() : value(*s.target->args[0]);
-            auto [c, i] = field(object.t, s.target->text);
-            index = i64(i);
-            target = type(c->fields[i].type);
+            if (object.t.name == "element?" || object.t.name == "fragment?")
+                object =
+                    convert(object, Ty{object.t.name.substr(0, object.t.name.size() - 1)}, true);
+            if ((object.t.name == "element" || object.t.name == "fragment") &&
+                (s.target->text == "text_content" || s.target->text == "id" ||
+                 s.target->text == "class_name")) {
+                domProperty = s.target->text;
+                target = Ty{"string"};
+            } else {
+                auto [c, i] = field(object.t, s.target->text);
+                index = i64(i);
+                target = type(c->fields[i].type);
+            }
         } else if (s.target->kind == "index") {
             object = value(*s.target->args[0]);
-            if (!object.t.array())
-                error("index assignment requires array");
-            index = convert(value(*s.target->args[1]), Ty{"i64"}).v;
-            target = object.t.item();
+            if (object.t.map()) {
+                mapKey =
+                    convert(value(*s.target->args[1], object.t.parts()[0]), object.t.parts()[0]);
+                target = object.t.parts()[1];
+                if (s.op != "=")
+                    index = mapIndex(object, mapKey, false);
+            } else {
+                auto indexed = indexOf(object, *s.target->args[1], false);
+                index = indexed.first;
+                target = indexed.second;
+            }
         } else
             error("invalid assignment target");
         Val old;
         if (s.op != "=")
-            old = variable ? load(*variable) : get(object, index, target);
+            old = variable               ? load(*variable)
+                  : !domProperty.empty() ? *domCall("html." + domProperty, {object})
+                                         : get(object, index, target);
         auto rhs = value(*s.expr, target);
         if (s.op != "=")
             rhs = binary(s.op.substr(0, 1), old, rhs);
         rhs = convert(rhs, target);
+        if (object.t.map())
+            index = mapIndex(object, mapKey, true);
         if (variable)
             store(variable->address, rhs);
-        else
+        else if (!domProperty.empty()) {
+            if (domProperty == "text_content")
+                call("fw_dom_set_text", b.getVoidTy(), {object.v, rhs.v});
+            else {
+                auto key = literal(domProperty == "id" ? "id" : "class");
+                call("fw_dom_set_attribute", b.getVoidTy(), {object.v, key.v, rhs.v});
+            }
+        } else
             set(object, index, rhs);
         return;
     }
     if (s.kind == "expr") {
-        if (s.target->kind == "name" || s.target->kind == "member") {
+        auto name = callable(*s.target);
+        auto variable = lookup(name);
+        bool groupedConstructor =
+            s.target->grouped &&
+            (classes.count(name) || name == "desktop.window" || name == "desktop.Window" ||
+             (variable && variable->type.classReference()));
+        if (!groupedConstructor && (s.target->kind == "name" || s.target->kind == "member")) {
             Expr call;
             call.kind = "call";
             call.loc = s.loc;
@@ -1230,6 +2331,18 @@ void Compiler::statement(Stmt &s) {
         if (top)
             error("return is only valid inside a function");
         Val x = s.expr ? value(*s.expr, returnType) : Val{};
+        if (!finalizers.empty()) {
+            if (x.t.object()) {
+                auto anchor = allocate(x.t, "return.root");
+                store(anchor, x);
+                protectedValues.push_back({anchor, finalizers.front().depth});
+            }
+            runFinalizers();
+            if (x.t.object())
+                protectedValues.pop_back();
+            if (terminated())
+                return;
+        }
         if (infer) {
             returns.push_back(x.t);
             call("fw_drop", b.getVoidTy(), {frame});
@@ -1290,8 +2403,10 @@ void Compiler::statement(Stmt &s) {
         b.CreateCondBr(c.v, body, end);
         b.SetInsertPoint(body);
         loops.emplace_back(end, cond);
+        loopScopes.push_back(scopes.size());
         block(s.body);
         loops.pop_back();
+        loopScopes.pop_back();
         if (!terminated())
             b.CreateBr(cond);
         b.SetInsertPoint(end);
@@ -1299,10 +2414,13 @@ void Compiler::statement(Stmt &s) {
     }
     if (s.kind == "for") {
         auto array = value(*s.expr);
-        if (!array.t.array())
-            error("for currently requires an array");
-        auto anchor = allocate(array.t, "iterable.root");
-        store(anchor, array);
+        if (array.t.map())
+            array = {objectCall("fw_map_keys", {frame, array.v}),
+                     Ty{array.t.parts()[0].name + "[]"}};
+        if (!array.t.sequence())
+            error("for requires an array, homogeneous tuple, or map");
+        scopes.emplace_back();
+        bind("$iterable", array, true);
         auto size = call("fw_length", b.getInt64Ty(), {array.v});
         auto index = allocate(Ty{"i64"}, "iterator");
         b.CreateStore(i64(0), index);
@@ -1315,11 +2433,16 @@ void Compiler::statement(Stmt &s) {
         auto i = b.CreateLoad(b.getInt64Ty(), index);
         b.CreateCondBr(b.CreateICmpSLT(i, size), body, end);
         b.SetInsertPoint(body);
+        auto loopDepth = scopes.size();
         scopes.emplace_back();
         bind(s.name, get(array, i, array.t.item()));
         loops.emplace_back(end, next);
+        loopScopes.push_back(loopDepth);
         block(s.body, false);
         loops.pop_back();
+        loopScopes.pop_back();
+        if (!terminated())
+            releaseScopes(loopDepth);
         scopes.pop_back();
         if (!terminated())
             b.CreateBr(next);
@@ -1330,11 +2453,18 @@ void Compiler::statement(Stmt &s) {
         b.CreateStore(b.CreateAdd(old, i64(1)), index);
         b.CreateBr(cond);
         b.SetInsertPoint(end);
+        releaseScopes(scopes.size() - 1);
+        scopes.pop_back();
         return;
     }
     if (s.kind == "break" || s.kind == "continue") {
         if (loops.empty())
             error(s.kind + " requires a loop");
+        runFinalizers(loops.size());
+        if (terminated())
+            return;
+        releaseProtected(loopScopes.back());
+        releaseScopes(loopScopes.back());
         call("fw_sweep", b.getVoidTy(), {frame});
         b.CreateBr(s.kind == "break" ? loops.back().first : loops.back().second);
         return;
@@ -1346,6 +2476,8 @@ void Compiler::buildFunction(Signature &sig, bool inference) {
         error("recursive functions require an explicit 'returns T'");
     sig.building = true;
     auto savedIP = b.saveIP();
+    auto savedBorrowed = borrowed;
+    borrowed = false;
     auto savedCurrent = current;
     auto savedFrame = frame;
     auto savedAttrs = std::move(attrs);
@@ -1353,6 +2485,15 @@ void Compiler::buildFunction(Signature &sig, bool inference) {
     attrs.clear();
     componentNames.clear();
     auto savedScopes = std::move(scopes);
+    auto savedHandlers = std::move(handlers);
+    auto savedFinalizers = std::move(finalizers);
+    auto savedLoopScopes = std::move(loopScopes);
+    auto savedFailure = failure;
+    auto savedProtected = std::move(protectedValues);
+    protectedValues.clear();
+    handlers.clear();
+    finalizers.clear();
+    loopScopes.clear();
     auto savedLoops = std::move(loops);
     auto savedOwner = owner;
     auto savedReturn = returnType;
@@ -1379,6 +2520,7 @@ void Compiler::buildFunction(Signature &sig, bool inference) {
         current = sig.function;
     b.SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", current));
     frame = objectCall("fw_frame", {});
+    failure = llvm::BasicBlock::Create(ctx, "propagate.error", current);
     size_t index = 0;
     if (!owner.empty())
         bind("$inst", {current->getArg(index++), Ty{owner}});
@@ -1399,6 +2541,7 @@ void Compiler::buildFunction(Signature &sig, bool inference) {
         call("fw_drop", b.getVoidTy(), {frame});
         b.CreateRetVoid();
     }
+    emitFailure();
     if (inference) {
         Ty result;
         for (auto t : returns) {
@@ -1430,12 +2573,18 @@ void Compiler::buildFunction(Signature &sig, bool inference) {
             "fly." + (owner.empty() ? "" : owner + ".") + sig.ast->name, module);
     } else
         sig.done = true;
+    borrowed = savedBorrowed;
     current = savedCurrent;
     frame = savedFrame;
     scopes = std::move(savedScopes);
     attrs = std::move(savedAttrs);
     componentNames = std::move(savedComponentNames);
     loops = std::move(savedLoops);
+    handlers = std::move(savedHandlers);
+    finalizers = std::move(savedFinalizers);
+    loopScopes = std::move(savedLoopScopes);
+    failure = savedFailure;
+    protectedValues = std::move(savedProtected);
     owner = savedOwner;
     returnType = savedReturn;
     returns = std::move(savedReturns);

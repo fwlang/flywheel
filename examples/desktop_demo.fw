@@ -1,0 +1,13 @@
+import desktop
+import html.*
+
+var window = desktop.window("Flywheel Desktop", 960, 640)
+window.load(<html>
+    <head><meta charset="utf-8" /><title>Flywheel Desktop</title></head>
+    <body style="font-family: sans-serif; padding: 2rem; background: #f7f8fa;">
+        <h1>Hello from Flywheel!</h1>
+        <p>This HTML is displayed in a native webview.</p>
+        <p>{"Text & markup stay safely escaped: <hello>"}</p>
+    </body>
+</html>)
+window.run()

@@ -1,12 +1,10 @@
 #include "flywheel/frontend.hpp"
 #include <chrono>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <llvm/Config/llvm-config.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/Program.h>
-#include <sstream>
 
 namespace fs = std::filesystem;
 namespace {
@@ -59,6 +57,19 @@ fs::path runtimePath(const char *executable) {
         return FW_RUNTIME;
     throw std::runtime_error("cannot locate Flywheel runtime archive");
 }
+std::string desktopPath(const fs::path &runtime) {
+#ifdef _WIN32
+    auto name = "flywheel_desktop.dll";
+#elif defined(__APPLE__)
+    auto name = "libflywheel_desktop.dylib";
+#else
+    auto name = "libflywheel_desktop.so";
+#endif
+    auto installed = runtime.parent_path() / name;
+    if (fs::exists(installed))
+        return fs::absolute(installed).string();
+    return FW_DESKTOP_BACKEND;
+}
 } // namespace
 int main(int argc, char **argv) {
     if (argc == 2 && std::string(argv[1]) == "--version") {
@@ -100,14 +111,9 @@ int main(int argc, char **argv) {
             } else
                 throw std::runtime_error("unknown or incomplete option: " + arg);
         }
-        std::ifstream input(filename, std::ios::binary);
-        if (!input)
-            throw std::runtime_error("cannot read source file '" + filename + "'");
-        std::ostringstream source;
-        source << input.rdbuf();
-        auto program = fw::Parser(fw::lex(source.str())).parse();
+        auto program = fw::loadProgram(filename);
         if (command == "check") {
-            fw::compile(program, filename, {optimization, ir, ""});
+            fw::compile(program, filename, {optimization, ir, "", ""});
             return 0;
         }
         Temp temp;
@@ -116,7 +122,8 @@ int main(int argc, char **argv) {
 #else
         auto object = temp.path / "program.o";
 #endif
-        fw::compile(program, filename, {optimization, ir, object.string()});
+        auto runtime = runtimePath(argv[0]);
+        fw::compile(program, filename, {optimization, ir, object.string(), desktopPath(runtime)});
 #ifdef _WIN32
         std::string suffix = ".exe";
 #else
@@ -127,7 +134,6 @@ int main(int argc, char **argv) {
                 ? temp.path / ("program" + suffix)
                 : fs::absolute(output.empty() ? fs::path(filename).stem().string() + suffix
                                               : output);
-        auto runtime = runtimePath(argv[0]);
         std::vector<std::string> link;
 #ifdef _MSC_VER
         link = {"/nologo", "/MD",       object.string(), runtime.string(), "/Fe:" + binary.string(),
@@ -138,6 +144,9 @@ int main(int argc, char **argv) {
 #if defined(_WIN32) && !defined(_MSC_VER)
         link.push_back("-lws2_32");
 #endif
+#if !defined(_WIN32) && !defined(__APPLE__)
+        link.push_back("-ldl");
+#endif
         int linked = execute(FW_CXX, link);
         if (linked)
             return linked;
@@ -145,8 +154,8 @@ int main(int argc, char **argv) {
             return execute(binary.string(), {});
         return 0;
     } catch (const fw::Error &e) {
-        std::cerr << filename << ':' << e.loc.line << ':' << e.loc.column << ": error: " << e.what()
-                  << '\n';
+        std::cerr << (e.loc.file.empty() ? filename : e.loc.file) << ':' << e.loc.line << ':'
+                  << e.loc.column << ": error: " << e.what() << '\n';
         return 1;
     } catch (const std::exception &e) {
         std::cerr << "flywheel: error: " << e.what() << '\n';

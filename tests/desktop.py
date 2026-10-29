@@ -1,0 +1,223 @@
+"""Real WebKit/GTK window test; run under dbus-run-session and xvfb-run on Linux."""
+
+import ctypes
+import ctypes.util
+import http.server
+import os
+import queue
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+import urllib.parse
+from pathlib import Path
+
+
+def close_window(window):
+    """Send WM_DELETE_WINDOW directly: Xvfb has no window manager for EWMH requests."""
+
+    class Data(ctypes.Union):
+        _fields_ = [
+            ("bytes", ctypes.c_char * 20),
+            ("shorts", ctypes.c_short * 10),
+            ("longs", ctypes.c_long * 5),
+        ]
+
+    class Message(ctypes.Structure):
+        _fields_ = [
+            ("type", ctypes.c_int),
+            ("serial", ctypes.c_ulong),
+            ("send_event", ctypes.c_int),
+            ("display", ctypes.c_void_p),
+            ("window", ctypes.c_ulong),
+            ("message_type", ctypes.c_ulong),
+            ("format", ctypes.c_int),
+            ("data", Data),
+        ]
+
+    class Event(ctypes.Union):
+        _fields_ = [("message", Message), ("padding", ctypes.c_long * 24)]
+
+    x11 = ctypes.CDLL(ctypes.util.find_library("X11"))
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+    x11.XInternAtom.restype = ctypes.c_ulong
+    x11.XSendEvent.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_int,
+        ctypes.c_long,
+        ctypes.POINTER(Event),
+    ]
+    x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    display = x11.XOpenDisplay(None)
+    assert display, "Cannot open isolated X display"
+    try:
+        event = Event()
+        event.message.type = 33  # ClientMessage
+        event.message.send_event = 1
+        event.message.display = display
+        event.message.window = int(window)
+        event.message.message_type = x11.XInternAtom(display, b"WM_PROTOCOLS", 0)
+        event.message.format = 32
+        event.message.data.longs[0] = x11.XInternAtom(display, b"WM_DELETE_WINDOW", 0)
+        assert x11.XSendEvent(display, int(window), 0, 0, ctypes.byref(event))
+    finally:
+        x11.XCloseDisplay(display)  # Flushes the request.
+
+
+def main():
+    compiler = Path(sys.argv[1]).resolve()
+    received = queue.Queue()
+    requests = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            requests.append(self.path)
+            path = urllib.parse.urlsplit(self.path)
+            if path.path == "/probe.js":
+                script = (
+                    f"fetch('http://127.0.0.1:{self.server.server_port}/result?value=' + "
+                    "encodeURIComponent(document.querySelector('h1').textContent + '|' + "
+                    "document.querySelector('p').getAttribute('data-note'))).catch(() => {});"
+                )
+                body = script.encode()
+                content_type = "text/javascript; charset=utf-8"
+            else:
+                if path.path == "/result":
+                    received.put(urllib.parse.parse_qs(path.query)["value"][0])
+                body = b"ok"
+                content_type = "text/plain"
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with tempfile.TemporaryDirectory(prefix="fw-desktop-test-") as temporary:
+            root = Path(temporary)
+            title = "FlywheelDesktopTest" + root.name.removeprefix("fw-desktop-test-")
+            source = root / "main.fw"
+            source.write_text(
+                f'''import desktop as gui
+import html.*
+import testing
+var base=testing.live_objects()
+function show returns void
+    gui.Window window=gui.window("{title}",480,320)
+    var heading=<h1>Hello &lt;World&gt; &amp; café</h1>
+    var page=<>
+        <meta charset="utf-8" />
+        {{heading}}
+        <p data-note={{"quote \\\" & <"}}>Fragment</p>
+        <script src="http://127.0.0.1:{server.server_port}/probe.js"></script>
+    </>
+    window.load(page)
+    heading.text_content="Changed after load"
+    print "before first run"
+    (window.run)
+    print "after first run"
+    window.load(<html><body>
+        <h1>Second window</h1>
+        <p data-note="again">Reload</p>
+        <script src="http://127.0.0.1:{server.server_port}/probe.js"></script>
+    </body></html>)
+    window.run()
+    print "after second run"
+end
+show()
+print testing.live_objects()==base
+''',
+                encoding="utf-8",
+            )
+            executable = root / "desktop"
+            compiled = subprocess.run(
+                [str(compiler), "build", str(source), "-O3", "-o", str(executable)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=45,
+            )
+            assert compiled.returncode == 0, compiled.stderr
+            process = subprocess.Popen(
+                [str(executable)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                env={
+                    **os.environ,
+                    "GDK_BACKEND": "x11",
+                    "WAYLAND_DISPLAY": "",
+                    "WEBKIT_DISABLE_DMABUF_RENDERER": "1",
+                    "LIBGL_ALWAYS_SOFTWARE": "1",
+                },
+            )
+            try:
+                for expected in [
+                    'Hello <World> & café|quote " & <',
+                    "Second window|again",
+                ]:
+                    try:
+                        actual = received.get(timeout=30)
+                    except queue.Empty as error:
+                        raise AssertionError(
+                            f"WebKit did not report {expected!r}; requests: {requests}"
+                        ) from error
+                    assert actual == expected, (actual, expected)
+                    windows = subprocess.run(
+                        [
+                            "xdotool",
+                            "search",
+                            "--onlyvisible",
+                            "--name",
+                            "^" + re.escape(title) + "$",
+                        ],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    ).stdout.splitlines()
+                    assert len(windows) == 1, windows
+                    geometry = subprocess.run(
+                        ["xdotool", "getwindowgeometry", "--shell", windows[0]],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    ).stdout
+                    assert "WIDTH=480\n" in geometry and "HEIGHT=320\n" in geometry, (
+                        geometry
+                    )
+                    close_window(windows[0])
+                stdout, stderr = process.communicate(timeout=15)
+                assert process.returncode == 0, stderr
+                assert (
+                    stdout
+                    == "before first run\nafter first run\nafter second run\ntrue\n"
+                ), (stdout, stderr)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                stdout, stderr = process.communicate(timeout=5)
+                if process.returncode:
+                    print(stdout, stderr, file=sys.stderr)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    print("desktop WebKit DOM, escaping, snapshots, repeated run, and ARC cleanup OK")
+
+
+if __name__ == "__main__":
+    main()

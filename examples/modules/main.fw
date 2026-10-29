@@ -1,0 +1,4 @@
+import views
+
+var page = views.page("Flywheel")
+print page.render()
