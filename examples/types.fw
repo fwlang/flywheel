@@ -1,0 +1,77 @@
+# Classes, interfaces, enums, generics, optional values, and pattern matching.
+interface Shape
+    function area() returns double
+    function name() returns string
+end
+
+class Circle implements Shape
+    double radius
+    function area() returns double
+        return 3.14159 * inst radius * inst radius
+    end
+    function name() returns string
+        return "circle"
+    end
+end
+
+class Rectangle implements Shape
+    double width
+    double height
+    function area() returns double
+        return inst width * inst height
+    end
+    function name() returns string
+        return "rectangle"
+    end
+end
+
+class Square extends Rectangle
+    function init(double side)
+        super.init(side, side)
+    end
+    function name() returns string
+        return "square"
+    end
+end
+
+enum Verdict
+    Small, Medium, Large
+end
+
+function judge(Shape shape) returns Verdict
+    match shape
+        case Square s if s.width > 3.0 then
+            return Verdict.Large
+        case Circle c if c.radius < 1.0 then
+            return Verdict.Small
+        else
+            return Verdict.Medium
+    end
+end
+
+class Stack<T>
+    T[] items
+    function init()
+        inst items = []
+    end
+    function push(T item)
+        inst items.push(item)
+    end
+    function pop() returns T?
+        if inst items.length == 0 then
+            return null
+        end
+        return inst items.pop()
+    end
+end
+
+Shape[] shapes = [Circle(0.5), Rectangle(2.0, 3.0), Square(4.0)]
+for shape in shapes do
+    print shape.name(), shape.area(), judge(shape)
+end
+
+Stack<string> names = Stack()
+names.push("first")
+names.push("second")
+var top = names.pop()
+print top ?? "empty", names.pop() ?? "empty", names.pop() ?? "empty"

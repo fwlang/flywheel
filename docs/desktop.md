@@ -1,45 +1,65 @@
 # Desktop windows
 
-The native `desktop` library displays Flywheel markup in a window using [webview/webview](https://github.com/webview/webview), backed by GTK/WebKitGTK on Linux, Cocoa/WebKit on macOS, and WebView2 on Windows. It does not run a local HTTP server or require Python.
+The native `desktop` library displays Flywheel markup in a window using [webview/webview](https://github.com/webview/webview), backed by GTK/WebKitGTK on Linux and WebView2 on Windows. It does not run a local HTTP server or require Python. Windows can run Flywheel event handlers, expose Flywheel functions to page JavaScript, update live, and run several at once.
 
 ```flywheel
 import desktop
 import html.*
 
-var window = desktop.window("My application", 960, 640)
-window.load(<>
-    <h1>Hello, World!</h1>
-    <p>Elements and fragments both work.</p>
-</>)
+int count = 0
+var window = desktop.window("Counter", 480, 320)
+
+function page() returns element
+    return <html><body>
+        <p id="count">Clicked {count} times</p>
+        <button onclick={function()
+            count += 1
+            window.load(page())
+        end}>Click me</button>
+    </body></html>
+end
+
+window.load(page())
 window.run()
 ```
 
 | API | Behavior |
 |---|---|
-| `desktop.window` or `desktop.window()` on an assignment RHS | Create a window description with title `Flywheel`, width `960`, height `640` |
-| `desktop.window(string title, int width, int height)` | Customize title and initial size; trailing arguments are optional |
-| `window.load(element_or_fragment) returns void` | Serialize a snapshot of the markup with the existing HTML renderer |
-| `window.run() returns void` | Create the native window, display the loaded HTML, and block until it closes |
+| `desktop.window()` | Create a window with title `Flywheel`, width `960`, height `640` |
+| `desktop.window(string title, int width, int height)` | Customize title and size; trailing arguments are optional; `desktop.window "Title"` also works |
+| `window.load(element_or_fragment)` | Show this tree; while running, the page shows it after the current callback |
+| `window.bind(string name, function(string) returns string)` | Expose a Flywheel function to page JavaScript as `name(value)` |
+| `window.eval(string script)` | Run JavaScript in the page: after loading when called before `run`, otherwise after the current callback |
+| `window.run()` | Show the window and block until it closes |
+| `desktop.run(desktop.window[] windows)` | Show several windows with one event loop; returns when all are closed |
+| `desktop.quit()` | Close every window and return from `run` after the current callback |
 
-`desktop.Window` is an alias for `desktop.window` in constructors and type annotations. Module aliases work, for example `import desktop as gui` and `gui.window view = gui.Window("Example")`. Windows are reference-managed objects: assignments alias the same description, and nullable `desktop.window?` values use normal checked access.
+`desktop.window` without parentheses is the class itself (`var Window = desktop.window`, then `Window("Title")`); see [classes and constructors](types.md#classes-and-constructors). `desktop.Window` is an alias. Windows are reference-managed objects: assignments alias the same window.
 
-A bare class name on the outer right-hand side of a declaration or assignment constructs an instance with no arguments. Parentheses around the class name preserve a constructor reference:
+## Events and live updates
+
+Markup event attributes can hold Flywheel functions: `function() returns void`, or `function(string value) returns void`, which receives the event target's `value` (for example the text of an `<input>`). Inline JavaScript strings (`onclick="..."`) still work too.
+
+A window keeps the tree it was given. After every event handler and binding call, each running window re-renders its tree; when the HTML changed, the page body is replaced, keeping the focused element (by `id`) and its text selection. So a handler can mutate the tree in place (`node.text_content = ...`) or call `window.load(new_tree)`. Changes made before `run` are shown when the window opens.
+
+## JavaScript bindings
 
 ```flywheel
-var window = desktop.window       # New window with default title and size
-var Window = (desktop.window)     # Constructor reference; creates no window
-var custom = Window("Custom", 800, 600)
-var another = Window              # Invoke the stored constructor with defaults
-var same_constructor = (Window)   # Copy the reference
+import desktop
+var window = desktop.window()
+window.bind("greet", function(string name) returns string
+    return "Hello, " + name
+end)
+window.eval("greet('Ann').then(function (reply) {{ document.title = reply; }})")
 ```
 
-`desktop.Window`, module aliases, and user-defined classes follow the same rule. Ordinary instance assignment, such as `var alias = window`, still shares the existing instance. `(desktop.window)()` explicitly invokes the constructor; `(desktop.window())` groups an already-created instance. Constructor references can be stored in inferred bindings and called, but have no instance fields/methods and cannot currently be stored in collections or given a callable parameter type. Grouped standalone constructor references are not invoked; ordinary zero-argument function and method statements still invoke, including `(window.run)`. Function references keep their existing semantics.
+Page JavaScript calls a binding with one argument and receives a Promise. A single string argument arrives unchanged; other arguments arrive as their JSON text. The returned string resolves the promise. Bindings must be added before `run`. Remember that `{` interpolates in Flywheel strings, so write `{{` and `}}` for JavaScript braces.
 
-Construction and `load` do not open a window or require a graphical session. `load` copies the serialized HTML, so source elements can be mutated or released afterward without changing the displayed snapshot. It accepts both individual elements and fragments; strings are rejected. It preserves existing text/attribute escaping. A new `load` replaces the previous snapshot. Without `load`, `run` shows an empty document.
+Handlers and bindings run on the thread that called `run`, one at a time. An uncaught Flywheel error in a callback closes the windows and propagates from `run` as an ordinary error.
 
-Closing the native window returns from `run` and releases its native resources. Calling `run` again creates another window from the saved snapshot; calling `load` between runs replaces its contents. Execution stays on the calling/main thread. `run` is blocking, so this API does not supply parallel windows, live synchronization with Flywheel trees, native event callbacks, or a JavaScript-to-Flywheel bridge. Existing server-side markup restrictions on event attributes still apply. Relative resource URLs have no application filesystem base; use absolute resource URLs when needed.
+## Errors and lifetime
 
-Dimensions must be positive signed 32-bit values. Titles and rendered HTML cannot contain NUL bytes. Invalid values, a missing backend, a missing display/WebView2 runtime, or native webview failures raise `DesktopError`. Ordinary `try`/`catch`/`finally` and ARC cleanup apply. Backend modules stay loaded until process exit because GUI frameworks register process-wide types.
+Dimensions must be positive signed 32-bit values. Titles and rendered HTML cannot contain NUL bytes. Invalid values, a missing backend, a missing display/WebView2 runtime, or native webview failures raise `DesktopError`. Backend modules stay loaded until process exit because GUI frameworks register process-wide types. Relative resource URLs have no application filesystem base; use absolute resource URLs when needed.
 
 ## Build and run
 
@@ -49,24 +69,15 @@ cmake --build build --parallel 2
 build/flywheel run examples/desktop_demo.fw
 ```
 
-The `FLYWHEEL_DESKTOP` CMake setting accepts `AUTO` (default), `ON`, or `OFF`. `AUTO` builds the backend when native development dependencies are available. `ON` makes missing build dependencies a configuration error. `OFF` retains the window value and serialization API, but `run` raises `DesktopError` unless a compatible backend is provided. Command-line programs do not load the GUI backend.
+The `FLYWHEEL_DESKTOP` CMake setting accepts `AUTO` (default), `ON`, or `OFF`. `AUTO` builds the backend when native development dependencies are available. `ON` makes missing build dependencies a configuration error. `OFF` retains the window API, but `run` raises `DesktopError` unless a compatible backend is provided. Command-line programs do not load the GUI backend.
 
-The build downloads webview **0.12.0** from its official source archive and verifies its SHA-256. For an offline build, provide an existing checkout with `-DFETCHCONTENT_SOURCE_DIR_WEBVIEW=/path/to/webview`. Webview's own examples, tests, and unrelated libraries are disabled. The adapter works around the pinned version's GTK size-setting result bug: GTK applies valid dimensions but reports `Invalid hint`. Only that exact false error is ignored; the GUI test checks the actual window dimensions.
+The build downloads webview **0.12.0** from its official source archive and verifies its SHA-256. For an offline build, provide an existing checkout with `-DFETCHCONTENT_SOURCE_DIR_WEBVIEW=/path/to/webview`. The adapter works around the pinned version's GTK size-setting result bug: GTK applies valid dimensions but reports `Invalid hint`. Only that exact false error is ignored.
 
-- **Linux:** install GTK and WebKitGTK development packages. Debian/Ubuntu: `libgtk-3-dev libwebkit2gtk-4.1-dev`; Arch Linux: `gtk3 webkit2gtk-4.1`. WebKitGTK 6.0/GTK4 and 4.0/GTK3 are also supported by the upstream backend. Running a window needs a graphical session and the corresponding runtime libraries.
-- **macOS:** use the native development toolchain and system Cocoa/WebKit frameworks. GUI execution must occur on the main thread.
-- **Windows:** use the native C++ toolchain; upstream CMake obtains the WebView2 SDK. End users need the WebView2 runtime installed.
+- **Linux:** install GTK and WebKitGTK development packages. Debian/Ubuntu: `libgtk-3-dev libwebkit2gtk-4.1-dev`; Arch Linux: `gtk3 webkit2gtk-4.1`. Running a window needs a graphical session.
+- **Windows:** use the native C++ toolchain; upstream CMake obtains the WebView2 SDK. End users need the WebView2 runtime installed. This path is untested.
 
-`cmake --install build --prefix /chosen/prefix` installs the backend beside the runtime archive in `lib`. The compiler locates that backend and records its path in generated applications. For deployment elsewhere, distribute the matching `libflywheel_desktop.so`, `libflywheel_desktop.dylib`, or `flywheel_desktop.dll`, install its platform runtime dependencies, and set `FLYWHEEL_DESKTOP_BACKEND` to its path. This environment variable overrides the recorded path. The shared backend exports a versioned native entry point, `fw_desktop_show_v1`; it is separate from the core runtime ABI.
+`cmake --install build --prefix /chosen/prefix` installs the backend beside the runtime archive in `lib`. The compiler records its path in generated applications; `FLYWHEEL_DESKTOP_BACKEND` overrides it. The backend exports the versioned entry point `fw_desktop_run_v2`, separate from the core runtime ABI.
 
 ## Validation
 
-The ordinary regression suite tests constructors, aliases/type annotations, markup ownership, replacing content, argument diagnostics, and failed-backend cleanup without opening a window. ASan/UBSan covers these ownership/error paths.
-
-On Linux, CMake also registers a real GUI test when `xvfb-run`, `xdotool`, and `dbus-run-session` are installed:
-
-```sh
-ctest --test-dir build --output-on-failure
-```
-
-The isolated WebKit test reads the actual rendered DOM through a loopback test script, checks escaping and snapshot behavior, closes the window gracefully, runs it a second time with new content, and checks Flywheel object cleanup. Linux is the tested platform at this checkpoint; Windows/macOS backend execution has not been verified locally.
+The ordinary regression suite tests constructors, aliases, ownership, argument diagnostics, and failed-backend cleanup without opening a window. On Linux, CMake also registers a real GUI test when `xvfb-run`, `xdotool`, and `dbus-run-session` are installed (`ctest --test-dir build --output-on-failure`). It reads the rendered DOM, checks escaping and live trees, reruns a window, clicks buttons and types into inputs from JavaScript, checks that Flywheel handlers ran and the page re-rendered, calls bindings in two windows at once, and quits from Flywheel.

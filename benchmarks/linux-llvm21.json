@@ -15,125 +15,125 @@
     "startup": {
       "compilation": {
         "flywheel-O0": {
-          "ms": 43.01311,
+          "ms": 22.736124,
           "command": [
             "/home/danny/projects/wednesware/fw/build-llvm21/flywheel",
             "build",
-            "/tmp/flywheel-bench-4lmnpsc1/main.fly",
+            "/tmp/flywheel-bench-vfc59yj9/main.fly",
             "-O0",
             "-o",
-            "/tmp/flywheel-bench-4lmnpsc1/flywheel-0"
+            "/tmp/flywheel-bench-vfc59yj9/flywheel-0"
           ]
         },
         "cpp-O0": {
-          "ms": 228.449389,
+          "ms": 214.348534,
           "command": [
             "/usr/bin/c++",
             "-std=c++20",
             "-O0",
-            "/tmp/flywheel-bench-4lmnpsc1/main.cpp",
+            "/tmp/flywheel-bench-vfc59yj9/main.cpp",
             "-o",
-            "/tmp/flywheel-bench-4lmnpsc1/cpp-0"
+            "/tmp/flywheel-bench-vfc59yj9/cpp-0"
           ]
         },
         "flywheel-O3": {
-          "ms": 44.06227,
+          "ms": 26.378475,
           "command": [
             "/home/danny/projects/wednesware/fw/build-llvm21/flywheel",
             "build",
-            "/tmp/flywheel-bench-4lmnpsc1/main.fly",
+            "/tmp/flywheel-bench-vfc59yj9/main.fly",
             "-O3",
             "-o",
-            "/tmp/flywheel-bench-4lmnpsc1/flywheel-3"
+            "/tmp/flywheel-bench-vfc59yj9/flywheel-3"
           ]
         },
         "cpp-O3": {
-          "ms": 230.136311,
+          "ms": 215.692604,
           "command": [
             "/usr/bin/c++",
             "-std=c++20",
             "-O3",
-            "/tmp/flywheel-bench-4lmnpsc1/main.cpp",
+            "/tmp/flywheel-bench-vfc59yj9/main.cpp",
             "-o",
-            "/tmp/flywheel-bench-4lmnpsc1/cpp-3"
+            "/tmp/flywheel-bench-vfc59yj9/cpp-3"
           ]
         }
       },
       "execution": {
         "flywheel-O0": {
           "samples_ms": [
-            0.972748,
-            0.798943,
-            0.870918,
-            0.699898,
-            1.0064,
-            0.819341,
-            0.784236
+            0.975411,
+            0.902966,
+            0.873902,
+            0.815833,
+            0.891375,
+            0.871267,
+            0.741745
           ],
-          "min_ms": 0.699898,
-          "median_ms": 0.819341,
-          "p90_ms": 1.0064,
-          "max_ms": 1.0064
+          "min_ms": 0.741745,
+          "median_ms": 0.873902,
+          "p90_ms": 0.975411,
+          "max_ms": 0.975411
         },
         "cpp-O0": {
           "samples_ms": [
-            0.735925,
-            0.861751,
-            0.811407,
-            0.870467,
-            0.892227,
-            0.741606,
-            0.852072
+            0.717089,
+            0.796848,
+            0.777923,
+            0.73387,
+            0.834549,
+            0.858813,
+            0.752495
           ],
-          "min_ms": 0.735925,
-          "median_ms": 0.852072,
-          "p90_ms": 0.892227,
-          "max_ms": 0.892227
+          "min_ms": 0.717089,
+          "median_ms": 0.777923,
+          "p90_ms": 0.858813,
+          "max_ms": 0.858813
         },
         "flywheel-O3": {
           "samples_ms": [
-            0.73832,
-            0.820163,
-            0.734262,
-            0.86671,
-            0.878161,
-            1.03263,
-            0.86178
+            0.891514,
+            1.275261,
+            0.926039,
+            0.945526,
+            0.896453,
+            0.890263,
+            0.74432
           ],
-          "min_ms": 0.734262,
-          "median_ms": 0.86178,
-          "p90_ms": 1.03263,
-          "max_ms": 1.03263
+          "min_ms": 0.74432,
+          "median_ms": 0.896453,
+          "p90_ms": 1.275261,
+          "max_ms": 1.275261
         },
         "cpp-O3": {
           "samples_ms": [
-            0.90441,
-            0.812769,
-            0.87249,
-            0.694768,
-            0.700279,
-            0.889843,
-            0.832315
+            0.851069,
+            0.901974,
+            0.676183,
+            0.834428,
+            0.78751,
+            0.6694,
+            0.775207
           ],
-          "min_ms": 0.694768,
-          "median_ms": 0.832315,
-          "p90_ms": 0.90441,
-          "max_ms": 0.90441
+          "min_ms": 0.6694,
+          "median_ms": 0.78751,
+          "p90_ms": 0.901974,
+          "max_ms": 0.901974
         },
         "cpython": {
           "samples_ms": [
-            8.69599,
-            8.10198,
-            8.884262,
-            9.105947,
-            9.385539,
-            8.859687,
-            8.911543
+            9.135438,
+            8.59017,
+            8.492268,
+            8.388944,
+            9.079173,
+            8.457382,
+            8.774103
           ],
-          "min_ms": 8.10198,
-          "median_ms": 8.884262,
-          "p90_ms": 9.385539,
-          "max_ms": 9.385539
+          "min_ms": 8.388944,
+          "median_ms": 8.59017,
+          "p90_ms": 9.135438,
+          "max_ms": 9.135438
         }
       },
       "stdout": "hello\n",
@@ -142,125 +142,125 @@
     "numeric": {
       "compilation": {
         "flywheel-O0": {
-          "ms": 44.4047,
+          "ms": 23.851506,
           "command": [
             "/home/danny/projects/wednesware/fw/build-llvm21/flywheel",
             "build",
-            "/tmp/flywheel-bench-4lmnpsc1/main.fly",
+            "/tmp/flywheel-bench-vfc59yj9/main.fly",
             "-O0",
             "-o",
-            "/tmp/flywheel-bench-4lmnpsc1/flywheel-0"
+            "/tmp/flywheel-bench-vfc59yj9/flywheel-0"
           ]
         },
         "cpp-O0": {
-          "ms": 241.361708,
+          "ms": 228.687499,
           "command": [
             "/usr/bin/c++",
             "-std=c++20",
             "-O0",
-            "/tmp/flywheel-bench-4lmnpsc1/main.cpp",
+            "/tmp/flywheel-bench-vfc59yj9/main.cpp",
             "-o",
-            "/tmp/flywheel-bench-4lmnpsc1/cpp-0"
+            "/tmp/flywheel-bench-vfc59yj9/cpp-0"
           ]
         },
         "flywheel-O3": {
-          "ms": 44.600196,
+          "ms": 30.110764,
           "command": [
             "/home/danny/projects/wednesware/fw/build-llvm21/flywheel",
             "build",
-            "/tmp/flywheel-bench-4lmnpsc1/main.fly",
+            "/tmp/flywheel-bench-vfc59yj9/main.fly",
             "-O3",
             "-o",
-            "/tmp/flywheel-bench-4lmnpsc1/flywheel-3"
+            "/tmp/flywheel-bench-vfc59yj9/flywheel-3"
           ]
         },
         "cpp-O3": {
-          "ms": 248.025732,
+          "ms": 223.447103,
           "command": [
             "/usr/bin/c++",
             "-std=c++20",
             "-O3",
-            "/tmp/flywheel-bench-4lmnpsc1/main.cpp",
+            "/tmp/flywheel-bench-vfc59yj9/main.cpp",
             "-o",
-            "/tmp/flywheel-bench-4lmnpsc1/cpp-3"
+            "/tmp/flywheel-bench-vfc59yj9/cpp-3"
           ]
         }
       },
       "execution": {
         "flywheel-O0": {
           "samples_ms": [
-            1.623053,
-            1.762624,
-            1.463395,
-            1.25737,
-            1.430062,
-            1.428399,
-            1.75514
+            1.53165,
+            1.678764,
+            1.294116,
+            1.505451,
+            1.473251,
+            1.548982,
+            1.674616
           ],
-          "min_ms": 1.25737,
-          "median_ms": 1.463395,
-          "p90_ms": 1.762624,
-          "max_ms": 1.762624
+          "min_ms": 1.294116,
+          "median_ms": 1.53165,
+          "p90_ms": 1.678764,
+          "max_ms": 1.678764
         },
         "cpp-O0": {
           "samples_ms": [
-            1.083024,
-            1.151632,
-            1.250707,
-            1.098432,
-            0.959443,
-            1.155319,
-            1.406327
+            1.031236,
+            1.010647,
+            1.266505,
+            1.147923,
+            1.284338,
+            1.356513,
+            0.970753
           ],
-          "min_ms": 0.959443,
-          "median_ms": 1.151632,
-          "p90_ms": 1.406327,
-          "max_ms": 1.406327
+          "min_ms": 0.970753,
+          "median_ms": 1.147923,
+          "p90_ms": 1.356513,
+          "max_ms": 1.356513
         },
         "flywheel-O3": {
           "samples_ms": [
-            1.150951,
-            0.965584,
-            1.153456,
-            1.330607,
-            1.121396,
-            1.179945,
-            1.169526
+            1.07105,
+            1.279349,
+            1.002292,
+            1.061803,
+            1.014624,
+            0.983597,
+            1.136141
           ],
-          "min_ms": 0.965584,
-          "median_ms": 1.153456,
-          "p90_ms": 1.330607,
-          "max_ms": 1.330607
+          "min_ms": 0.983597,
+          "median_ms": 1.061803,
+          "p90_ms": 1.279349,
+          "max_ms": 1.279349
         },
         "cpp-O3": {
           "samples_ms": [
-            0.924698,
-            1.148406,
-            0.938393,
-            1.202648,
-            0.943623,
-            0.919348,
-            1.118601
+            1.059909,
+            1.144497,
+            0.931699,
+            0.90478,
+            1.116986,
+            0.995128,
+            0.97439
           ],
-          "min_ms": 0.919348,
-          "median_ms": 0.943623,
-          "p90_ms": 1.202648,
-          "max_ms": 1.202648
+          "min_ms": 0.90478,
+          "median_ms": 0.995128,
+          "p90_ms": 1.144497,
+          "max_ms": 1.144497
         },
         "cpython": {
           "samples_ms": [
-            28.446359,
-            28.913351,
-            30.414556,
-            28.362882,
-            28.150205,
-            30.068971,
-            30.388187
+            28.109408,
+            27.710803,
+            26.70742,
+            28.647182,
+            28.037062,
+            26.647508,
+            26.607694
           ],
-          "min_ms": 28.150205,
-          "median_ms": 28.913351,
-          "p90_ms": 30.414556,
-          "max_ms": 30.414556
+          "min_ms": 26.607694,
+          "median_ms": 27.710803,
+          "p90_ms": 28.647182,
+          "max_ms": 28.647182
         }
       },
       "stdout": "43197606\n",
@@ -269,125 +269,125 @@
     "array": {
       "compilation": {
         "flywheel-O0": {
-          "ms": 139.040589,
+          "ms": 40.211435,
           "command": [
             "/home/danny/projects/wednesware/fw/build-llvm21/flywheel",
             "build",
-            "/tmp/flywheel-bench-4lmnpsc1/main.fly",
+            "/tmp/flywheel-bench-vfc59yj9/main.fly",
             "-O0",
             "-o",
-            "/tmp/flywheel-bench-4lmnpsc1/flywheel-0"
+            "/tmp/flywheel-bench-vfc59yj9/flywheel-0"
           ]
         },
         "cpp-O0": {
-          "ms": 275.090839,
+          "ms": 249.116195,
           "command": [
             "/usr/bin/c++",
             "-std=c++20",
             "-O0",
-            "/tmp/flywheel-bench-4lmnpsc1/main.cpp",
+            "/tmp/flywheel-bench-vfc59yj9/main.cpp",
             "-o",
-            "/tmp/flywheel-bench-4lmnpsc1/cpp-0"
+            "/tmp/flywheel-bench-vfc59yj9/cpp-0"
           ]
         },
         "flywheel-O3": {
-          "ms": 179.174327,
+          "ms": 150.006641,
           "command": [
             "/home/danny/projects/wednesware/fw/build-llvm21/flywheel",
             "build",
-            "/tmp/flywheel-bench-4lmnpsc1/main.fly",
+            "/tmp/flywheel-bench-vfc59yj9/main.fly",
             "-O3",
             "-o",
-            "/tmp/flywheel-bench-4lmnpsc1/flywheel-3"
+            "/tmp/flywheel-bench-vfc59yj9/flywheel-3"
           ]
         },
         "cpp-O3": {
-          "ms": 295.488457,
+          "ms": 278.655072,
           "command": [
             "/usr/bin/c++",
             "-std=c++20",
             "-O3",
-            "/tmp/flywheel-bench-4lmnpsc1/main.cpp",
+            "/tmp/flywheel-bench-vfc59yj9/main.cpp",
             "-o",
-            "/tmp/flywheel-bench-4lmnpsc1/cpp-3"
+            "/tmp/flywheel-bench-vfc59yj9/cpp-3"
           ]
         }
       },
       "execution": {
         "flywheel-O0": {
           "samples_ms": [
-            4.003832,
-            3.979627,
-            4.392989,
-            3.833634,
-            3.764004,
-            3.92772,
-            4.100333
+            4.039774,
+            4.324525,
+            4.394045,
+            4.161601,
+            3.96824,
+            4.438398,
+            4.264453
           ],
-          "min_ms": 3.764004,
-          "median_ms": 3.979627,
-          "p90_ms": 4.392989,
-          "max_ms": 4.392989
+          "min_ms": 3.96824,
+          "median_ms": 4.264453,
+          "p90_ms": 4.438398,
+          "max_ms": 4.438398
         },
         "cpp-O0": {
           "samples_ms": [
-            0.981775,
-            1.196556,
-            1.111507,
-            1.335416,
-            0.978158,
-            1.161871,
-            1.464026
+            1.056383,
+            1.200832,
+            1.032077,
+            1.009846,
+            0.976253,
+            0.938182,
+            0.962638
           ],
-          "min_ms": 0.978158,
-          "median_ms": 1.161871,
-          "p90_ms": 1.464026,
-          "max_ms": 1.464026
+          "min_ms": 0.938182,
+          "median_ms": 1.009846,
+          "p90_ms": 1.200832,
+          "max_ms": 1.200832
         },
         "flywheel-O3": {
           "samples_ms": [
-            3.58004,
-            3.967454,
-            3.814849,
-            4.134556,
-            4.017097,
-            4.134036,
-            3.92796
+            4.206454,
+            4.022341,
+            3.750694,
+            3.899251,
+            3.940568,
+            3.881157,
+            4.181447
           ],
-          "min_ms": 3.58004,
-          "median_ms": 3.967454,
-          "p90_ms": 4.134556,
-          "max_ms": 4.134556
+          "min_ms": 3.750694,
+          "median_ms": 3.940568,
+          "p90_ms": 4.206454,
+          "max_ms": 4.206454
         },
         "cpp-O3": {
           "samples_ms": [
-            0.779046,
-            1.081311,
-            0.760851,
-            0.962478,
-            0.920981,
-            0.837655,
-            0.921122
+            1.131803,
+            1.144047,
+            0.913396,
+            0.85731,
+            0.88381,
+            0.895863,
+            0.915088
           ],
-          "min_ms": 0.760851,
-          "median_ms": 0.920981,
-          "p90_ms": 1.081311,
-          "max_ms": 1.081311
+          "min_ms": 0.85731,
+          "median_ms": 0.913396,
+          "p90_ms": 1.144047,
+          "max_ms": 1.144047
         },
         "cpython": {
           "samples_ms": [
-            29.591177,
-            27.518805,
-            27.916939,
-            30.269035,
-            29.005603,
-            29.458379,
-            34.987101
+            26.976031,
+            27.539655,
+            29.250208,
+            27.413027,
+            30.057145,
+            32.563284,
+            28.304352
           ],
-          "min_ms": 27.518805,
-          "median_ms": 29.458379,
-          "p90_ms": 34.987101,
-          "max_ms": 34.987101
+          "min_ms": 26.976031,
+          "median_ms": 28.304352,
+          "p90_ms": 32.563284,
+          "max_ms": 32.563284
         }
       },
       "stdout": "120000000\n",
@@ -396,125 +396,125 @@
     "strings": {
       "compilation": {
         "flywheel-O0": {
-          "ms": 45.87657,
+          "ms": 23.898044,
           "command": [
             "/home/danny/projects/wednesware/fw/build-llvm21/flywheel",
             "build",
-            "/tmp/flywheel-bench-4lmnpsc1/main.fly",
+            "/tmp/flywheel-bench-vfc59yj9/main.fly",
             "-O0",
             "-o",
-            "/tmp/flywheel-bench-4lmnpsc1/flywheel-0"
+            "/tmp/flywheel-bench-vfc59yj9/flywheel-0"
           ]
         },
         "cpp-O0": {
-          "ms": 259.394927,
+          "ms": 246.15687,
           "command": [
             "/usr/bin/c++",
             "-std=c++20",
             "-O0",
-            "/tmp/flywheel-bench-4lmnpsc1/main.cpp",
+            "/tmp/flywheel-bench-vfc59yj9/main.cpp",
             "-o",
-            "/tmp/flywheel-bench-4lmnpsc1/cpp-0"
+            "/tmp/flywheel-bench-vfc59yj9/cpp-0"
           ]
         },
         "flywheel-O3": {
-          "ms": 45.173447,
+          "ms": 29.667808,
           "command": [
             "/home/danny/projects/wednesware/fw/build-llvm21/flywheel",
             "build",
-            "/tmp/flywheel-bench-4lmnpsc1/main.fly",
+            "/tmp/flywheel-bench-vfc59yj9/main.fly",
             "-O3",
             "-o",
-            "/tmp/flywheel-bench-4lmnpsc1/flywheel-3"
+            "/tmp/flywheel-bench-vfc59yj9/flywheel-3"
           ]
         },
         "cpp-O3": {
-          "ms": 321.404196,
+          "ms": 283.317469,
           "command": [
             "/usr/bin/c++",
             "-std=c++20",
             "-O3",
-            "/tmp/flywheel-bench-4lmnpsc1/main.cpp",
+            "/tmp/flywheel-bench-vfc59yj9/main.cpp",
             "-o",
-            "/tmp/flywheel-bench-4lmnpsc1/cpp-3"
+            "/tmp/flywheel-bench-vfc59yj9/cpp-3"
           ]
         }
       },
       "execution": {
         "flywheel-O0": {
           "samples_ms": [
-            4.369355,
-            3.826761,
-            4.654468,
-            4.410882,
-            4.0616,
-            4.802134,
-            4.143914
+            3.871059,
+            3.645036,
+            4.706248,
+            3.808201,
+            4.010248,
+            3.672498,
+            4.444649
           ],
-          "min_ms": 3.826761,
-          "median_ms": 4.369355,
-          "p90_ms": 4.802134,
-          "max_ms": 4.802134
+          "min_ms": 3.645036,
+          "median_ms": 3.871059,
+          "p90_ms": 4.706248,
+          "max_ms": 4.706248
         },
         "cpp-O0": {
           "samples_ms": [
-            5.073441,
-            5.402246,
-            4.879278,
-            4.427734,
-            4.701115,
-            4.4626,
-            4.458572
+            5.358856,
+            5.10358,
+            4.799101,
+            4.330976,
+            4.386451,
+            4.261448,
+            4.369088
           ],
-          "min_ms": 4.427734,
-          "median_ms": 4.701115,
-          "p90_ms": 5.402246,
-          "max_ms": 5.402246
+          "min_ms": 4.261448,
+          "median_ms": 4.386451,
+          "p90_ms": 5.358856,
+          "max_ms": 5.358856
         },
         "flywheel-O3": {
           "samples_ms": [
-            4.534925,
-            4.123235,
-            3.575031,
-            3.871895,
-            4.203425,
-            3.643208,
-            3.697109
+            4.519299,
+            4.487529,
+            5.062253,
+            5.295408,
+            5.225778,
+            5.088532,
+            5.588986
           ],
-          "min_ms": 3.575031,
-          "median_ms": 3.871895,
-          "p90_ms": 4.534925,
-          "max_ms": 4.534925
+          "min_ms": 4.487529,
+          "median_ms": 5.088532,
+          "p90_ms": 5.588986,
+          "max_ms": 5.588986
         },
         "cpp-O3": {
           "samples_ms": [
-            2.672664,
-            2.678866,
-            2.473653,
-            3.027808,
-            2.181707,
-            2.069637,
-            2.851168
+            2.978812,
+            2.913831,
+            3.35282,
+            3.028014,
+            3.060214,
+            3.056137,
+            2.64557
           ],
-          "min_ms": 2.069637,
-          "median_ms": 2.672664,
-          "p90_ms": 3.027808,
-          "max_ms": 3.027808
+          "min_ms": 2.64557,
+          "median_ms": 3.028014,
+          "p90_ms": 3.35282,
+          "max_ms": 3.35282
         },
         "cpython": {
           "samples_ms": [
-            10.910088,
-            10.485715,
-            9.837404,
-            11.106535,
-            10.645153,
-            10.314054,
-            10.831211
+            12.387901,
+            9.97703,
+            9.616556,
+            9.750677,
+            11.297756,
+            10.056348,
+            9.984934
           ],
-          "min_ms": 9.837404,
-          "median_ms": 10.645153,
-          "p90_ms": 11.106535,
-          "max_ms": 11.106535
+          "min_ms": 9.616556,
+          "median_ms": 9.984934,
+          "p90_ms": 12.387901,
+          "max_ms": 12.387901
         }
       },
       "stdout": "23890\n",
@@ -523,125 +523,125 @@
     "markup": {
       "compilation": {
         "flywheel-O0": {
-          "ms": 44.96653,
+          "ms": 24.548168,
           "command": [
             "/home/danny/projects/wednesware/fw/build-llvm21/flywheel",
             "build",
-            "/tmp/flywheel-bench-4lmnpsc1/main.fly",
+            "/tmp/flywheel-bench-vfc59yj9/main.fly",
             "-O0",
             "-o",
-            "/tmp/flywheel-bench-4lmnpsc1/flywheel-0"
+            "/tmp/flywheel-bench-vfc59yj9/flywheel-0"
           ]
         },
         "cpp-O0": {
-          "ms": 315.568279,
+          "ms": 294.391158,
           "command": [
             "/usr/bin/c++",
             "-std=c++20",
             "-O0",
-            "/tmp/flywheel-bench-4lmnpsc1/main.cpp",
+            "/tmp/flywheel-bench-vfc59yj9/main.cpp",
             "-o",
-            "/tmp/flywheel-bench-4lmnpsc1/cpp-0"
+            "/tmp/flywheel-bench-vfc59yj9/cpp-0"
           ]
         },
         "flywheel-O3": {
-          "ms": 42.833864,
+          "ms": 30.248181,
           "command": [
             "/home/danny/projects/wednesware/fw/build-llvm21/flywheel",
             "build",
-            "/tmp/flywheel-bench-4lmnpsc1/main.fly",
+            "/tmp/flywheel-bench-vfc59yj9/main.fly",
             "-O3",
             "-o",
-            "/tmp/flywheel-bench-4lmnpsc1/flywheel-3"
+            "/tmp/flywheel-bench-vfc59yj9/flywheel-3"
           ]
         },
         "cpp-O3": {
-          "ms": 384.579031,
+          "ms": 381.692403,
           "command": [
             "/usr/bin/c++",
             "-std=c++20",
             "-O3",
-            "/tmp/flywheel-bench-4lmnpsc1/main.cpp",
+            "/tmp/flywheel-bench-vfc59yj9/main.cpp",
             "-o",
-            "/tmp/flywheel-bench-4lmnpsc1/cpp-3"
+            "/tmp/flywheel-bench-vfc59yj9/cpp-3"
           ]
         }
       },
       "execution": {
         "flywheel-O0": {
           "samples_ms": [
-            20.380816,
-            21.875369,
-            20.450827,
-            20.368343,
-            21.253136,
-            21.962221,
-            21.713927
+            25.55093,
+            24.684623,
+            25.248305,
+            25.078087,
+            25.675423,
+            25.240921,
+            25.021581
           ],
-          "min_ms": 20.368343,
-          "median_ms": 21.253136,
-          "p90_ms": 21.962221,
-          "max_ms": 21.962221
+          "min_ms": 24.684623,
+          "median_ms": 25.240921,
+          "p90_ms": 25.675423,
+          "max_ms": 25.675423
         },
         "cpp-O0": {
           "samples_ms": [
-            78.69557,
-            82.276292,
-            78.46026,
-            78.477162,
-            83.813495,
-            78.719264,
-            78.971405
+            78.672063,
+            82.299746,
+            82.365258,
+            79.303581,
+            83.653524,
+            84.146665,
+            80.99509
           ],
-          "min_ms": 78.46026,
-          "median_ms": 78.719264,
-          "p90_ms": 83.813495,
-          "max_ms": 83.813495
+          "min_ms": 78.672063,
+          "median_ms": 82.299746,
+          "p90_ms": 84.146665,
+          "max_ms": 84.146665
         },
         "flywheel-O3": {
           "samples_ms": [
-            21.441027,
-            21.389722,
-            20.845104,
-            20.040731,
-            20.144755,
-            20.322697,
-            20.582823
+            24.905665,
+            23.96011,
+            24.814245,
+            24.809475,
+            25.032222,
+            25.281106,
+            25.593921
           ],
-          "min_ms": 20.040731,
-          "median_ms": 20.582823,
-          "p90_ms": 21.441027,
-          "max_ms": 21.441027
+          "min_ms": 23.96011,
+          "median_ms": 24.905665,
+          "p90_ms": 25.593921,
+          "max_ms": 25.593921
         },
         "cpp-O3": {
           "samples_ms": [
-            4.993562,
-            4.182866,
-            4.314863,
-            5.065746,
-            5.662211,
-            4.840516,
-            4.477206
+            4.747515,
+            5.070267,
+            5.105043,
+            4.457834,
+            5.367693,
+            4.757734,
+            4.435773
           ],
-          "min_ms": 4.182866,
-          "median_ms": 4.840516,
-          "p90_ms": 5.662211,
-          "max_ms": 5.662211
+          "min_ms": 4.435773,
+          "median_ms": 4.757734,
+          "p90_ms": 5.367693,
+          "max_ms": 5.367693
         },
         "cpython": {
           "samples_ms": [
-            36.727172,
-            35.895669,
-            35.254632,
-            37.182063,
-            36.933748,
-            39.143629,
-            39.480908
+            34.574059,
+            34.179092,
+            33.04806,
+            33.347619,
+            33.652278,
+            35.350279,
+            34.435801
           ],
-          "min_ms": 35.254632,
-          "median_ms": 36.933748,
-          "p90_ms": 39.480908,
-          "max_ms": 39.480908
+          "min_ms": 33.04806,
+          "median_ms": 34.179092,
+          "p90_ms": 35.350279,
+          "max_ms": 35.350279
         }
       },
       "stdout": "1188890\n",
@@ -650,125 +650,125 @@
     "allocations": {
       "compilation": {
         "flywheel-O0": {
-          "ms": 44.090022,
+          "ms": 24.65093,
           "command": [
             "/home/danny/projects/wednesware/fw/build-llvm21/flywheel",
             "build",
-            "/tmp/flywheel-bench-4lmnpsc1/main.fly",
+            "/tmp/flywheel-bench-vfc59yj9/main.fly",
             "-O0",
             "-o",
-            "/tmp/flywheel-bench-4lmnpsc1/flywheel-0"
+            "/tmp/flywheel-bench-vfc59yj9/flywheel-0"
           ]
         },
         "cpp-O0": {
-          "ms": 303.330741,
+          "ms": 278.894623,
           "command": [
             "/usr/bin/c++",
             "-std=c++20",
             "-O0",
-            "/tmp/flywheel-bench-4lmnpsc1/main.cpp",
+            "/tmp/flywheel-bench-vfc59yj9/main.cpp",
             "-o",
-            "/tmp/flywheel-bench-4lmnpsc1/cpp-0"
+            "/tmp/flywheel-bench-vfc59yj9/cpp-0"
           ]
         },
         "flywheel-O3": {
-          "ms": 43.820509,
+          "ms": 31.798236,
           "command": [
             "/home/danny/projects/wednesware/fw/build-llvm21/flywheel",
             "build",
-            "/tmp/flywheel-bench-4lmnpsc1/main.fly",
+            "/tmp/flywheel-bench-vfc59yj9/main.fly",
             "-O3",
             "-o",
-            "/tmp/flywheel-bench-4lmnpsc1/flywheel-3"
+            "/tmp/flywheel-bench-vfc59yj9/flywheel-3"
           ]
         },
         "cpp-O3": {
-          "ms": 330.518577,
+          "ms": 326.049495,
           "command": [
             "/usr/bin/c++",
             "-std=c++20",
             "-O3",
-            "/tmp/flywheel-bench-4lmnpsc1/main.cpp",
+            "/tmp/flywheel-bench-vfc59yj9/main.cpp",
             "-o",
-            "/tmp/flywheel-bench-4lmnpsc1/cpp-3"
+            "/tmp/flywheel-bench-vfc59yj9/cpp-3"
           ]
         }
       },
       "execution": {
         "flywheel-O0": {
           "samples_ms": [
-            4.562256,
-            4.243931,
-            5.114387,
-            4.843511,
-            4.75166,
-            4.699311,
-            4.236948
+            5.707668,
+            5.780744,
+            5.476195,
+            5.676439,
+            5.623891,
+            5.133666,
+            5.632067
           ],
-          "min_ms": 4.236948,
-          "median_ms": 4.699311,
-          "p90_ms": 5.114387,
-          "max_ms": 5.114387
+          "min_ms": 5.133666,
+          "median_ms": 5.632067,
+          "p90_ms": 5.780744,
+          "max_ms": 5.780744
         },
         "cpp-O0": {
           "samples_ms": [
-            6.990403,
-            7.458758,
-            7.444582,
-            7.468867,
-            6.99426,
-            6.971037,
-            7.517418
+            6.638907,
+            7.155802,
+            6.750305,
+            7.091732,
+            6.900766,
+            6.724066,
+            7.013546
           ],
-          "min_ms": 6.971037,
-          "median_ms": 7.444582,
-          "p90_ms": 7.517418,
-          "max_ms": 7.517418
+          "min_ms": 6.638907,
+          "median_ms": 6.900766,
+          "p90_ms": 7.155802,
+          "max_ms": 7.155802
         },
         "flywheel-O3": {
           "samples_ms": [
-            5.21728,
-            4.450938,
-            4.542369,
-            4.906398,
-            5.483718,
-            6.234802,
-            4.3875
+            5.011017,
+            5.615746,
+            5.052244,
+            5.136642,
+            5.560423,
+            5.278356,
+            5.247618
           ],
-          "min_ms": 4.3875,
-          "median_ms": 4.906398,
-          "p90_ms": 6.234802,
-          "max_ms": 6.234802
+          "min_ms": 5.011017,
+          "median_ms": 5.247618,
+          "p90_ms": 5.615746,
+          "max_ms": 5.615746
         },
         "cpp-O3": {
           "samples_ms": [
-            1.044332,
-            1.046526,
-            1.069157,
-            0.981615,
-            1.509351,
-            1.133478,
-            1.068066
+            1.447873,
+            1.460347,
+            1.139497,
+            1.301601,
+            1.118388,
+            1.228234,
+            1.393082
           ],
-          "min_ms": 0.981615,
-          "median_ms": 1.068066,
-          "p90_ms": 1.509351,
-          "max_ms": 1.509351
+          "min_ms": 1.118388,
+          "median_ms": 1.301601,
+          "p90_ms": 1.460347,
+          "max_ms": 1.460347
         },
         "cpython": {
           "samples_ms": [
-            14.447177,
-            14.11139,
-            15.431698,
-            14.204804,
-            12.998891,
-            14.021613,
-            13.985445
+            14.07434,
+            13.129587,
+            13.034629,
+            13.060818,
+            14.724985,
+            13.274868,
+            14.690782
           ],
-          "min_ms": 12.998891,
-          "median_ms": 14.11139,
-          "p90_ms": 15.431698,
-          "max_ms": 15.431698
+          "min_ms": 13.034629,
+          "median_ms": 13.274868,
+          "p90_ms": 14.724985,
+          "max_ms": 14.724985
         }
       },
       "stdout": "200158890\n",

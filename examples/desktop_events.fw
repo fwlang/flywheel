@@ -1,0 +1,29 @@
+# A desktop counter: Flywheel event handlers, live updates, and a JavaScript binding.
+import desktop
+import html.*
+
+int count = 0
+var window = desktop.window("Flywheel counter", 420, 260)
+
+function page() returns element
+    return <html><body style="font-family: sans-serif; text-align: center">
+        <h1>{count}</h1>
+        <button onclick={function()
+            count += 1
+            window.load(page())
+        end}>Add one</button>
+        <button onclick={function()
+            count = 0
+            window.load(page())
+        end}>Reset</button>
+        <p><input id="name" placeholder="Type a name" oninput={function(string text)
+            window.eval("document.title = " + "'Hello, " + text.replace("'", "") + "'")
+        end} /></p>
+    </body></html>
+end
+
+window.bind("current", function(string unused) returns string
+    return string(count)
+end)
+window.load(page())
+window.run()

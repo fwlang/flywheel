@@ -1,0 +1,17 @@
+# Run with: flywheel test examples/tests
+import testing
+
+function test_length_counts_characters() returns void
+    testing.assert_equal("héllo".length, 5)
+end
+
+function test_split_and_join() returns void
+    var parts = "a, b, c".split(", ")
+    testing.assert_equal(parts.length, 3)
+    testing.assert_equal("-".join(parts), "a-b-c")
+end
+
+function test_optional_fallback() returns void
+    int? missing = null
+    testing.assert_equal(missing ?? 7, 7)
+end

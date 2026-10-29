@@ -22,6 +22,20 @@ Slot reference(Object *object) {
 Object *managed(Frame *frame, Object::Kind kind) {
     return own(frame, new Object(kind));
 }
+// Builtin classes whose instances native code creates (web.request, os.result, ...). Generated
+// code registers each class identity at startup so `is` and `match` work on native instances.
+std::mutex classRegistryMutex;
+std::map<std::string, const void *> classRegistry;
+Object *nativeInstance(Frame *frame, const std::string &type,
+                       std::vector<std::string> fieldNames) {
+    auto object = managed(frame, Object::Instance);
+    object->typeName = object->text = type;
+    object->fieldNames = std::move(fieldNames);
+    std::lock_guard<std::mutex> lock(classRegistryMutex);
+    auto it = classRegistry.find(type);
+    object->classId = it == classRegistry.end() ? nullptr : it->second;
+    return object;
+}
 std::string readableType(std::string text) {
     std::string out;
     for (size_t i = 0; i < text.size();) {
@@ -39,6 +53,17 @@ std::string readableType(std::string text) {
     return out;
 }
 std::string formatSlot(const Slot &, bool, std::set<Object *> &, size_t);
+// Enum member names by enum id, registered by generated code before user code runs.
+std::mutex enumMutex;
+std::map<int64_t, std::vector<std::string>> enumTable;
+std::string enumName(int64_t id, int64_t value) {
+    std::lock_guard<std::mutex> lock(enumMutex);
+    auto it = enumTable.find(id);
+    if (it == enumTable.end() || value < 0 || static_cast<size_t>(value) >= it->second.size())
+        return std::to_string(value);
+    return it->second[static_cast<size_t>(value)];
+}
+void appendUtf8(std::string &out, uint32_t v);
 std::string formatObject(Object *object, bool nested, std::set<Object *> &active, size_t depth) {
     if (!object)
         return "null";
@@ -57,6 +82,10 @@ std::string formatObject(Object *object, bool nested, std::set<Object *> &active
         return "desktop.window(" + jsonQuote(object->desktop->title) + ")";
     if (object->kind == Object::Closure)
         return "<function>";
+    if (object->kind == Object::Resource)
+        return "<" + object->text + ">";
+    if (object->kind == Object::Box)
+        return formatSlot(object->slots.at(0), nested, active, depth + 1);
     if (object->kind == Object::Weak) {
         auto target = object->link ? object->link->target : nullptr;
         if (!target)
@@ -79,6 +108,12 @@ std::string formatObject(Object *object, bool nested, std::set<Object *> &active
     } remove{active, object};
     auto item = [&](const Slot &slot) { return formatSlot(slot, true, active, depth + 1); };
     std::string out;
+    if (object->kind == Object::Set) {
+        out = "{";
+        for (size_t i = 0; i < object->keys.size(); ++i)
+            out += (i ? ", " : "") + item(object->keys[i]);
+        return out + "}";
+    }
     if (object->kind == Object::Map) {
         out = "{";
         for (size_t i = 0; i < object->slots.size(); ++i) {
@@ -129,6 +164,13 @@ std::string formatSlot(const Slot &value, bool nested, std::set<Object *> &activ
     }
     case Slot::Reference:
         return formatObject(value.object, nested, active, depth);
+    case Slot::Enum:
+        return enumName(static_cast<int64_t>(value.real), value.integer);
+    case Slot::Char: {
+        std::string out;
+        appendUtf8(out, static_cast<uint32_t>(value.integer));
+        return nested ? "'" + out + "'" : out;
+    }
     }
     fail("invalid value kind");
 }
@@ -197,6 +239,23 @@ bool sequenceType(const CastType &type) {
 }
 CastType itemType(const CastType &type, size_t index) {
     return type.parts[type.kind == CastType::FixedTuple ? index : 0];
+}
+// Nullable primitives (int?, bool?, char?, ...) hold present values in a one-slot Box.
+bool primitiveType(const CastType &type) {
+    auto &t = type.text;
+    return type.kind == CastType::Scalar &&
+           (t == "bool" || t == "char" || t == "float" || t == "double" ||
+            (t.size() > 1 && (t[0] == 'i' || t[0] == 'u') && t[1] >= '0' && t[1] <= '9'));
+}
+Slot unboxed(const Slot &value) {
+    if (value.kind == Slot::Reference && value.object && value.object->kind == Object::Box)
+        return value.object->slots.at(0);
+    return value;
+}
+Slot boxed(Frame *frame, const Slot &value) {
+    auto box = managed(frame, Object::Box);
+    box->slots.push_back(value);
+    return reference(box);
 }
 bool sequenceObject(Object *value) {
     return value && (value->kind == Object::Array || value->kind == Object::Tuple);
@@ -304,7 +363,8 @@ Slot castValue(Frame *frame, const Slot &value, const CastType &source, const Ca
         if (isNull)
             return value;
         auto actual = source.kind == CastType::Nullable ? source.parts[0] : source;
-        return castValue(frame, value, actual, target.parts[0], false, depth + 1);
+        auto present = castValue(frame, unboxed(value), actual, target.parts[0], false, depth + 1);
+        return primitiveType(target.parts[0]) ? boxed(frame, present) : present;
     }
     bool wrapNullable =
         source.kind == CastType::Nullable && sequenceType(target) &&
@@ -314,7 +374,7 @@ Slot castValue(Frame *frame, const Slot &value, const CastType &source, const Ca
     if (source.kind == CastType::Nullable && !wrapNullable) {
         if (isNull)
             fail("cannot cast null to a non-null type", "CastError");
-        return castValue(frame, value, source.parts[0], target, root, depth + 1);
+        return castValue(frame, unboxed(value), source.parts[0], target, root, depth + 1);
     }
     if (target.kind == CastType::Map) {
         auto output = managed(frame, Object::Map);
@@ -446,6 +506,7 @@ Object *fw_instance(Frame *frame, int64_t count, const char *type, const char *n
                     const char *fields) {
     return nativeBoundary([&] {
         auto result = managed(frame, Object::Instance);
+        result->classId = type;
         result->typeName = type;
         result->text = name;
         result->slots.resize(static_cast<size_t>(count));
@@ -461,6 +522,38 @@ Object *fw_instance(Frame *frame, int64_t count, const char *type, const char *n
         }
         return result;
     });
+}
+const void *fw_class_id(Object *instance) {
+    return instance ? instance->classId : nullptr;
+}
+void fw_enum_register(int64_t id, const char *names) {
+    std::lock_guard<std::mutex> lock(enumMutex);
+    auto &members = enumTable[id];
+    members.clear();
+    std::string list = names;
+    for (size_t begin = 0;;) {
+        auto end = list.find(',', begin);
+        members.push_back(list.substr(begin, end == std::string::npos ? end : end - begin));
+        if (end == std::string::npos)
+            break;
+        begin = end + 1;
+    }
+}
+int64_t fw_enum_index(const char *names, Object *text) {
+    std::string list = names;
+    int64_t index = 0;
+    for (size_t begin = 0;; ++index) {
+        auto end = list.find(',', begin);
+        if (list.compare(begin, end == std::string::npos ? std::string::npos : end - begin,
+                         text->text) == 0)
+            return index;
+        if (end == std::string::npos)
+            return -1;
+        begin = end + 1;
+    }
+}
+Object *fw_enum_name(Frame *frame, int64_t id, int64_t value) {
+    return nativeBoundary([&] { return string(frame, enumName(id, value)); });
 }
 Object *fw_format(Frame *frame, Object *value) {
     return nativeBoundary([&] {
@@ -532,6 +625,7 @@ Object *fw_weak_new(Frame *frame, Object *target) {
     return nativeBoundary([&] {
         auto weak = managed(frame, Object::Weak);
         if (target) {
+            SharedLock lock(weakMutex());
             if (!target->weakCell) {
                 target->weakCell = std::make_shared<WeakCell>();
                 target->weakCell->target = target;
@@ -545,10 +639,19 @@ Object *fw_weak_get(Frame *frame, Object *weak) {
     return nativeBoundary([&]() -> Object * {
         if (!weak)
             fail("weak reference is null", "CastError");
-        auto target = weak->link ? weak->link->target : nullptr;
+        if (!weak->link)
+            return nullptr;
+        // Take a reference only while the target is still alive (count above zero); the
+        // target's destructor clears the cell under the same lock.
+        SharedLock lock(weakMutex());
+        auto target = weak->link->target;
         if (!target)
             return nullptr;
-        retain(target);
+        auto count = target->refs.load();
+        while (count != 0 && !target->refs.compare_exchange_weak(count, count + 1)) {
+        }
+        if (count == 0)
+            return nullptr;
         return own(frame, target);
     });
 }

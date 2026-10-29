@@ -1,6 +1,6 @@
 # HTML tree queries and mutation
 
-The HTML API operates on a supplied native markup tree. There is no implicit global document and no browser DOM or runtime HTML parser.
+The HTML API operates on a supplied native markup tree. There is no implicit global document, browser DOM, or runtime HTML parser.
 
 ```flywheel
 import html.*
@@ -15,7 +15,7 @@ if title != null then
     title.text_content = "Hello & welcome!"
 end
 
-array<element> paragraphs = page.query_all(".card p")
+array<element> paragraphs = page.query_all(".card p:last-child")
 for paragraph in paragraphs do
     paragraph.add_class("selected")
 end
@@ -31,21 +31,33 @@ print page
 | `tree.query(selector)` | `element?`: first matching descendant, or null |
 | `tree.query_all(selector)` | `array<element>`: matching descendants in preorder |
 | `tree.get_by_id(id)` | `element?`: first descendant with that exact ID, without CSS parsing |
-| `node.matches(selector)` | bool for compound selectors and comma-separated alternatives |
+| `node.matches(selector)` | bool; combinators and structural pseudo-classes use the node's parent links |
+| `node.closest(selector)` | `element?`: the node itself or its nearest matching ancestor |
 
-Queries search descendants, **excluding the supplied root**, as with an element's `querySelector`. Use `matches` to test the root itself. Fragments are transparent containers and are not selector candidates; named children inside them are searchable. Results retain existing nodes, so mutations through a result affect its original tree. Query arrays are snapshots and keep nodes alive after they are removed from a parent. A shared node is returned once per query, by identity.
+Queries search descendants, **excluding the supplied root**, as with an element's `querySelector`. Use `matches` to test the root itself. Fragments are transparent containers and are not selector candidates; named children inside them are searchable, and siblings are counted across fragment boundaries. Results retain existing nodes, so mutations through a result affect its original tree. Query arrays are snapshots. A shared node is returned once per query, by identity.
 
-Nullable query results can be compared with null. Dereferencing a null result raises `CastError`; `element(result)` explicitly checks/unpacks a nullable element when a non-null function argument is needed.
+Nullable query results can be compared with null, and null checks narrow them. Dereferencing a null result raises `CastError`.
 
 ## Supported selectors
 
-- Tags (`h1`), universal `*`, classes (`.card`), IDs (`#main-title`).
-- Compound forms such as `section.card.active#main`.
-- Descendants (`.card p`) and direct named children (`.card > p`).
+- Tags (`h1`), universal `*`, classes (`.card`), IDs (`#main-title`), and compound forms such as `section.card.active#main`.
+- Combinators: descendant (`.card p`), child (`.card > p`), next sibling (`h1 + p`), and later sibling (`h1 ~ p`).
 - Comma-separated groups (`h1, .card p`), with duplicate identities removed.
 - Attribute presence and comparisons: `[data-state]`, `[name="value"]`, `~=`, `^=`, `$=`, `*=`, and `|=`.
+- Pseudo-classes: `:first-child`, `:last-child`, `:only-child`, `:nth-child(an+b)`, `:nth-last-child(an+b)`, `:first-of-type`, `:last-of-type`, `:only-of-type`, `:nth-of-type(an+b)`, `:empty`, `:not(selector list)`, `:checked`, `:disabled`, and `:enabled`. `an+b` accepts forms such as `3`, `2n+1`, `-n+3`, `odd`, and `even`.
 
-Tags and attribute names compare case-insensitively in ASCII; IDs, class tokens, and attribute values compare exactly. Quoted attribute values support spaces. Pseudo-classes, pseudo-elements, sibling combinators, full CSS identifier escapes, and selector flags are not implemented. Malformed/unsupported selectors raise `SelectorError` rather than pretending nothing matched. `matches` does not accept ancestor/child combinators because elements do not store parent links; use a tree-scoped query for those selectors.
+Tags and attribute names compare case-insensitively in ASCII; IDs, class tokens, and attribute values compare exactly. Quoted attribute values support spaces. Pseudo-elements, dynamic pseudo-classes such as `:hover`, full CSS identifier escapes, and selector flags are not implemented. Malformed or unsupported selectors raise `SelectorError` rather than pretending nothing matched.
+
+## Parent and sibling links
+
+Every child keeps a weak link to the parent it was most recently added to (by markup construction, `append`, or `prepend`). Links never keep a tree alive and stop resolving once the child is removed from that parent.
+
+| Property | Result |
+|---|---|
+| `.parent` | `element?`: the parent element or fragment |
+| `.next_sibling`, `.previous_sibling` | `element?`: neighbouring named elements under the nearest named ancestor |
+
+Because one node may be shared by several trees, these follow the most recent insertion; use `clone()` for independent copies.
 
 ## Other tools
 
@@ -68,14 +80,33 @@ These operations also have qualified `html.operation(tree, ...)` forms.
 | `.append(value)`, `.prepend(value)` | Retain markup children or insert formatted, escaped text |
 | `.remove_child(node)` | bool; remove a direct logical child, including children inside transparent fragments |
 | `.clear()` | Remove all children |
-| `.clone()` / `.clone(false)` | Deep clone by default, or copy only the root and attributes |
-| `.has_class(token)` | bool |
-| `.add_class(token)` | bool indicating whether the token was added |
-| `.remove_class(token)` | bool indicating whether the token existed |
-| `.toggle_class(token)` | bool indicating whether the token is now present |
+| `.clone()` / `.clone(false)` | Deep clone by default, or copy only the root, attributes, and event handlers |
+| `.has_class(token)`, `.add_class(token)`, `.remove_class(token)`, `.toggle_class(token)` | Class token helpers returning bool |
 
-Attribute/class helpers require a named element; fragments have no attributes. Attribute names currently accept ASCII letters/digits and `_`, `-`, `:`, `.` and are normalized to lowercase. A class token must be nonempty and contain no whitespace. Void HTML elements reject child insertion/text. Appending a node that contains the destination raises `RuntimeError` before mutation, preventing ARC cycles.
+Attribute/class helpers require a named element; fragments have no attributes. A class token must be nonempty and contain no whitespace. Void elements reject child insertion/text. Appending a node that contains the destination raises `RuntimeError` before mutation, preventing cycles. Live NodeLists, browser layout, arbitrary raw inner-HTML assignment, and automatic reparenting are not implemented.
 
-Elements retain shared identity. Appending does not automatically remove a node from another parent, and fragments retain their value identity rather than being consumed. Use `clone()` for independent nodes. Parent/closest APIs, live NodeLists, browser layout/events, arbitrary raw inner-HTML assignment, and automatic reparenting are not implemented. `set_text` and compiled markup insertion preserve escaping without introducing a runtime XML/HTML parser.
+Selector, child/text traversal, and cloning limit depth to 256; queries also limit traversal to one million visited element occurrences.
 
-Selector, child/text traversal, and cloning limit depth to 256; queries also limit traversal to one million visited element occurrences. Serialization uses the existing renderer. Native sockets/web rendering and these tree operations remain on the existing single-threaded language execution path.
+## Tags, attributes, and events
+
+`import html.*` provides the HTML5 element set (from `a` to `wbr`) with their global and element-specific attributes; `data-*` and `aria-*` attributes are accepted on every tag. Boolean attributes such as `disabled`, `checked`, and `open` take a `bool` and are rendered only when true. Other attributes take strings or numbers: `<input min={0} step={0.5} />` renders `min="0" step="0.5"`. Void elements (`br`, `img`, `input`, `meta`, ...) cannot have children.
+
+Event attributes (`onclick`, `oninput`, ...) accept either inline JavaScript text, `onclick="history.back()"`, or a Flywheel function: `function() returns void`, or `function(string value) returns void`, which receives the event target's `value`. Function handlers run in [desktop windows](desktop.md); HTML rendered with `render`, `print`, or `web` responses omits them, since a browser page cannot call back into the program.
+
+`import svg.*` provides SVG elements (`svg`, `g`, `path`, `circle`, `rect`, `line`, `polygon`, `text`, `defs`, `linearGradient`, `use`, ...) with their presentation attributes, and can be combined with `html.*`.
+
+## Element families
+
+A module can declare its own tag set, for example for custom elements or another XML vocabulary:
+
+```flywheel
+elements widgets
+    my-card: title, size
+    my-icon void: name
+    my-slot: *
+end
+
+var card = <my-card title="Hi" size={2}><my-icon name="star" /></my-card>
+```
+
+Each line names a tag, optionally `void` (no children), and after `:` its allowed attributes, or `*` for any attribute. Tags are visible in the declaring module and in modules that import it. Unused components are still checked against these rules.

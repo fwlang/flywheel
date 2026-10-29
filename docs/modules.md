@@ -31,11 +31,13 @@ public function greet(string name) returns string
 end
 ```
 
-These modifiers apply to top-level functions, classes, components, and variable/constant declarations. They are not member access modifiers. Private names are available throughout their own module, including its exported functions and templates. Accessing a private name through an imported namespace is a compile error. Returning a value of a private class does not make the class name public or hide the value's existing fields.
+These modifiers apply to top-level functions, classes, interfaces, enums, components, and variable/constant declarations. They are not member access modifiers. Private names are available throughout their own module, including its exported functions and templates. Accessing a private name through an imported namespace is a compile error. Returning a value of a private class does not make the class name public or hide the value's existing fields.
 
 `import helpers.*` imports that module's own public declarations. Private declarations and imported namespaces are not re-exported. Collisions with another wildcard export, an import alias, or a local top-level declaration are compile errors. Exported `const` bindings remain immutable through qualified access. Mutable module globals retain shared identity across aliases.
 
-Native libraries support qualified imports and aliases. Native wildcard imports currently apply only to `html.*`; local modules support wildcard imports for all their public declarations. Package manifests, configurable external search paths, explicit re-export syntax, and cycle-safe initialization are still future work.
+Native libraries (`core`, `collections`, `desktop`, `fs`, `gc`, `html`, `io`, `json`, `math`, `net`, `os`, `regex`, `svg`, `testing`, `thread`, `time`, and `web`) support qualified imports and aliases; see the [library reference](../stdlib/README.md). Native wildcard imports apply to the tag sets `html.*` and `svg.*`; local modules support wildcard imports for all their public declarations. [Element families](html-dom.md#element-families) declared in a module are visible in that module and in modules that import it. Generic classes and functions can be used across modules with type arguments, such as `shapes.Box<int>`. Package manifests, configurable external search paths, and explicit re-export syntax are future work.
+
+A local module named like a native library takes precedence, so a file `gc.fw` next to the entry file replaces `import gc`.
 
 Run the multi-file example with:
 

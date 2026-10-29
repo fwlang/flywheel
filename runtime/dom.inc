@@ -60,16 +60,24 @@ void setAttribute(Object *node, const std::string &name, const std::string &valu
 struct SelectorAttribute {
     std::string name, op, value;
 };
+struct SelectorStep;
+using SelectorGroup = std::vector<SelectorStep>;
+// :first-child, :nth-child(2n+1), :not(.a, p), ... `a`/`b` hold an+b for the nth forms.
+struct SelectorPseudo {
+    std::string name;
+    int64_t a = 0, b = 0;
+    std::vector<SelectorGroup> negated;
+};
 struct SelectorCompound {
     std::string tag;
     std::vector<std::string> ids, classes;
     std::vector<SelectorAttribute> attributes;
+    std::vector<SelectorPseudo> pseudos;
 };
 struct SelectorStep {
     SelectorCompound compound;
-    char relation = ' ';
+    char relation = ' '; // ' ' descendant, '>' child, '+' next sibling, '~' later sibling
 };
-using SelectorGroup = std::vector<SelectorStep>;
 class SelectorParser {
     const std::string &text;
     size_t position = 0;
@@ -158,11 +166,95 @@ class SelectorParser {
                     error("expected closing ]");
                 out.attributes.push_back(std::move(attr));
                 found = true;
+            } else if (c == ':') {
+                ++position;
+                out.pseudos.push_back(pseudo());
+                found = true;
             } else
                 break;
         }
         if (!found)
             error("expected tag, class, ID, or attribute selector");
+        return out;
+    }
+
+    // an+b, odd, even, or an integer
+    void nth(SelectorPseudo &out) {
+        space();
+        size_t begin = position;
+        while (position < text.size() && text[position] != ')')
+            ++position;
+        std::string expression;
+        for (char c : text.substr(begin, position - begin))
+            if (!domSpace(c))
+                expression += c;
+        expression = lowerAscii(expression);
+        if (expression == "odd") {
+            out.a = 2;
+            out.b = 1;
+            return;
+        }
+        if (expression == "even") {
+            out.a = 2;
+            out.b = 0;
+            return;
+        }
+        auto n = expression.find('n');
+        auto number = [&](const std::string &digits, int64_t fallback) -> int64_t {
+            if (digits.empty() || digits == "+")
+                return fallback;
+            if (digits == "-")
+                return -fallback;
+            int64_t value = 0;
+            auto start = digits.data() + (digits[0] == '+' ? 1 : 0);
+            auto [end, ec] = std::from_chars(start, digits.data() + digits.size(), value);
+            if (ec != std::errc{} || end != digits.data() + digits.size())
+                error("invalid an+b expression");
+            return value;
+        };
+        if (n == std::string::npos) {
+            out.b = number(expression, 0);
+            if (expression.empty())
+                error("expected an+b expression");
+            return;
+        }
+        out.a = number(expression.substr(0, n), 1);
+        out.b = number(expression.substr(n + 1), 0);
+    }
+    SelectorPseudo pseudo() {
+        SelectorPseudo out;
+        out.name = lowerAscii(identifier());
+        static const std::set<std::string> plain = {
+            "first-child", "last-child", "only-child", "first-of-type", "last-of-type",
+            "only-of-type", "empty",     "checked",    "disabled",      "enabled"};
+        static const std::set<std::string> functional = {"nth-child", "nth-last-child",
+                                                         "nth-of-type", "not"};
+        if (plain.count(out.name))
+            return out;
+        if (!functional.count(out.name))
+            error("unsupported pseudo-class ':" + out.name + "'");
+        if (position == text.size() || text[position++] != '(')
+            error("expected '(' after :" + out.name);
+        if (out.name == "not") {
+            // The argument is a selector list; nested parsing stops at the matching ')'.
+            int depth = 1;
+            size_t begin = position;
+            while (position < text.size() && depth) {
+                if (text[position] == '(')
+                    ++depth;
+                else if (text[position] == ')')
+                    --depth;
+                ++position;
+            }
+            if (depth)
+                error("expected ')'");
+            auto inner = text.substr(begin, position - begin - 1);
+            out.negated = SelectorParser(inner).parse();
+            return out;
+        }
+        nth(out);
+        if (position == text.size() || text[position++] != ')')
+            error("expected ')'");
         return out;
     }
 
@@ -181,12 +273,10 @@ class SelectorParser {
                 bool separated = space();
                 if (position == text.size() || text[position] == ',')
                     break;
-                if (text[position] == '>') {
-                    ++position;
+                if (text[position] == '>' || text[position] == '+' || text[position] == '~') {
+                    relation = text[position++];
                     space();
-                    relation = '>';
-                } else if (separated &&
-                           std::string("+~:\\").find(text[position]) == std::string::npos)
+                } else if (separated && text[position] != '\\')
                     relation = ' ';
                 else
                     error("unsupported selector syntax");
@@ -202,7 +292,17 @@ class SelectorParser {
         return groups;
     }
 };
-bool simpleMatch(Object *node, const SelectorCompound &selector) {
+std::vector<Object *> elementChildren(Object *parent);
+bool nthMatch(int64_t a, int64_t b, int64_t position) {
+    if (a == 0)
+        return position == b;
+    auto difference = position - b;
+    return difference % a == 0 && difference / a >= 0;
+}
+bool groupMatch(Object *node, const std::vector<Object *> &chain, size_t depth, Object *root,
+                const SelectorGroup &group, size_t step);
+// `parent` is the node's parent element or fragment, used by structural pseudo-classes.
+bool simpleMatch(Object *node, const SelectorCompound &selector, Object *parent) {
     if (!node || node->kind != Object::Element || node->text.empty())
         return false;
     if (!selector.tag.empty() && selector.tag != "*" && lowerAscii(node->text) != selector.tag)
@@ -241,22 +341,76 @@ bool simpleMatch(Object *node, const SelectorCompound &selector) {
         if (attr.op == "|=" && *value != attr.value && value->rfind(attr.value + "-", 0) != 0)
             return false;
     }
+    for (auto &pseudo : selector.pseudos) {
+        auto &name = pseudo.name;
+        if (name == "empty") {
+            for (auto &child : node->slots)
+                if (child.object &&
+                    (child.object->kind != Object::String || !child.object->text.empty()))
+                    return false;
+            continue;
+        }
+        if (name == "checked" || name == "disabled") {
+            if (!attribute(node, name))
+                return false;
+            continue;
+        }
+        if (name == "enabled") {
+            if (attribute(node, "disabled"))
+                return false;
+            continue;
+        }
+        if (name == "not") {
+            for (auto &group : pseudo.negated)
+                if (groupMatch(node, {}, 0, parent, group, group.size() - 1))
+                    return false;
+            continue;
+        }
+        auto siblings = elementChildren(parent);
+        if (name.find("of-type") != std::string::npos)
+            siblings.erase(std::remove_if(siblings.begin(), siblings.end(),
+                                          [&](Object *s) { return s->text != node->text; }),
+                           siblings.end());
+        auto at = std::find(siblings.begin(), siblings.end(), node);
+        if (at == siblings.end())
+            return false;
+        auto index = static_cast<int64_t>(at - siblings.begin()) + 1;
+        auto count = static_cast<int64_t>(siblings.size());
+        bool ok = name == "first-child" || name == "first-of-type"  ? index == 1
+                  : name == "last-child" || name == "last-of-type"  ? index == count
+                  : name == "only-child" || name == "only-of-type"  ? count == 1
+                  : name == "nth-child" || name == "nth-of-type"    ? nthMatch(pseudo.a, pseudo.b, index)
+                                                                    : nthMatch(pseudo.a, pseudo.b,
+                                                                               count - index + 1);
+        if (!ok)
+            return false;
+    }
     return true;
 }
-bool groupMatch(Object *node, const std::vector<Object *> &ancestors, const SelectorGroup &group,
-                size_t step, size_t parent) {
-    if (!simpleMatch(node, group[step].compound))
+// `chain` holds the named ancestors of `node` (outermost first) up to `depth`; the parent is
+// chain[depth - 1], or `root` (possibly a fragment) at the top.
+bool groupMatch(Object *node, const std::vector<Object *> &chain, size_t depth, Object *root,
+                const SelectorGroup &group, size_t step) {
+    Object *parent = depth ? chain[depth - 1] : root;
+    if (!simpleMatch(node, group[step].compound, parent))
         return false;
     if (step == 0)
         return true;
-    if (group[step].relation == '>')
-        return parent > 0 &&
-               groupMatch(ancestors[parent - 1], ancestors, group, step - 1, parent - 1);
-    while (parent > 0) {
-        --parent;
-        if (groupMatch(ancestors[parent], ancestors, group, step - 1, parent))
-            return true;
+    auto relation = group[step].relation;
+    if (relation == '>')
+        return depth > 0 && groupMatch(chain[depth - 1], chain, depth - 1, root, group, step - 1);
+    if (relation == ' ') {
+        for (size_t d = depth; d > 0; --d)
+            if (groupMatch(chain[d - 1], chain, d - 1, root, group, step - 1))
+                return true;
+        return false;
     }
+    auto siblings = elementChildren(parent);
+    auto at = std::find(siblings.begin(), siblings.end(), node);
+    for (auto it = siblings.begin(); it < at; ++it)
+        if ((relation == '~' || it + 1 == at) &&
+            groupMatch(*it, chain, depth, root, group, step - 1))
+            return true;
     return false;
 }
 template <class Visitor> void walkDom(Object *root, Visitor &&visitor) {
@@ -293,6 +447,15 @@ void childrenOf(Object *node, std::vector<Slot> &output, size_t depth = 0) {
             else
                 output.push_back(reference(child.object));
         }
+}
+std::vector<Object *> elementChildren(Object *parent) {
+    std::vector<Slot> slots;
+    if (parent && parent->kind == Object::Element)
+        childrenOf(parent, slots);
+    std::vector<Object *> out;
+    for (auto &slot : slots)
+        out.push_back(slot.object);
+    return out;
 }
 void textOf(Object *node, std::string &output, size_t depth = 0) {
     if (depth > 256)
@@ -333,6 +496,8 @@ bool removeChild(Object *root, Object *child, size_t depth = 0) {
     auto &children = root->slots;
     for (auto it = children.begin(); it != children.end(); ++it) {
         if (it->object == child) {
+            if (child && child->parentElement == root)
+                child->parentElement = nullptr;
             children.erase(it);
             return true;
         }
@@ -342,6 +507,36 @@ bool removeChild(Object *root, Object *child, size_t depth = 0) {
     }
     return false;
 }
+// Children point back to their most recent parent. The pointer does not own the parent; a
+// parent clears it when destroyed (~Object) and remove_child clears it, so it never dangles.
+std::mutex parentMutex;
+void linkParent(Object *parent, Object *child) {
+    if (!child || child->kind != Object::Element)
+        return;
+    SharedLock lock(parentMutex);
+    child->parentElement = parent;
+}
+Object *parentOf(Object *node) {
+    SharedLock lock(parentMutex);
+    auto parent = node ? node->parentElement : nullptr;
+    if (!parent)
+        return nullptr;
+    // A stale link (the child was removed or moved elsewhere) is ignored.
+    for (auto &slot : parent->slots)
+        if (slot.object == node)
+            return parent;
+    return nullptr;
+}
+// Named ancestors of `node`, outermost first, following parent links; fragments are skipped
+// except that the outermost fragment is kept as the root context.
+std::vector<Object *> ancestorChain(Object *node) {
+    std::vector<Object *> chain;
+    std::set<Object *> seen{node};
+    for (auto p = parentOf(node); p && seen.insert(p).second; p = parentOf(p))
+        if (!p->text.empty() || !parentOf(p))
+            chain.insert(chain.begin(), p);
+    return chain;
+}
 Object *cloneNode(Frame *frame, Object *node, bool deep, size_t depth = 0) {
     if (depth > 256)
         fail("DOM clone nesting exceeds 256");
@@ -349,6 +544,8 @@ Object *cloneNode(Frame *frame, Object *node, bool deep, size_t depth = 0) {
     auto out = managed(frame, Object::Element);
     out->text = node->text;
     out->attributes = node->attributes;
+    if (node->extra)
+        out->more().events = node->extra->events;
     if (deep)
         for (auto &child : node->slots) {
             if (child.object && child.object->kind == Object::Element)
@@ -372,7 +569,7 @@ Object *fw_dom_query(Frame *frame, Object *root, Object *selector, int64_t all) 
         std::set<Object *> seen;
         walkDom(root, [&](Object *node, const std::vector<Object *> &ancestors) {
             for (auto &group : groups)
-                if (groupMatch(node, ancestors, group, group.size() - 1, ancestors.size())) {
+                if (groupMatch(node, ancestors, ancestors.size(), root, group, group.size() - 1)) {
                     if (seen.insert(node).second)
                         matches.push_back(node);
                     break;
@@ -405,12 +602,10 @@ int64_t fw_dom_matches(Object *root, Object *selector) {
     return nativeBoundary([&]() -> int64_t {
         element(root);
         auto groups = SelectorParser(selector->text).parse();
+        auto chain = ancestorChain(root);
         for (auto &group : groups)
-            if (group.size() != 1)
-                fail("matches supports compound selectors without ancestor combinators",
-                     "SelectorError");
-        for (auto &group : groups)
-            if (simpleMatch(root, group[0].compound))
+            if (groupMatch(root, chain, chain.size(), chain.empty() ? nullptr : chain.front(), group,
+                           group.size() - 1))
                 return 1;
         return 0;
     });
@@ -492,6 +687,7 @@ void fw_dom_append(Object *root, Object *child, int64_t prepend) {
             root->slots.insert(root->slots.begin(), std::move(value));
         else
             root->slots.push_back(std::move(value));
+        linkParent(root, child);
     });
 }
 int64_t fw_dom_remove_child(Object *root, Object *child) {
@@ -511,6 +707,66 @@ Object *fw_dom_attributes(Frame *frame, Object *root) {
 }
 void fw_dom_clear(Object *root) {
     nativeBoundary([&] { element(root)->slots.clear(); });
+}
+// 0 parent, 1 next element sibling, 2 previous element sibling (null when there is none).
+Object *fw_dom_relative(Frame *frame, Object *node, int64_t which) {
+    return nativeBoundary([&]() -> Object * {
+        element(node);
+        auto parent = parentOf(node);
+        Object *found = nullptr;
+        if (which == 0)
+            found = parent;
+        else if (parent) {
+            // Siblings are element children of the nearest named ancestor (fragments flatten).
+            auto context = parent;
+            while (context->text.empty() && parentOf(context))
+                context = parentOf(context);
+            auto siblings = elementChildren(context);
+            auto at = std::find(siblings.begin(), siblings.end(), node);
+            if (at != siblings.end()) {
+                if (which == 1 && at + 1 != siblings.end())
+                    found = *(at + 1);
+                if (which == 2 && at != siblings.begin())
+                    found = *(at - 1);
+            }
+        }
+        retain(found);
+        return own(frame, found);
+    });
+}
+// The node itself or its nearest ancestor matching the selector.
+Object *fw_dom_closest(Frame *frame, Object *node, Object *selector) {
+    return nativeBoundary([&]() -> Object * {
+        element(node);
+        auto groups = SelectorParser(selector->text).parse();
+        std::set<Object *> seen;
+        for (auto current = node; current && seen.insert(current).second;
+             current = parentOf(current)) {
+            if (current->text.empty())
+                continue;
+            auto chain = ancestorChain(current);
+            for (auto &group : groups)
+                if (groupMatch(current, chain, chain.size(), chain.empty() ? nullptr : chain.front(),
+                               group, group.size() - 1)) {
+                    retain(current);
+                    return own(frame, current);
+                }
+        }
+        return nullptr;
+    });
+}
+// Attaches a function-valued event attribute (onclick={...}); arity 1 receives the target value.
+void fw_element_event(Object *root, Object *name, Object *closure, int64_t arity) {
+    nativeBoundary([&] {
+        attributeElement(root);
+        for (auto &event : root->more().events)
+            if (event.name == name->text) {
+                event.handler = reference(closure);
+                event.arity = static_cast<int>(arity);
+                return;
+            }
+        root->more().events.push_back({name->text, static_cast<int>(arity), reference(closure)});
+    });
 }
 Object *fw_dom_clone(Frame *frame, Object *root, int64_t deep) {
     return nativeBoundary([&] { return cloneNode(frame, root, deep != 0); });

@@ -16,6 +16,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -42,7 +43,8 @@ struct Object;
 void retain(Object *);
 void release(Object *);
 struct Slot {
-    enum Kind { Integer, Unsigned, Real, Boolean, Reference } kind = Integer;
+    // Enum slots keep the member index in `integer` and the enum id in `real`.
+    enum Kind { Integer, Unsigned, Real, Boolean, Reference, Char, Enum } kind = Integer;
     int64_t integer = 0;
     double real = 0;
     Object *object = nullptr;
@@ -77,12 +79,31 @@ struct WeakCell {
 struct MapIndex {
     std::unordered_map<int64_t, size_t> integers;
     std::unordered_map<std::string, size_t> strings;
+    std::unordered_multimap<uint64_t, size_t> hashed; // tuple and class keys, by key hash
     size_t count = 0;
 };
+// Native state owned by a Resource object (files, sockets, threads, ...).
+struct NativeResource {
+    virtual ~NativeResource() = default;
+};
+// A desktop window: its loaded tree (re-rendered after callbacks), JavaScript bindings, the
+// event handlers of the current rendering, and scripts waiting to run in the page.
+struct ObjectExtra;
 struct DesktopState {
     std::string title;
     int width = 960, height = 640;
     bool running = false;
+    Object *tree = nullptr;
+    std::vector<std::pair<std::string, Object *>> bindings;
+    std::vector<std::pair<Object *, int>> handlers; // closure and arity, by rendered index
+    std::string pending, rendered;
+    ~DesktopState();
+};
+// A function-valued markup event attribute such as onclick={function() ...}.
+struct ElementEvent {
+    std::string name;
+    int arity = 0;
+    Slot handler;
 };
 struct Object {
     std::atomic<size_t> refs{1};
@@ -98,7 +119,10 @@ struct Object {
         Result,
         DesktopWindow,
         Weak,
-        Closure
+        Closure,
+        Box, // a present value of a nullable primitive (int?, bool?, ...) in slot 0
+        Set, // a map whose keys are the elements; values are unused
+        Resource // native resource; `text` names its type (io.file, net.socket, ...)
     } kind;
     std::unique_ptr<DesktopState> desktop;
     std::string text;
@@ -113,29 +137,181 @@ struct Object {
     // weakCell belongs to a weak reference's target; link is the cell a Weak object reads.
     std::shared_ptr<WeakCell> weakCell, link;
     void *code = nullptr; // Closure entry point; captured values live in slots.
+    const void *classId = nullptr; // Instance class identity (compiler-generated name string)
+    Object *parentElement = nullptr; // latest parent of a markup node (not owning)
+    // Cycle collector state: membership in the possible-roots list and trial-deletion marks.
+    std::atomic<bool> buffered{false};
+    Object *previousCandidate = nullptr, *nextCandidate = nullptr;
+    int64_t gcCount = 0;
+    uint8_t gcColor = 0;
+    // Maps with tuple keys (1, structural) or class keys (2, user hash/equals) keep each key's
+    // hash beside it so the index can be rebuilt without calling back into user code.
+    // Rarely used state lives in a separately allocated block to keep objects small.
+    std::unique_ptr<ObjectExtra> extra;
+    ObjectExtra &more() {
+        if (!extra)
+            extra = std::make_unique<ObjectExtra>();
+        return *extra;
+    }
+    const std::vector<ElementEvent> &eventList() const;
+    NativeResource *nativeResource() const;
+    int hashMode() const;
+    int64_t keyEnum() const;
     explicit Object(Kind k) : kind(k) {
         ++liveObjects;
     }
-    ~Object() {
-        if (weakCell)
-            weakCell->target = nullptr;
-        --liveObjects;
+    ~Object();
+};
+// Fields only some objects need: element event handlers, native resources (files, sockets,
+// threads), and the hashing state of maps with tuple, class, or enum keys.
+struct ObjectExtra {
+    std::unique_ptr<NativeResource> resource;
+    std::vector<ElementEvent> events;
+    // Maps with tuple keys (1, structural) or class keys (2, user hash/equals) keep each key's
+    // hash beside it so the index can be rebuilt without calling back into user code.
+    std::vector<uint64_t> keyHashes;
+    int64_t keyEnum = 0; // enum id of enum-keyed maps
+    int hashMode = 0;
+};
+const std::vector<ElementEvent> &Object::eventList() const {
+    static const std::vector<ElementEvent> none;
+    return extra ? extra->events : none;
+}
+NativeResource *Object::nativeResource() const {
+    return extra ? extra->resource.get() : nullptr;
+}
+int Object::hashMode() const {
+    return extra ? extra->hashMode : 0;
+}
+int64_t Object::keyEnum() const {
+    return extra ? extra->keyEnum : 0;
+}
+// Threads spawned by thread.spawn or web.workers. While none run, only the main thread
+// touches objects, so the runtime skips its cross-thread locks. The count rises before a
+// thread starts, so the spawning thread never races with it.
+std::atomic<int64_t> activeThreads{0};
+// Locks `m` only while other threads exist.
+struct SharedLock {
+    std::mutex *held = nullptr;
+    explicit SharedLock(std::mutex &m) {
+        if (activeThreads.load(std::memory_order_acquire) != 0) {
+            m.lock();
+            held = &m;
+        }
+    }
+    SharedLock(const SharedLock &) = delete;
+    ~SharedLock() {
+        if (held)
+            held->unlock();
     }
 };
+// Weak cells are read and cleared under this lock so a weak read never races with the
+// target's destruction (see fw_weak_get).
+std::mutex &weakMutex() {
+    static std::mutex m;
+    return m;
+}
+Object::~Object() {
+    if (weakCell) {
+        SharedLock lock(weakMutex());
+        weakCell->target = nullptr;
+    }
+    // Children keep a plain back pointer to their latest parent; clear it as the parent dies.
+    if (kind == Element)
+        for (auto &slot : slots)
+            if (slot.object && slot.object->parentElement == this)
+                slot.object->parentElement = nullptr;
+    --liveObjects;
+}
+// Possible roots of garbage cycles: containers whose count was decremented without reaching
+// zero. They are linked in before the decrement, while the caller still owns a reference.
+struct CycleCandidates {
+    std::mutex lock;
+    Object *head = nullptr;
+    std::atomic<size_t> count{0};
+    std::atomic<size_t> threshold{20000};
+};
+CycleCandidates &candidates() {
+    static CycleCandidates *state = new CycleCandidates; // never destroyed: used at exit
+    return *state;
+}
+bool mayFormCycles(Object::Kind kind) {
+    switch (kind) {
+    case Object::Array:
+    case Object::Instance:
+    case Object::Element:
+    case Object::Map:
+    case Object::Tuple:
+    case Object::Result:
+    case Object::Closure:
+    case Object::Box:
+    case Object::Set:
+        return true;
+    default:
+        return false;
+    }
+}
+void unlinkCandidate(CycleCandidates &c, Object *p) {
+    if (p->previousCandidate)
+        p->previousCandidate->nextCandidate = p->nextCandidate;
+    else
+        c.head = p->nextCandidate;
+    if (p->nextCandidate)
+        p->nextCandidate->previousCandidate = p->previousCandidate;
+    p->previousCandidate = p->nextCandidate = nullptr;
+    --c.count;
+}
 void retain(Object *p) {
     if (p)
         p->refs.fetch_add(1, std::memory_order_relaxed);
 }
-void release(Object *p) {
-    if (p && p->refs.fetch_sub(1, std::memory_order_acq_rel) == 1)
-        delete p;
+void release(Object *p);
+void linkParent(Object *parent, Object *child); // runtime/dom.inc
+DesktopState::~DesktopState() {
+    release(tree);
+    for (auto &[name, closure] : bindings)
+        release(closure);
+    for (auto &[closure, arity] : handlers)
+        release(closure);
 }
+void release(Object *p) {
+    if (!p)
+        return;
+    if (mayFormCycles(p->kind) && !p->buffered.load(std::memory_order_relaxed) &&
+        p->refs.load(std::memory_order_relaxed) > 1) {
+        // `buffered` changes only under the candidate lock (or with no other threads), so
+        // relaxed accesses suffice; locked read-modify-writes would cost every release.
+        auto &c = candidates();
+        SharedLock lock(c.lock);
+        if (!p->buffered.load(std::memory_order_relaxed)) {
+            p->buffered.store(true, std::memory_order_relaxed);
+            p->nextCandidate = c.head;
+            if (c.head)
+                c.head->previousCandidate = p;
+            c.head = p;
+            ++c.count;
+        }
+    }
+    if (p->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        if (p->buffered.load(std::memory_order_relaxed)) {
+            auto &c = candidates();
+            SharedLock lock(c.lock);
+            p->buffered.store(false, std::memory_order_relaxed);
+            unlinkCandidate(c, p);
+        }
+        delete p;
+    }
+}
+// Mirrors whether this thread has a pending error. It is trivially initialized, so the
+// check generated code runs after almost every call needs no thread-local init guard.
+thread_local constinit bool errorPending = false;
 struct PendingError {
     std::string type;
     Object *value = nullptr;
     void clear() {
         release(value);
         value = nullptr;
+        errorPending = false;
         type.clear();
     }
     void set(const std::string &t, Object *v) {
@@ -143,6 +319,7 @@ struct PendingError {
         clear();
         type = t;
         value = v;
+        errorPending = v != nullptr;
     }
     ~PendingError() {
         clear();
@@ -238,6 +415,13 @@ void render(Object *p, std::string &out) {
         out += '>';
     }
 }
+// Strings are UTF-8; lengths and indices count Unicode scalar values.
+size_t utf8Length(const std::string &s) {
+    size_t n = 0;
+    for (unsigned char c : s)
+        n += (c & 0xc0) != 0x80;
+    return n;
+}
 Slot &slot(Object *p, int64_t index) {
     if (!p || index < 0 || static_cast<uint64_t>(index) >= p->slots.size())
         fail("index out of bounds", "IndexError");
@@ -248,8 +432,13 @@ extern "C" {
 void *fw_frame() {
     return new Frame;
 }
+int64_t fw_gc_collect();
 void fw_sweep(Frame *f) {
     f->sweep();
+    // Statement boundaries are safe points: every live reference is rooted or frame-owned.
+    auto &c = candidates();
+    if (c.count > c.threshold && activeThreads.load() == 0)
+        fw_gc_collect();
 }
 void fw_root(Frame *f, Object **address) {
     f->roots.push_back(address);
@@ -368,7 +557,7 @@ int64_t fw_length(Object *p) {
     try {
         if (!p)
             fail("null length");
-        return static_cast<int64_t>(p->kind == Object::String ? p->text.size() : p->slots.size());
+        return static_cast<int64_t>(p->kind == Object::String ? utf8Length(p->text) : p->slots.size());
     } catch (const NativeFailure &e) {
         recordFailure(e.type, e.message);
         return {};
@@ -429,7 +618,9 @@ void fw_set_int(Object *p, int64_t index, int64_t value, int64_t kind) {
     try {
         auto &target = slot(p, index);
         target.integer = value;
-        target.kind = static_cast<Slot::Kind>(kind);
+        target.kind = static_cast<Slot::Kind>(kind & 0xff);
+        if (target.kind == Slot::Enum)
+            target.real = static_cast<double>(kind >> 8);
     } catch (const NativeFailure &e) {
         recordFailure(e.type, e.message);
         return;
@@ -486,6 +677,7 @@ void fw_child(Object *p, Object *child) {
         s.kind = Slot::Reference;
         retain(child);
         p->slots.push_back(std::move(s));
+        linkParent(p, child);
     } catch (const NativeFailure &e) {
         recordFailure(e.type, e.message);
         return;
@@ -1293,7 +1485,9 @@ bool textKey(const Slot &key) {
 }
 void indexKey(Object *map, size_t position) {
     auto &key = map->keys[position];
-    if (!map->objectKeys)
+    if (map->hashMode())
+        map->index->hashed.emplace(map->extra->keyHashes[position], position);
+    else if (!map->objectKeys)
         map->index->integers[key.integer] = position;
     else if (textKey(key))
         map->index->strings[key.object->text] = position;
@@ -1336,9 +1530,16 @@ size_t appendKey(Object *map, Slot key, Slot value) {
 extern "C" {
 Object *fw_map_new(Frame *frame, int64_t objects) {
     try {
-        auto p = new Object(Object::Map);
-        p->keyKind = static_cast<Slot::Kind>(objects);
-        p->objectKeys = objects == 4;
+        // Bits 0-7: key kind (7 tuple and 8 class keys are hashed references); bits 8-39: enum
+        // id for enum keys; bit 40 makes a set.
+        auto p = new Object((objects >> 40) & 1 ? Object::Set : Object::Map);
+        auto kind = objects & 0xff;
+        p->keyKind = kind >= 7 ? Slot::Reference : static_cast<Slot::Kind>(kind);
+        if (auto id = (objects >> 8) & 0xffffffff)
+            p->more().keyEnum = id;
+        p->objectKeys = kind == 4 || kind >= 7;
+        if (kind >= 7)
+            p->more().hashMode = kind == 7 ? 1 : 2;
         return own(frame, p);
     } catch (const NativeFailure &e) {
         recordFailure(e.type, e.message);
@@ -1361,8 +1562,10 @@ int64_t fw_map_index(Object *p, int64_t integer, Object *object, int64_t insert)
             retain(object);
             key.object = object;
             key.kind = Slot::Reference;
-        } else
+        } else {
             key.integer = integer;
+            key.real = static_cast<double>(p->keyEnum());
+        }
         return static_cast<int64_t>(appendKey(p, std::move(key), Slot{}));
     } catch (const NativeFailure &e) {
         recordFailure(e.type, e.message);
@@ -1450,6 +1653,8 @@ void fw_collection_clear(Object *p) {
     try {
         p->slots.clear();
         p->keys.clear();
+        if (p->extra)
+            p->extra->keyHashes.clear();
         p->index.reset();
     } catch (const NativeFailure &e) {
         recordFailure(e.type, e.message);
@@ -1463,7 +1668,7 @@ void fw_collection_clear(Object *p) {
 
 extern "C" {
 int64_t fw_error_pending() {
-    return pendingError.value != nullptr;
+    return errorPending;
 }
 int64_t fw_error_matches(const char *type) {
     return pendingError.value && (std::string(type) == "Error" || pendingError.type == type);
@@ -1586,6 +1791,7 @@ extern "C" Object *fw_try_read(Frame *frame, Object *path) {
 }
 
 #include "collections.inc"
+#include "strings.inc"
 
 #include "dom.inc"
 
@@ -1594,3 +1800,5 @@ extern "C" Object *fw_try_read(Frame *frame, Object *path) {
 #include "desktop.inc"
 
 #include "web.inc"
+#include "stdlib.inc"
+#include "concurrency.inc"

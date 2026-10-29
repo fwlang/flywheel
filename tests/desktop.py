@@ -165,7 +165,7 @@ print testing.live_objects()==base
             )
             try:
                 for expected in [
-                    'Hello <World> & café|quote " & <',
+                    'Changed after load|quote " & <',
                     "Second window|again",
                 ]:
                     try:
@@ -216,7 +216,69 @@ print testing.live_objects()==base
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
-    print("desktop WebKit DOM, escaping, snapshots, repeated run, and ARC cleanup OK")
+    print("desktop WebKit DOM, escaping, live trees, repeated run, and ARC cleanup OK")
+    events(compiler)
+
+
+def events(compiler):
+    """Function event handlers, live re-rendering, JS bindings, and two windows at once."""
+    with tempfile.TemporaryDirectory(prefix="fw-desktop-events-") as temporary:
+        root = Path(temporary)
+        source = root / "events.fw"
+        source.write_text(
+            """import desktop
+import html.*
+int count = 0
+var main_window = desktop.window("Counter", 400, 300)
+var side = desktop.window("Side", 300, 200)
+function page() returns element
+    return <html><head><title>T</title></head><body>
+        <p id="out">{count}</p>
+        <input id="name" oninput={function(string v) => print("typed " + v)} />
+        <button id="add" onclick={function()
+            count += 1
+            main_window.load(page())
+        end}>Add</button>
+    </body></html>
+end
+main_window.load(page())
+side.load(<p id="side">Side window</p>)
+int reports = 0
+var report = function(string text) returns string
+    print "report " + text
+    reports += 1
+    if reports == 2 then
+        desktop.quit()
+    end
+    return "ok"
+end
+main_window.bind("report", report)
+side.bind("report", report)
+main_window.eval("var b = document.getElementById('add'); b.click(); b.click(); var n = document.getElementById('name'); n.value = 'hey'; n.dispatchEvent(new Event('input')); setTimeout(function () {{ report(document.getElementById('out').textContent); }}, 500)")
+side.eval("setTimeout(function () {{ report(document.getElementById('side').textContent); }}, 300)")
+desktop.run([main_window, side])
+print "closed", count
+""",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [str(compiler), "run", str(source)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={
+                **os.environ,
+                "GDK_BACKEND": "x11",
+                "WAYLAND_DISPLAY": "",
+                "WEBKIT_DISABLE_DMABUF_RENDERER": "1",
+                "LIBGL_ALWAYS_SOFTWARE": "1",
+            },
+        )
+        assert result.returncode == 0, result.stderr
+        lines = result.stdout.splitlines()
+        assert sorted(lines[:3]) == ["report 2", "report Side window", "typed hey"], lines
+        assert lines[3:] == ["closed 2"], lines
+    print("desktop events, live updates, bindings, and multiple windows OK")
 
 
 if __name__ == "__main__":

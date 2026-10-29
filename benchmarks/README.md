@@ -15,12 +15,12 @@ Checked environment: Linux-7.2.11-zen1-1-zen-x86_64-with-glibc2.44; AMD Ryzen 5 
 
 | Workload | Flywheel O0 | Flywheel O3 | C++ O0 | C++ O3 | CPython |
 |---|---:|---:|---:|---:|---:|
-| startup | 0.819 | 0.862 | 0.852 | 0.832 | 8.884 |
-| numeric | 1.463 | 1.153 | 1.152 | 0.944 | 28.913 |
-| array | 3.980 | 3.967 | 1.162 | 0.921 | 29.458 |
-| strings | 4.369 | 3.872 | 4.701 | 2.673 | 10.645 |
-| markup | 21.253 | 20.583 | 78.719 | 4.841 | 36.934 |
-| allocations | 4.699 | 4.906 | 7.445 | 1.068 | 14.111 |
+| startup | 0.874 | 0.896 | 0.778 | 0.788 | 8.590 |
+| numeric | 1.532 | 1.062 | 1.148 | 0.995 | 27.711 |
+| array | 4.264 | 3.941 | 1.010 | 0.913 | 28.304 |
+| strings | 3.871 | 5.089 | 4.386 | 3.028 | 9.985 |
+| markup | 25.241 | 24.906 | 82.300 | 4.758 | 34.179 |
+| allocations | 5.632 | 5.248 | 6.901 | 1.302 | 13.275 |
 
 The markup workload renders 100,000 components, the array workload mutates/traverses 1,000 elements for 200 passes, and allocation tests construct 20,000 class instances. The string workload builds 5,000 interpolated segments. Numeric throughput runs 300,000 checked arithmetic iterations.
 
@@ -35,5 +35,7 @@ The markup workload renders 100,000 components, the array workload mutates/trave
 - The stored JSON includes raw samples, min/median/p90/max, build commands, compile times, runtime limits, output checksums, and memory measurements. These are local measurements, not cross-platform performance claims.
 
 See [linux-llvm21.json](linux-llvm21.json) for complete results.
+
+Compared with the previous checkpoint, allocation-heavy workloads (markup, allocations) are roughly 10–15% slower. Measured separately, the cost is the cycle collector's possible-root bookkeeping (a few nanoseconds per container released while still referenced) and larger object headers (class identity, collector state, parent links). Rarely used per-object state lives in a separately allocated block, and cross-thread locks are taken only while other threads run. Array and numeric workloads are unchanged within noise. Short workloads such as `strings` vary by a millisecond or more between runs.
 
 This checkpoint includes local modules, typed error propagation, tagged collection values, recursive formatting/casts, HTML tree tools, and managed-object lifetime metrics. Borrowed-read and scope-release optimizations are verified by ownership tests and IR checks. Overall timings include these additional language/runtime checks; they are not an isolated before/after measurement of ARC alone.

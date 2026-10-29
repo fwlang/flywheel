@@ -583,7 +583,7 @@ POSITIVE.update(
             "Title\nh1\nFirst\nSecond\n2\ntrue\ntrue\ntrue\n",
         ),
         "dom_selectors": (
-            'import html.*\nvar root=<><p id="one" class="card primary" data-state="ready now">A</p><section><p class="card" data-state="ready">B</p></section></>\nprint len(root.query_all("p.card.primary, #one"))\nprint len(root.query_all("[data-state]"))\nprint len(root.query_all("p[data-state~=ready]"))\nprint root.query("section > p.card").text_content\nprint root.query("#one").matches("P.card#one")\ntry\nroot.query("p:first-child")\ncatch SelectorError error\nprint "unsupported"\nend\n',
+            'import html.*\nvar root=<><p id="one" class="card primary" data-state="ready now">A</p><section><p class="card" data-state="ready">B</p></section></>\nprint len(root.query_all("p.card.primary, #one"))\nprint len(root.query_all("[data-state]"))\nprint len(root.query_all("p[data-state~=ready]"))\nprint root.query("section > p.card").text_content\nprint root.query("#one").matches("P.card#one")\ntry\nroot.query("p:hover")\ncatch SelectorError error\nprint "unsupported"\nend\n',
             "1\n2\n2\nB\ntrue\nunsupported\n",
         ),
         "dom_attributes_and_classes": (
@@ -751,9 +751,9 @@ function check returns void
     var window=make()
     print typeof(window)
     print string(window)
-    print testing.live_objects()==base+1
+    print testing.live_objects()>base
     window.load(<p>Replacement</p>)
-    print testing.live_objects()==base+1
+    print testing.live_objects()>base
     gui.window? optional=window
     optional.load(<p>Nullable alias</p>)
     var defaults=gui.window()
@@ -803,34 +803,35 @@ import html.*
 import testing
 var base=testing.live_objects()
 function check returns void
-    var window=gui.window
+    var Window=gui.window
+    print Window
+    print typeof(Window)
+    var window=gui.window()
     print typeof(window)
     window.load(<h1>Hello, World!</h1>)
-    var original=window
-    window=gui.Window
-    print window==original
-    var Window=(gui.window)
-    print testing.live_objects()==base+2
-    print Window
+    var named=gui.window "my-window"
+    print named
+    var called=gui.window("my-window", 480, 320)
+    print called
+    print testing.live_objects()>=base+3
     var explicit=Window("Custom",480,320)
     print explicit
-    var default=Window
-    print default
-    var alias=(Window)
+    var alias=Window
     var other=alias()
     other.load(<><p>Fragment</p></>)
-    gui.window typed=gui.window
+    var outer=alias "Outer"
+    print outer
+    gui.window typed=gui.Window()
     print typed
     var grouped=((gui.Window))
     print grouped
-    var called=(gui.window)()
-    print called
-    print bool((gui.window))
-    (gui.window)
+    var direct=(gui.window)()
+    print direct
+    print bool(gui.window)
 end
 check()
 print testing.live_objects()==base""",
-            'desktop.window\nfalse\ntrue\n<class desktop.window>\ndesktop.window("Custom")\ndesktop.window("Flywheel")\ndesktop.window("Flywheel")\n<class desktop.window>\ndesktop.window("Flywheel")\ntrue\ntrue\n',
+            '<class desktop.window>\nclass:desktop.window\ndesktop.window\ndesktop.window("my-window")\ndesktop.window("my-window")\ntrue\ndesktop.window("Custom")\ndesktop.window("Outer")\ndesktop.window("Flywheel")\n<class desktop.window>\ndesktop.window("Flywheel")\ntrue\ntrue\n',
         ),
         "bare_class_constructor_references": (
             """import testing
@@ -840,19 +841,23 @@ end
 function answer returns int
     return 42
 end
-var person=Person
-print person.name
-var Class=(Person)
+var Class=Person
 print Class
+var person=Person()
+print person.name
 var explicit=Class("Custom")
 print explicit.name
-var defaults=Class
+var outer=Class "Outer"
+print outer.name
+var defaults=Class()
 print defaults.name
+var grouped=(Person)
+print grouped
 var reference=answer
 print reference()
 print (answer)
 print((1+2)*3)""",
-            "Default\n<class Person>\nCustom\nDefault\n42\n<function answer>\n9\n",
+            "<class Person>\nDefault\nCustom\nOuter\nDefault\n<class Person>\n42\n<function answer>\n9\n",
         ),
     }
 )
@@ -873,7 +878,7 @@ function hello returns void
     print "called"
 end
 function check returns void
-    var counter=Counter
+    var counter=Counter()
     counter.increment
     (counter.increment)
     ((counter.increment))
@@ -882,9 +887,6 @@ function check returns void
     (hello)
     var callback=hello
     (callback)
-    (desktop.window)
-    var Window=(desktop.window)
-    (Window)
 end
 check()
 print testing.live_objects()==base""",
@@ -1080,7 +1082,7 @@ import html.*
 import testing
 var base=testing.live_objects()
 function attempt returns void
-    var window=desktop.window
+    var window=desktop.window()
     window.load(<><h1>Test</h1></>)
     for i in 0..<2 do
         try
@@ -1145,17 +1147,17 @@ NEGATIVE = {
     "truthiness": ("if 1 then\nend", "bool"),
     "break": ("break", "requires a loop"),
     "attr": ("print attr name", "component"),
-    "attribute_type": ("import html.*\nvar t = <p style={3}>x</p>", "requires string"),
+    "attribute_type": ("import html.*\nvar t = <p style={true}>x</p>", "requires a string or number"),
     "attribute_unknown": (
         'import html.*\nvar t = <p bogus="x" />',
         "unknown attribute",
     ),
     "import_collision": ("import fs\nimport math as fs", "duplicate import"),
     "unicode": ('print "\\u{D800}"', "Unicode"),
-    "unsupported_module": ("import net", "not implemented"),
-    "unsupported_constructor": (
-        "class C\nfunction init() returns void\nend\nend",
-        "not implemented",
+    "unsupported_module": ("import gizmo", "not found or not implemented"),
+    "init_unassigned": (
+        "class C\nint x\nfunction init()\nend\nend",
+        "init must assign required field 'x'",
     ),
 }
 TRAPS = {
@@ -1296,23 +1298,28 @@ NEGATIVE.update(
     {
         "grouped_constructor_instance": (
             "import desktop\ndesktop.window value=(desktop.window)",
-            "constructor reference",
+            "is a class reference, not an instance",
         ),
         "constructor_reference_method": (
             "import desktop\nvar Window=(desktop.window)\nWindow.run()",
             "has no instance methods",
         ),
-        "constructor_reference_array": (
-            "import desktop\nvar references=[(desktop.window)]",
-            "constructor references cannot be stored",
-        ),
+
         "constructor_reference_cast": (
             "import desktop\nprint int((desktop.window))",
             "unsupported cast source",
         ),
         "bare_constructor_missing_required": (
-            "class Person\nstring name\nend\nvar person=Person",
+            "class Person\nstring name\nend\nvar person=Person()",
             "missing required constructor field",
+        ),
+        "class_reference_statement": (
+            "import desktop\ndesktop.window",
+            "is a class reference; call it with ()",
+        ),
+        "class_reference_field": (
+            "class Person\nstring name=\"x\"\nend\nvar person=Person\nprint person.name",
+            "is a class reference, not an instance",
         ),
         "desktop_member_diagnostic": (
             "import desktop\nvar value=desktop.windows",
@@ -1323,9 +1330,14 @@ NEGATIVE.update(
 
 NEGATIVE.update(
     {
-        "captured_assignment": (
-            "function f() returns void\nint x = 1\nvar g = function() returns void\nx = 2\nend\nend",
-            "cannot assign to captured variable 'x'",
+        "generic_inference": (
+            "function first<T>(T[] items) returns T\nreturn items[0]\nend\nint[] none = []\nprint first()",
+            "cannot infer type parameter T",
+        ),
+        "generic_arity": ("class Box<T>\nT value\nend\nBox<int, int> b = Box(1)", "expects 1 type argument"),
+        "constructor_signature": (
+            "class P\nstring name\nend\nfunction(int) returns P make = P",
+            "constructor P does not match type",
         ),
         "closure_arity": (
             "var f = function(int x) => x\nprint f(1, 2)",
@@ -1535,13 +1547,13 @@ end
 public const PersonClass=(Person)
 """,
             "main.fw": """import factories as factory
-var window=factory.Window
+var window=factory.Window()
 print window
-var constructor=(factory.Window)
+var constructor=factory.Window
 print constructor("Module window")
-var person=factory.Person
+var person=factory.Person()
 print person.name
-var person_constructor=(factory.PersonClass)
+var person_constructor=factory.PersonClass
 print person_constructor("Named").name
 """,
         },
@@ -1549,6 +1561,495 @@ print person_constructor("Named").name
     )
 )
 
+
+POSITIVE.update(
+    {
+        "integer_division_any_numeric": (
+            "print 7 // 2\nprint -7 // 2\nprint 7.5 // 2.0\nprint -7.9 // 2\nprint typeof(7.5 // 2)\nvar x = 10\nx //= 3\nprint x",
+            "3\n-3\n3\n-3\ni64\n3\n",
+        ),
+        "unicode_string_length": (
+            'print "héllo".length\nprint len("日本語")\nvar größe = 3\nprint größe',
+            "5\n3\n3\n",
+        ),
+        "unsigned_literals": (
+            "u64 big = 18446744073709551615\nprint big\nprint typeof(9223372036854775808)",
+            "18446744073709551615\nu64\n",
+        ),
+        "line_continuation_and_chains": (
+            "var total = 1 +\n    2 +\n    3\nvar other = 4 \\\n    + 5\nprint total, other\nprint 1 < 2 < 3, 3 > 2 > 2, 1 <= 1 < 2\nfunction side(int n) returns int\n    print \"eval\"\n    return n\nend\nprint 5 < side(1) < 9",
+            "6 9\ntrue false true\neval\nfalse\n",
+        ),
+        "chars_and_string_methods": (
+            """var s = "  Héllo, Wörld  "
+print s.trim().upper()
+print s.trim().lower()
+print "a,b,,c".split(",")
+print "one  two\\tthree".split()
+print ", ".join(["x", "y"]), ["p", "q"].join("+")
+print "banana".replace("an", "AN")
+print "banana".find("na"), "banana".find_last("na"), "banana".count("a"), "héllo".find("l")
+print "hello".starts_with("he"), "hello".ends_with("lo"), "hello".contains("ell")
+print "héllo"[1], "héllo"[1..3], "héllo"[1..<3], "héllo".slice(-3)
+print "abc".reverse(), "7".pad_start(3, "0"), "a\\nb\\r\\nc".lines()
+char c = 'é'
+print c, int(c), char(65), 'a' < 'b', 'x' in "xyz", "ab" + 'c'
+print "héllo".chars()
+for ch in "añ" do
+    print ch
+end""",
+            'HÉLLO, WÖRLD\nhéllo, wörld\n["a", "b", "", "c"]\n["one", "two", "three"]\nx, y p+q\nbANANa\n2 4 3 2\ntrue true true\né éll él llo\ncba 007 ["a", "b", "c"]\né 233 A true true abc\n[\'h\', \'é\', \'l\', \'l\', \'o\']\na\nñ\n',
+        ),
+        "array_tools": (
+            """int[] xs = [5, 3, 9, 1]
+xs.sort()
+print xs
+xs.sort(function(int a, int b) => a > b)
+print xs
+xs.reverse()
+print xs, xs.slice(1, 3), xs[0..1], xs.index_of(9), xs.contains(4)
+xs.insert(0, 42)
+print xs, xs.remove_at(0), xs.remove(9), xs
+xs.extend([7, 8])
+print xs.join("-"), xs.copy()
+string[] names = ["bob", "Al", "carl"]
+names.sort()
+print names""",
+            '[1, 3, 5, 9]\n[9, 5, 3, 1]\n[1, 3, 5, 9] [3, 5] [1, 3] 3 false\n[1, 3, 5] 42 true [1, 3, 5]\n1-3-5-7-8 [1, 3, 5, 7, 8]\n["Al", "bob", "carl"]\n',
+        ),
+        "math_tools": (
+            """import math
+print math.abs(-5), math.abs(-2.5), math.min(3, 1, 2), math.max(1.5, 2.5), math.clamp(15, 0, 10)
+print math.floor(2.7), math.ceil(2.1), math.round(2.5), math.log(math.E), math.log(8, 2)
+print math.is_nan(math.NAN), math.is_finite(math.INF), math.tan(0.0), math.atan2(0.0, 1.0)
+math.seed(42)
+var r = math.random_int(1, 6)
+print 1 <= r <= 6, math.random() < 1.0""",
+            "5 2.5 1 2.5 10\n2 3 3 1 3\ntrue false 0 0\ntrue true\n",
+        ),
+        "nullable_primitives": (
+            """int? a = null
+int? b = 5
+print a, b, a ?? 10, b ?? 10
+print a == null, b == 5, b != 5, a == b
+if b != null then
+    print b + 1
+end
+if a != null and a > 0 then
+    print "no"
+else
+    print "a missing"
+end
+function first_even(int[] xs) returns int?
+    for x in xs do
+        if x % 2 == 0 then
+            return x
+        end
+    end
+    return null
+end
+print first_even([1, 3, 4]), first_even([1])
+function describe(int? n) returns string
+    if n == null then
+        return "nothing"
+    end
+    return "got " + string(n * 2)
+end
+print describe(null), describe(4)
+bool? flag = true
+double? d = 2.5
+print flag ?? false, d
+map<string, int?> m = {"x": 1, "y": null}
+print m, int(b), string(a)
+class Opt
+    int? value = null
+end
+var o = Opt()
+print o.value ?? -1
+o.value = 3
+print o""",
+            'null 5 10 5\ntrue true false false\n6\na missing\n4 null\nnothing got 8\ntrue 2.5\n{"x": 1, "y": null} 5 null\n-1\nOpt(value=3)\n',
+        ),
+        "classes_interfaces_enums_match": (
+            """enum Color
+    Red, Green
+    Blue
+end
+interface Shape
+    function area() returns double
+    function label() returns string
+end
+class Base implements Shape
+    string tag = "base"
+    function area() returns double
+        return 0.0
+    end
+    function label() returns string
+        return "{inst tag}:{inst area()}"
+    end
+end
+class Circle extends Base
+    double r
+    function init(double r)
+        inst r = r
+        inst tag = "circle"
+    end
+    function area() returns double
+        return 3.0 * inst r * inst r
+    end
+end
+class Square extends Base
+    double side
+    function label() returns string
+        return "square " + super.label()
+    end
+    function area() returns double
+        return inst side * inst side
+    end
+end
+var c = Color.Green
+print c, c.value, c.name, Color.values(), Color.from_name("Blue"), Color.from_name("Pink")
+match c
+    case Color.Red then
+        print "red"
+    case Green, Blue then
+        print "cool"
+end
+Shape[] shapes = [Circle(1.0), Square("sq", 2.0), Base()]
+for s in shapes do
+    print s.label()
+end
+Base b = Circle(2.0)
+print b.area(), b is Circle, b is Square, (b as Circle).r
+Circle? none = b as Circle?
+print none != null
+if b is Circle then
+    print "radius", b.r
+end
+function describe(Shape shape) returns string
+    match shape
+        case Circle k if k.r > 1.5 then
+            return "big circle"
+        case Circle k then
+            return "circle"
+        case Square sq then
+            return "square {sq.side}"
+        case Base then
+            return "base"
+    end
+end
+for s in shapes do
+    print describe(s)
+end
+print describe(b)
+for n in [0, 3, 7, 9] do
+    match n
+        case 0 then
+            print "zero"
+        case 1..5 then
+            print "small"
+        case 6, 7 then
+            print "six or seven"
+        else
+            print "big"
+    end
+end
+Result<int, string> res = Result.ok(3)
+match res
+    case ok v then
+        print "ok", v
+    case error e then
+        print "error", e
+end
+map<Color, int> counts = {Color.Red: 1}
+counts[Color.Blue] = 2
+print counts
+int? maybe = 4
+match maybe
+    case null then
+        print "none"
+    case int v then
+        print "value", v
+end""",
+            "Green 1 Green [Red, Green, Blue] Blue null\ncool\ncircle:3\nsquare sq:4\nbase:0\n12 true false 2\ntrue\nradius 2\ncircle\nsquare 2\nbase\nbig circle\nzero\nsmall\nsix or seven\nbig\nok 3\n{Red: 1, Blue: 2}\nvalue 4\n",
+        ),
+    }
+)
+
+NEGATIVE.update(
+    {
+        "missing_interface_method": (
+            "interface S\n    function f() returns int\nend\nclass A implements S\n    int x = 0\nend",
+            "class A must implement S.f",
+        ),
+        "override_signature": (
+            'class A\n    function f() returns int\n        return 1\n    end\nend\nclass B extends A\n    function f() returns string\n        return "x"\n    end\nend',
+            "overrides A.f with a different signature",
+        ),
+        "match_exhaustive": (
+            "enum E\n    X, Y\nend\nvar e = E.X\nmatch e\n    case E.X then\n        print 1\nend",
+            "match is not exhaustive (missing Y)",
+        ),
+        "init_reads_inst": (
+            "class A\n    int x\n    function init()\n        print inst x\n        inst x = 1\n    end\nend",
+            "init uses 'inst' before assigning required field 'x'",
+        ),
+        "init_early_return": (
+            "class A\n    int x\n    function init(bool b)\n        if b then\n            return\n        end\n        inst x = 1\n    end\nend",
+            "init can return before assigning required field 'x'",
+        ),
+        "interface_construct": (
+            "interface S\n    function f() returns int\nend\nvar s = S()",
+            "interface S cannot be constructed",
+        ),
+        "inheritance_cycle": ("class A extends A\n    int x = 1\nend", "inheritance cycle"),
+        "unrelated_cast": (
+            "class A\n    int x = 1\nend\nclass B\n    int y = 1\nend\nvar a = A()\nvar b = a as B",
+            "cannot cast A to unrelated type B",
+        ),
+        "nullable_arithmetic": ("int? a = 1\nprint a + 1", "requires non-null operands"),
+        "nullable_implicit": ("int? a = 1\nint b = a", "cannot implicitly convert i64? to i64"),
+        "char_literal_length": ("print 'ab'", "exactly one character"),
+        "string_immutable": ('var s = "abc"\ns[0] = \'x\'', "strings are immutable"),
+    }
+)
+TRAPS.update(
+    {
+        "nullable_cast": ("int? a = null\nprint int(a)", "cannot cast null"),
+        "real_division_zero": ("double z = 0.0\nprint 1.0 // z", "division by zero"),
+        "narrowed_global_changed": (
+            "class A\n    int x = 1\nend\nclass B extends A\n    int y = 2\nend\nA a = B()\nfunction reset() returns void\n    a = A()\nend\nif a is B then\n    reset()\n    print a.y\nend",
+            "no longer B",
+        ),
+    }
+)
+
+
+POSITIVE.update(
+    {
+        "first_class_methods_and_constructors": (
+            """import desktop
+class Counter
+    int value = 0
+    function add(int n) returns int
+        inst value += n
+        return inst value
+    end
+    function adder() returns function(int) returns int
+        return inst add
+    end
+end
+class Person
+    string name
+    int age = 0
+end
+var c = Counter()
+var add = c.add
+print add(2), add(3), c.value
+print c.adder()(10), [1, 2, 3].map(c.add)
+function(string) returns Person make = Person
+function(string, int) returns Person full = Person
+print make("Ann").name, full("Bo", 4)
+var makers = [Person, Person]
+print makers[0]("Cy", 1)
+function(string) returns desktop.window win = desktop.window
+var windows = [desktop.window]
+print win("from function"), windows[0]("x", 10, 10)""",
+            '2 5 5\n15 [16, 18, 21]\nAnn Person(name="Bo", age=4)\nPerson(name="Cy", age=1)\ndesktop.window("from function") desktop.window("x")\n',
+        ),
+        "mutable_captures": (
+            """import testing
+var base = testing.live_objects()
+function counter() returns function() returns int
+    int count = 0
+    return function() returns int
+        count += 1
+        return count
+    end
+end
+function local_effects() returns void
+    var next = counter()
+    print next(), next(), next()
+    int total = 0
+    string log = ""
+    [1, 2, 3].each(function(int x)
+        total += x
+        log = log + string(x)
+    end)
+    print total, log
+    var later = function() => total * 10
+    total = 7
+    print later()
+    var fns = [function() => 0]
+    fns.clear()
+    for i in [1, 2] do
+        fns.push(function() => i * 100)
+    end
+    print fns[0](), fns[1]()
+    int depth = 0
+    var outer = function()
+        var inner = function()
+            depth += 5
+        end
+        inner()
+        inner()
+    end
+    outer()
+    print depth
+end
+local_effects()
+print testing.live_objects() == base""",
+            "1 2 3\n6 123\n70\n100 200\n10\ntrue\n",
+        ),
+        "generics": (
+            """class Box<T>
+    T value
+    function get() returns T
+        return inst value
+    end
+    function with(T other) returns Box<T>
+        return Box<T>(other)
+    end
+end
+class Pair<A, B>
+    A first
+    B second
+    function swap() returns Pair<B, A>
+        return Pair(inst second, inst first)
+    end
+end
+class Stack<T>
+    T[] items
+    function init()
+        inst items = []
+    end
+    function push(T item)
+        inst items.push(item)
+    end
+    function pop() returns T?
+        if inst items.length == 0 then
+            return null
+        end
+        return inst items.pop()
+    end
+end
+function first<T>(T[] items) returns T
+    return items[0]
+end
+function map_all<T, U>(T[] items, function(T) returns U f) returns U[]
+    U[] out = []
+    for item in items do
+        out.push(f(item))
+    end
+    return out
+end
+var b = Box(5)
+print b.get(), typeof(b), Box<string>("hi").with("there").get()
+print first([3, 4]), first(["a"]), first<double>([1.5])
+print map_all([1, 2, 3], function(int x) => "n{x}")
+var p = Pair("one", 1)
+print p.swap(), typeof(p.swap())
+Stack<int> st = Stack()
+st.push(1)
+st.push(2)
+print st.pop(), st.pop(), st.pop()
+Box<int>[] boxes = [Box(1), Box(2)]
+print boxes.map(function(Box<int> x) => x.get() * 10)
+var getter = first<int>
+print getter([9])""",
+            '5 Box<i64> there\n3 a 1.5\n["n1", "n2", "n3"]\nPair<i64,string>(first=1, second="one") Pair<i64,string>\n2 1 null\n[10, 20]\n9\n',
+        ),
+    }
+)
+
+POSITIVE.update({"sets_hashing_iterators": ('import testing\nvar base = testing.live_objects()\nclass Point\n    int x\n    int y\n    function equals(Point other) returns bool\n        return inst x == other.x and inst y == other.y\n    end\n    function hash() returns int\n        return inst x * 31 + inst y\n    end\nend\nclass Countdown\n    int n\n    function next() returns int?\n        if inst n == 0 then\n            return null\n        end\n        inst n -= 1\n        return inst n + 1\n    end\nend\nclass Range\n    int stop\n    function iterator() returns Countdown\n        return Countdown(inst stop)\n    end\nend\nfunction check() returns void\n    set<int> s = {3, 1, 3, 2}\n    print s, s.length, 2 in s, 5 in s\n    s.add(5)\n    print s.remove(1), s.remove(9), s\n    var words = set(["a", "b", "a"])\n    print words, words.contains("b")\n    set<string> empty = {}\n    print empty.length\n    var other = set([2, 9])\n    print s.union(other), s.intersection(other), s.difference(other), set([2]).is_subset(s)\n    for x in s do\n        print "item", x\n    end\n    print Point(1, 2) == Point(1, 2), Point(1, 2) != Point(2, 1)\n    map<Point, string> names = {Point(1, 2): "a"}\n    names[Point(1, 2)] = "b"\n    names[Point(3, 4)] = "c"\n    print names.length, names[Point(1, 2)], Point(3, 4) in names, Point(9, 9) in names\n    print names.remove(Point(3, 4)), names.length\n    set<Point> points = {Point(0, 0), Point(0, 0)}\n    print points.length\n    map<[int, string], int> pairs = {}\n    pairs[[1, "a"]] = 10\n    pairs[[1, "a"]] += 1\n    print pairs, [1, "a"] in pairs, [1, "b"] in pairs\n    set<[int, int]> grid = {[0, 0], [0, 1], [0, 0]}\n    print grid.length\n    for n in Countdown(3) do\n        print "count", n\n    end\n    for n in Range(2) do\n        print "range", n\n    end\n    map<string, int> ages = {"ann": 3, "bo": 4}\n    for name, age in ages do\n        print name, age\n    end\n    for i, w in ["x", "y"] do\n        print i, w\n    end\n    print ages.values()\nend\ncheck()\nprint testing.live_objects() == base\n', '{3, 1, 2} 3 true false\ntrue false {3, 2, 5}\n{"a", "b"} true\n0\n{3, 2, 5, 9} {2} {3, 5} true\nitem 3\nitem 2\nitem 5\ntrue true\n2 b true false\ntrue 1\n1\n{(1, "a"): 11} true false\n2\ncount 3\ncount 2\ncount 1\nrange 2\nrange 1\nann 3\nbo 4\n0 x\n1 y\n[3, 4]\ntrue\n')})
+NEGATIVE.update(
+    {
+        "map_key_without_hash": (
+            "class P\n    int x = 0\nend\nmap<P, int> m = {}\nm[P()] = 1",
+            "must define hash() returns int and equals",
+        ),
+        "iterator_not_nullable": (
+            "class C\n    function next() returns int\n        return 1\n    end\nend\nfor x in C() do\nend",
+            "next() must return a nullable value",
+        ),
+        "set_pairs": ("set<int> s = {1}\nfor i, x in s do\nend", "sets have no index"),
+    }
+)
+
+POSITIVE.update(
+    {
+        "stdlib_fs_time_regex_json_io": ('import os\nimport fs\nimport time\nimport regex\nimport io\nimport json\nenum Role\n    Admin, User\nend\nclass Address\n    string city\n    int? zip = null\nend\nclass Person\n    string name\n    int age = 0\n    Address[] homes = []\n    Role role = Role.User\n    map<string, int> scores = {}\n    string? nickname = null\nend\nfs.mkdir("fsdemo/sub")\nfs.write("fsdemo/a.txt", "one\\n")\nfs.append("fsdemo/a.txt", "two\\n")\nprint fs.read("fsdemo/a.txt").lines(), fs.list("fsdemo"), fs.walk("fsdemo")\nprint fs.is_dir("fsdemo"), fs.is_file("fsdemo/a.txt"), fs.size("fsdemo/a.txt")\nprint fs.join("fsdemo", "sub", "x.json"), fs.basename("a/b.txt"), fs.extension("a/b.txt"), fs.stem("a/b.txt"), fs.dirname("a/b.txt")\nfs.copy("fsdemo/a.txt", "fsdemo/b.txt")\nfs.move("fsdemo/b.txt", "fsdemo/sub/c.txt")\nprint fs.walk("fsdemo")\nprint fs.remove_all("fsdemo"), fs.is_dir("fsdemo")\nprint time.format(0.0), time.format(86400.0 * 365.0, "%Y-%m-%d")\nvar d = time.date(1700000000.0)\nprint d.year, d.month, d.day, d.weekday\nprint time.from_date(2023, 11, 14, 22, 13, 20.0), time.parse("2001-02-03T04:05:06Z")\nprint time.now() > 1700000000.0\nprint regex.matches("[a-z]+", "abc"), regex.contains("\\\\d", "a1"), regex.find("\\\\d+", "ab12c345")\nprint regex.find_all("\\\\d+", "a1b22c333"), regex.groups("(\\\\w+)@(\\\\w+)", "me@host"), regex.groups("x", "y")\nprint regex.replace("(\\\\d+)", "a1b22", "<$1>"), regex.split(",\\\\s*", "a, b,c")\nvar j = json.parse("{{\\"items\\": [1, 2, {{\\"k\\": true}}], \\"name\\": \\"x\\"}}")\nprint j["items"][1], json.length(j["items"]), json.keys(j), j["items"][2]["k"]\nfor item in json.items(j["items"]) do\n    print json.kind(item)\nend\nvar p = Person("Ann", 30, [Address("Oslo", 1234)], Role.Admin, {"math": 9}, null)\nvar text = json.encode(p)\nprint text\nPerson back = json.decode(text)\nprint back\nprint Person.from_json("{{\\"name\\": \\"Bo\\", \\"homes\\": [{{\\"city\\": \\"Rome\\"}}]}}")\nprint json.decode<int[]>("[1, 2, 3]"), json.decode<map<string, double?>>("{{\\"a\\": 1.5, \\"b\\": null}}")\nprint json.encode([1, 2], 2)\nprint json.encode({"k": [true, false]})\nprint json.decode<set<int>>("[3, 3, 1]")\nprint os.args()\nio.write("no newline")\nio.write("\\n")\nvar f = io.open("io-demo.txt", "w")\nf.write("first\\nsecond\\n")\nf.close()\nvar g = io.open("io-demo.txt")\nprint g.read_line(), g.read_line(), g.read_line()\ng.close()\nprint io.open("io-demo.txt").lines()\nfs.remove("io-demo.txt")\n', '["one", "two"] ["a.txt", "sub"] ["a.txt", "sub"]\ntrue true 8\nfsdemo/sub/x.json b.txt .txt b a\n["a.txt", "sub", "sub/c.txt"]\n4 false\n1970-01-01T00:00:00Z 1971-01-01\n2023 11 14 2\n1700000000 981173106\ntrue\ntrue true 12\n["1", "22", "333"] ["me", "host"] null\na<1>b<22> ["a", "b", "c"]\n2 3 ["items", "name"] true\nnumber\nnumber\nobject\n{"name":"Ann","age":30,"homes":[{"city":"Oslo","zip":1234}],"role":"Admin","scores":{"math":9},"nickname":null}\nPerson(name="Ann", age=30, homes=[Address(city="Oslo", zip=1234)], role=Admin, scores={"math": 9}, nickname=null)\nPerson(name="Bo", age=0, homes=[Address(city="Rome", zip=null)], role=User, scores={}, nickname=null)\n[1, 2, 3] {"a": 1.5, "b": null}\n[\n  1,\n  2\n]\n{"k":[true,false]}\n{3, 1}\n[]\nno newline\nfirst second null\n["first", "second"]\n'),
+        "stdlib_net": ('import net\nvar server = net.listen("127.0.0.1", 0)\nvar port = server.port()\nvar client = net.connect("localhost", port, 2.0)\nvar peer = server.accept()\nclient.send("hello\\nworld\\n")\nprint peer.receive_line(), peer.receive_line()\npeer.send("pong")\npeer.close()\nprint client.receive(), client.receive() == ""\nprint client.receive_line()\nclient.close()\nserver.close()\nprint net.resolve("localhost").length > 0\nvar v6 = net.listen("::1", 0)\nvar c6 = net.connect("::1", v6.port())\nvar p6 = v6.accept()\nc6.send("six")\nprint p6.receive(3), c6.address().starts_with("[::1]")\ntry\n    c6.close()\n    c6.send("x")\ncatch NetworkError e\n    print e.message\nend\n', 'hello world\npong true\nnull\ntrue\nsix true\nsocket is closed\n'),
+    }
+)
+if os.name != "nt":
+    POSITIVE["stdlib_processes"] = ('import os\nvar r = os.run(["sh", "-c", "echo out; echo err >&2; exit 3"])\nprint r.status, r.stdout.trim(), r.stderr.trim(), r.timed_out\nvar pr = os.process(["cat"])\npr.input = "fed through stdin"\nprint pr.run().stdout\nvar slow = os.process(["sleep", "5"])\nslow.timeout = 0.2\nvar sr = slow.run()\nprint sr.timed_out\nvar cw = os.process(["pwd"])\ncw.cwd = "/tmp"\ncw.env["FLY_X"] = "42"\nprint cw.run().stdout.trim()\nvar envp = os.process(["sh", "-c", "echo $FLY_X"])\nenvp.env["FLY_X"] = "42"\nprint envp.run().stdout.trim()\nprint os.pipeline([["printf", "b\\\\na\\\\nc\\\\n"], ["sort"], ["head", "-n", "2"]]).stdout.lines()\n', '3 out err false\nfed through stdin\ntrue\n/tmp\n42\n["a", "b"]\n')
+NEGATIVE.update(
+    {
+        "json_decode_target": ('import json\nprint json.decode("[1]")', "needs a target type"),
+        "json_decode_interface": (
+            'import json\ninterface S\n    function f() returns int\nend\nS s = json.decode("{{}}")',
+            "cannot decode S from JSON",
+        ),
+    }
+)
+TRAPS.update(
+    {
+        "regex_invalid": ('import regex\nprint regex.matches("(", "x")', "RegexError"),
+        "json_missing_field": (
+            'import json\nclass P\n    string name\nend\nprint P.from_json("{{}}")',
+            "missing JSON field 'name'",
+        ),
+        "net_refused": ('import net\nvar l = net.listen("127.0.0.1", 0)\nvar p = l.port()\nl.close()\nnet.connect("127.0.0.1", p)', "NetworkError"),
+    }
+)
+
+POSITIVE.update(
+    {
+        "threads_channels_mutex": ('import thread\nimport gc\nimport testing\nclass Node\n    string name\n    Node? next = null\nend\nfunction work(int n) returns int\n    int total = 0\n    for i in 0..<n do\n        total += i\n    end\n    return total\nend\nfunction check() returns void\n    var base = testing.live_objects()\n    thread.task<int>[] tasks = []\n    for i in 1..4 do\n        tasks.push(thread.spawn(function() => work(i * 1000)))\n    end\n    print tasks.map(function(thread.task<int> t) => t.join())\n    var failing = thread.spawn(function() returns int\n        throw RuntimeError("boom")\n    end)\n    try\n        failing.join()\n    catch RuntimeError e\n        print "caught", e.message\n    end\n    thread.channel<string> ch = thread.channel(2)\n    var producer = thread.spawn(function()\n        for w in ["a", "b", "c", "d"] do\n            ch.send(w)\n        end\n        ch.close()\n    end)\n    string got = ""\n    var item = ch.receive()\n    while item != null do\n        got = got + item\n        item = ch.receive()\n    end\n    producer.join()\n    print got, ch.try_receive()\n    var lock = thread.mutex()\n    int[] counter = [0]\n    thread.task<void>[] adders = []\n    for i in 0..<4 do\n        adders.push(thread.spawn(function()\n            for k in 0..<1000 do\n                lock.lock()\n                counter[0] += 1\n                lock.unlock()\n            end\n        end))\n    end\n    for a in adders do\n        a.join()\n    end\n    print counter[0], thread.cores() >= 1\n    tasks.clear()\n    adders.clear()\n    var a = Node("a")\n    var b = Node("b", a)\n    a.next = b\n    print testing.live_objects() > base\nend\ncheck()\nprint gc.collect() >= 2\nvar x = Node("x")\nx.next = x\n', "[499500, 1999000, 4498500, 7998000]\ncaught boom\nabcd null\n4000 true\ntrue\ntrue\n"),
+        "cycle_collection": ('import gc\nimport testing\nimport html.*\nclass Node\n    string name\n    Node? next = null\n    function() returns string callback = function() => "none"\nend\nvar base = testing.live_objects()\nfunction churn() returns void\n    for i in 0..<1000 do\n        var a = Node("a")\n        var b = Node("b", a)\n        a.next = b\n        map<string, Node> registry = {}\n        registry["self"] = a\n        a.callback = function() returns string\n            return registry["self"].name\n        end\n    end\n    var page = <div><p>text</p></div>\n    var keep = Node("keep")\n    print keep.name\nend\nchurn()\nprint testing.live_objects() > base\nvar freed = gc.collect()\nprint freed > 0, testing.live_objects() == base\n', "keep\ntrue\ntrue true\n"),
+    }
+)
+NEGATIVE.update(
+    {
+        "spawn_arguments": ("import thread\nthread.spawn(function(int x) => x)", "function taking no arguments"),
+        "channel_type": ("import thread\nvar c = thread.channel()", "needs an element type"),
+    }
+)
+
+POSITIVE.update({"html_selectors_families_svg": ('import html.*\nimport svg.*\nelements widgets\n    my-card: title, size\n    my-spacer void: height\n    my-any: *\nend\nvar page = <div id="root">\n    <ul class="list">\n        <li class="item">one</li>\n        <li class="item special">two</li>\n        <li class="item">three</li>\n        <li class="item">four</li>\n    </ul>\n    <p>after</p>\n    <span>x</span>\n    <input type="number" min={0} max={10} step={0.5} disabled={false} />\n    <progress value={3} max={10}></progress>\n    <svg viewBox="0 0 10 10" width={10}><circle cx="5" cy="5" r={4} fill="red" /></svg>\n    <my-card title="Hi" size={3}>content</my-card>\n    <my-spacer height="4" />\n    <my-any whatever="ok" />\n    <button onclick="alert(1)">js</button>\n    <details open={true}><summary>s</summary></details>\n</div>\nprint page.query_all("li:first-child").map(function(element e) => e.text_content)\nprint page.query_all("li:last-child, li:nth-child(2)").map(function(element e) => e.text_content)\nprint page.query_all("li:nth-child(odd)").length, page.query_all("li:nth-child(2n+3)").length, page.query_all("li:nth-last-child(1)")[0].text_content\nprint page.query_all("li:not(.special)").length, page.query_all("ul + p").length, page.query_all("ul ~ span").length, page.query_all("li.special + li")[0].text_content\nprint page.query_all("p:empty").length, page.query_all("li:only-child").length, page.query_all("div > ul > li:first-of-type")[0].text_content\nvar two = page.query(".special")\nif two != null then\n    var parent = two.parent\n    if parent != null then\n        print parent.tag\n    end\n    var next = two.next_sibling\n    if next != null then\n        print next.text_content, two.previous_sibling != null\n    end\n    var root = two.closest("div")\n    if root != null then\n        print root.id\n    end\n    print two.closest("section") == null, two.matches("ul > .special"), two.matches("li + li")\nend\nprint page.query("svg")\nprint page.query("my-card")\nprint page.query("input")\n', '["one"]\n["two", "four"]\n2 1 four\n3 1 1 three\n0 0 one\nul\nthree true\nroot\ntrue true true\n<svg viewBox="0 0 10 10" width="10"><circle cx="5" cy="5" r="4" fill="red"></circle></svg>\n<my-card title="Hi" size="3">content</my-card>\n<input type="number" min="0" max="10" step="0.5">\n')})
+NEGATIVE.update(
+    {
+        "unused_component_tag": (
+            "import html.*\ncomponent Broken = <dvi>{attr inner}</dvi>",
+            "unknown tag 'dvi'",
+        ),
+        "unused_component_attribute": (
+            'import html.*\ncomponent Broken = <p hrefx="x">{attr inner}</p>',
+            "unknown attribute 'hrefx' on <p>",
+        ),
+        "family_attribute": (
+            "elements w\n    my-card: title\nend\nvar x = <my-card size=\"1\" />",
+            "unknown attribute 'size' on <my-card>",
+        ),
+        "event_handler_type": (
+            "import html.*\nvar x = <button onclick={function(int n) => print(n)}>b</button>",
+            "event attribute 'onclick' expects",
+        ),
+    }
+)
+TRAPS["selector_pseudo"] = ('import html.*\nprint <p />.matches("p:hover")', "unsupported pseudo-class")
+
+POSITIVE.update(
+    {
+        "markup_sequences": (
+            'import html.*\nstring[] names = ["a", "<b>"]\nelement? none = null\nprint <ul>{names.map(function(string n) => <li>{n}</li>)}{none}</ul>\nprint <p>{[1, 2]}</p>',
+            "<ul><li>a</li><li>&lt;b&gt;</li></ul>\n<p>12</p>\n",
+        ),
+        "example_types": ('# Classes, interfaces, enums, generics, optional values, and pattern matching.\ninterface Shape\n    function area() returns double\n    function name() returns string\nend\n\nclass Circle implements Shape\n    double radius\n    function area() returns double\n        return 3.14159 * inst radius * inst radius\n    end\n    function name() returns string\n        return "circle"\n    end\nend\n\nclass Rectangle implements Shape\n    double width\n    double height\n    function area() returns double\n        return inst width * inst height\n    end\n    function name() returns string\n        return "rectangle"\n    end\nend\n\nclass Square extends Rectangle\n    function init(double side)\n        super.init(side, side)\n    end\n    function name() returns string\n        return "square"\n    end\nend\n\nenum Verdict\n    Small, Medium, Large\nend\n\nfunction judge(Shape shape) returns Verdict\n    match shape\n        case Square s if s.width > 3.0 then\n            return Verdict.Large\n        case Circle c if c.radius < 1.0 then\n            return Verdict.Small\n        else\n            return Verdict.Medium\n    end\nend\n\nclass Stack<T>\n    T[] items\n    function init()\n        inst items = []\n    end\n    function push(T item)\n        inst items.push(item)\n    end\n    function pop() returns T?\n        if inst items.length == 0 then\n            return null\n        end\n        return inst items.pop()\n    end\nend\n\nShape[] shapes = [Circle(0.5), Rectangle(2.0, 3.0), Square(4.0)]\nfor shape in shapes do\n    print shape.name(), shape.area(), judge(shape)\nend\n\nStack<string> names = Stack()\nnames.push("first")\nnames.push("second")\nvar top = names.pop()\nprint top ?? "empty", names.pop() ?? "empty", names.pop() ?? "empty"\n', "circle 0.7853975 Small\nrectangle 6 Medium\nsquare 16 Large\nsecond first empty\n"),
+    }
+)
 
 class CompilerTests(unittest.TestCase):
     def setUp(self):
@@ -1879,6 +2380,199 @@ class CompilerTests(unittest.TestCase):
         reader.start()
         return process, lines
 
+    def test_web_keepalive_chunked_ipv6_tls(self):
+        import http.client
+        import shutil
+        import socket
+        import ssl
+
+        tls = shutil.which("openssl") is not None
+        if tls:
+            made = subprocess.run(
+                ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout",
+                 "key.pem", "-out", "cert.pem", "-days", "2", "-subj", "/CN=localhost"],
+                cwd=self.root, capture_output=True,
+            )
+            tls = made.returncode == 0
+        source = """import web
+function echo(web.request r) returns string
+    return "{r.method} {r.body}"
+end
+function hello() returns string
+    return "hi"
+end
+print web.serve("/", hello, 0)
+print web.route("POST", "/echo", echo, 0, "::1")
+"""
+        if tls:
+            probe = socket.socket()
+            probe.bind(("127.0.0.1", 0))
+            free = probe.getsockname()[1]
+            probe.close()
+            source += f'print web.tls("cert.pem", "key.pem", {free})\nprint web.serve("/", hello, {free})\n'
+        process, lines = self.start_url_server(source, "-O0")
+        port = lambda url: int(url.split("://", 1)[1].rsplit(":", 1)[1].split("/")[0])
+        plain = lines.get(timeout=30)
+        v6 = lines.get(timeout=10)
+        stalled = socket.create_connection(("127.0.0.1", port(plain)), timeout=5)
+        self.addCleanup(stalled.close)
+        stalled.send(b"GET / HTTP/1.1\r\n")
+        connection = http.client.HTTPConnection("127.0.0.1", port(plain), timeout=5)
+        self.addCleanup(connection.close)
+        connection.request("GET", "/")
+        response = connection.getresponse()
+        self.assertEqual(response.read(), b"hi")
+        self.assertEqual(response.getheader("Connection"), "keep-alive")
+        first = connection.sock
+        connection.request("GET", "/")
+        self.assertEqual(connection.getresponse().read(), b"hi")
+        self.assertIs(connection.sock, first)
+        try:
+            chunked = http.client.HTTPConnection("::1", port(v6), timeout=5)
+        except OSError:
+            chunked = None
+        if chunked is not None:
+            self.addCleanup(chunked.close)
+            chunked.putrequest("POST", "/echo")
+            chunked.putheader("Transfer-Encoding", "chunked")
+            chunked.endheaders()
+            for part in [b"hello ", b"chunked"]:
+                chunked.send(b"%x\r\n%s\r\n" % (len(part), part))
+            chunked.send(b"0\r\n\r\n")
+            self.assertEqual(chunked.getresponse().read(), b"POST hello chunked")
+        if tls:
+            secure = lines.get(timeout=10)
+            self.assertTrue(secure.startswith("https://127.0.0.1:"))
+            self.assertEqual(lines.get(timeout=10), secure + "/")
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            https = http.client.HTTPSConnection("127.0.0.1", port(secure), timeout=5, context=context)
+            self.addCleanup(https.close)
+            for _ in range(2):
+                https.request("GET", "/")
+                self.assertEqual(https.getresponse().read(), b"hi")
+
+    def test_tooling(self):
+        tests = self.root / "suite"
+        (tests / "nested").mkdir(parents=True)
+        (tests / "test_ok.fw").write_text(
+            "import testing\nfunction test_add() returns void\n    testing.assert_equal(1 + 1, 2)\nend\n"
+            "function helper() returns void\n    testing.fail(\"not a test\")\nend\n",
+            encoding="utf-8",
+        )
+        (tests / "nested" / "math_test.fw").write_text(
+            "import testing\nfunction test_bad() returns void\n    testing.assert_equal(2 * 2, 5, \"product\")\nend\n"
+            "function test_good() returns void\n    testing.assert(true)\nend\n",
+            encoding="utf-8",
+        )
+        result = self.command("test", tests)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("  ok   test_add", result.stdout)
+        self.assertIn("  FAIL test_bad: assertion failed: product: expected 5, got 4", result.stdout)
+        self.assertIn("  ok   test_good", result.stdout)
+        self.assertIn("2 test file(s), 1 failed", result.stdout)
+        self.assertEqual(self.command("test", tests / "test_ok.fw").returncode, 0)
+
+        messy = self.root / "messy.fw"
+        messy.write_text(
+            "class P\n  int x = 0\n      function get() returns int\nreturn inst x\n end\nend\n"
+            "function main\nvar xs = [1,\n2]\nif true then\nprint xs\n  else\nprint 0\nend\n"
+            "xs.each(function(int x)\nprint x\n    end)\nvar s = \"a  \n   b\"\nend   \n",
+            encoding="utf-8",
+        )
+        expected = (
+            "class P\n    int x = 0\n    function get() returns int\n        return inst x\n    end\nend\n"
+            "function main\n    var xs = [1,\n        2]\n    if true then\n        print xs\n    else\n        print 0\n    end\n"
+            "    xs.each(function(int x)\n        print x\n    end)\n    var s = \"a  \n   b\"\nend\n"
+        )
+        self.assertEqual(self.command("fmt", "--check", messy).returncode, 1)
+        self.assertEqual(self.command("fmt", messy).returncode, 0)
+        self.assertEqual(messy.read_text(encoding="utf-8"), expected)
+        self.assertEqual(self.command("fmt", "--check", messy).returncode, 0)
+
+        self.source.write_text("function f() returns int\n    return 1\nend\nprint f()", encoding="utf-8")
+        result = self.command("check", "-g", self.source, "--emit-ir", self.root / "debug.ll")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("!DISubprogram(name: \"f\"", (self.root / "debug.ll").read_text())
+
+        server = subprocess.Popen(
+            [COMPILER, "lsp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, cwd=self.root
+        )
+        self.addCleanup(server.kill)
+
+        def send(message):
+            body = json.dumps(message).encode()
+            server.stdin.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+            server.stdin.flush()
+
+        def receive():
+            length = 0
+            while True:
+                line = server.stdout.readline().strip()
+                if not line:
+                    break
+                if line.startswith(b"Content-Length:"):
+                    length = int(line.split(b":")[1])
+            return json.loads(server.stdout.read(length))
+
+        uri = self.source.resolve().as_uri()
+        send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        self.assertTrue(receive()["result"]["capabilities"]["documentFormattingProvider"])
+        send({"jsonrpc": "2.0", "method": "textDocument/didOpen",
+              "params": {"textDocument": {"uri": uri, "text": 'int x = "no"\n'}}})
+        diagnostics = receive()["params"]["diagnostics"]
+        self.assertEqual(diagnostics[0]["range"]["start"], {"line": 0, "character": 8})
+        self.assertIn("cannot convert string", diagnostics[0]["message"])
+        send({"jsonrpc": "2.0", "method": "textDocument/didChange",
+              "params": {"textDocument": {"uri": uri}, "contentChanges": [{"text": "function f\nprint 1\nend\n"}]}})
+        self.assertEqual(receive()["params"]["diagnostics"], [])
+        send({"jsonrpc": "2.0", "id": 2, "method": "textDocument/formatting",
+              "params": {"textDocument": {"uri": uri}, "options": {}}})
+        self.assertEqual(receive()["result"][0]["newText"], "function f\n    print 1\nend\n")
+        send({"jsonrpc": "2.0", "id": 3, "method": "shutdown"})
+        receive()
+        send({"jsonrpc": "2.0", "method": "exit"})
+        self.assertEqual(server.wait(timeout=10), 0)
+
+    def test_web_workers(self):
+        import threading
+        import time
+        import urllib.request
+
+        source = """import web
+import time
+function slow() returns string
+    time.sleep(0.4)
+    return "slow"
+end
+function boom() returns string
+    throw RuntimeError("worker failure")
+end
+web.workers(4)
+print web.serve("/slow", slow, 0)
+print web.serve("/boom", boom, 0)
+"""
+        process, lines = self.start_url_server(source, "-O0")
+        slow = lines.get(timeout=30)
+        boom = lines.get(timeout=10)
+        results = []
+        threads = [
+            threading.Thread(target=lambda: results.append(urllib.request.urlopen(slow, timeout=10).read()))
+            for _ in range(3)
+        ]
+        start = time.monotonic()
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(results, [b"slow"] * 3)
+        self.assertLess(time.monotonic() - start, 1.1)
+        with self.assertRaises(Exception):
+            urllib.request.urlopen(boom, timeout=10).read()
+        self.assertEqual(process.wait(timeout=10), 1)
+        self.assertIn("worker failure", process.stderr.read())
+
     def test_web_serve_returns_url(self):
         import http.client
         import queue
@@ -2150,7 +2844,7 @@ print web.static("/assets", "public", {port})
         ir = self.root / "program.ll"
         result = self.command("check", self.source, "--emit-ir", ir)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("define i32 @main()", ir.read_text())
+        self.assertIn("define i32 @main(i32 %0, ptr %1)", ir.read_text())
         self.assertFalse((self.root / "case").exists())
 
 

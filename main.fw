@@ -1,1 +1,5 @@
-print "test"
+import desktop
+
+var window = (desktop.window)
+
+print window

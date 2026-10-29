@@ -12,6 +12,34 @@ bool start(unsigned char c) {
 bool part(unsigned char c) {
     return std::isalnum(c) || c == '_';
 }
+// Decodes the UTF-8 scalar at p (source is validated before tokenization).
+unsigned scalarAt(const std::string &s, size_t p, size_t &length) {
+    auto c = static_cast<unsigned char>(s[p]);
+    length = c < 0x80 ? 1 : c < 0xe0 ? 2 : c < 0xf0 ? 3 : 4;
+    unsigned value = length == 1 ? c : c & (0x3f >> (length - 1));
+    for (size_t i = 1; i < length && p + i < s.size(); ++i)
+        value = (value << 6) | (static_cast<unsigned char>(s[p + i]) & 63);
+    return value;
+}
+// Identifiers may use non-ASCII letters. Punctuation, symbol, and emoji blocks are rejected;
+// spellings are compared by exact UTF-8 bytes (no normalization).
+bool letterScalar(unsigned v) {
+    if (v < 0x80)
+        return std::isalpha(static_cast<int>(v)) || v == '_';
+    return !(v <= 0xbf || v == 0xd7 || v == 0xf7 || (v >= 0x2000 && v <= 0x2bff) ||
+             (v >= 0x3000 && v <= 0x303f) || (v >= 0xfe30 && v <= 0xfe4f) ||
+             (v >= 0xff00 && v <= 0xff20) || (v >= 0x1f000 && v <= 0x1faff));
+}
+size_t identifierEnd(const std::string &s, size_t p) {
+    while (p < s.size()) {
+        size_t length;
+        auto v = scalarAt(s, p, length);
+        if (!(letterScalar(v) || (v < 0x80 && std::isdigit(static_cast<int>(v)))))
+            break;
+        p += length;
+    }
+    return p;
+}
 // A tag header also starts an argument after a callable, where '<' could otherwise
 // be a comparison. Inspect only the header prefix, never search ahead for a closing
 // tag: a later markup statement must not change how 'a <b' is tokenized.
@@ -123,15 +151,22 @@ int precedence(const std::string &s) {
         return 2;
     if (s == "==" || s == "!=")
         return 3;
-    if (s == "<" || s == ">" || s == "<=" || s == ">=" || s == "in")
+    if (s == "<" || s == ">" || s == "<=" || s == ">=" || s == "in" || s == "is")
         return 4;
-    if (s == ".." || s == "..<")
+    if (s == "as")
+        return 9;
+    if (s == "??")
         return 5;
-    if (s == "+" || s == "-")
+    if (s == ".." || s == "..<")
         return 6;
-    if (s == "*" || s == "/" || s == "//" || s == "%")
+    if (s == "+" || s == "-")
         return 7;
+    if (s == "*" || s == "/" || s == "//" || s == "%")
+        return 8;
     return 0;
+}
+bool comparison(const std::string &s) {
+    return s == "==" || s == "!=" || s == "<" || s == ">" || s == "<=" || s == ">=";
 }
 void utf8(std::string &out, unsigned value, Location l) {
     if (value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff))
@@ -233,7 +268,8 @@ std::vector<Token> lex(const std::string &source) {
         }
     };
     auto emit = [&](std::string kind, std::string text, size_t end) {
-        out.push_back({std::move(text), std::move(kind), loc, group});
+        bool spaced = p == 0 || std::isspace(static_cast<unsigned char>(source[p - 1]));
+        out.push_back({std::move(text), std::move(kind), loc, group, spaced});
         advance(end);
     };
     while (p < source.size()) {
@@ -247,12 +283,56 @@ std::vector<Token> lex(const std::string &source) {
             advance(e == std::string::npos ? source.size() : e);
             continue;
         }
+        if (c == '\\') {
+            // Explicit continuation: a backslash ending the line joins it with the next one.
+            auto e = source.find_first_not_of(" \t\r", p + 1);
+            if (e != std::string::npos && source[e] == '#')
+                e = source.find('\n', e);
+            if (e == std::string::npos || source[e] != '\n')
+                throw Error(loc, "'\\' continues a line only at the end of the line");
+            advance(e + 1);
+            continue;
+        }
         if (c == '\n' || c == ';') {
+            // A line ending in a binary operator, comma, or '=' continues on the next line.
+            if (c == '\n' && !group && !out.empty()) {
+                auto &last = out.back();
+                static const std::set<std::string> joins = {
+                    "+",  "-",  "*",  "/",  "//", "%",  "==", "!=", "<=", ">=", "=",  "+=",
+                    "-=", "*=", "/=", "//=", "%=", "..", "..<", ",",  "=>", "??"};
+                bool wildcard = last.text == "*" && out.size() > 1 &&
+                                (out[out.size() - 2].text == "." || out[out.size() - 2].text == ":");
+                if ((last.kind == "op" && joins.count(last.text) && !wildcard) ||
+                    (last.kind == "id" && (last.text == "and" || last.text == "or"))) {
+                    advance(p + 1);
+                    continue;
+                }
+            }
             // Grouped newlines are kept with their depth; the parser ignores them except
             // inside a lambda body that starts at that depth.
             if (!group)
                 expected = true;
             emit("nl", "\n", p + 1);
+            continue;
+        }
+        if (c == '\'') {
+            // Character literal: one Unicode scalar or one string escape.
+            size_t e = p + 1;
+            if (e < source.size() && source[e] == '\\') {
+                if (e + 1 < source.size() && source[e + 1] == 'u') {
+                    auto close = source.find('}', e);
+                    e = close == std::string::npos ? source.size() : close + 1;
+                } else
+                    e += 2;
+            } else if (e < source.size() && source[e] != '\'' && source[e] != '\n') {
+                size_t length;
+                scalarAt(source, e, length);
+                e += length;
+            }
+            if (e >= source.size() || source[e] != '\'' || e == p + 1)
+                throw Error(loc, "character literals hold exactly one character, such as 'a'");
+            emit("char", source.substr(p + 1, e - p - 1), e + 1);
+            expected = false;
             continue;
         }
         if (c == '"') {
@@ -261,10 +341,14 @@ std::vector<Token> lex(const std::string &source) {
             expected = false;
             continue;
         }
-        bool genericType = !out.empty() && out.back().kind == "id" &&
-                           (out.back().text == "array" || out.back().text == "tuple" ||
-                            out.back().text == "map" || out.back().text == "Result" ||
-                            out.back().text == "weak");
+        // '<' directly after an identifier (no space) opens type arguments, never markup.
+        bool adjacent = p > 0 && !out.empty() && out.back().kind == "id" &&
+                        (part(static_cast<unsigned char>(source[p - 1])) ||
+                         static_cast<unsigned char>(source[p - 1]) >= 0x80);
+        bool genericType = adjacent || (!out.empty() && out.back().kind == "id" &&
+                                        (out.back().text == "array" || out.back().text == "tuple" ||
+                                         out.back().text == "map" || out.back().text == "set" ||
+                                         out.back().text == "Result" || out.back().text == "weak"));
         if (c == '<' && !genericType && (expected || markupArgumentStart(source, p)) &&
             p + 1 < source.size() && (start(source[p + 1]) || source[p + 1] == '>')) {
             auto end = markupEnd(source, p);
@@ -272,10 +356,9 @@ std::vector<Token> lex(const std::string &source) {
             expected = false;
             continue;
         }
-        if (start(c)) {
-            size_t e = p + 1;
-            while (e < source.size() && part(source[e]))
-                ++e;
+        size_t scalarLength;
+        if (letterScalar(scalarAt(source, p, scalarLength))) {
+            size_t e = identifierEnd(source, p);
             auto s = source.substr(p, e - p);
             emit("id", s, e);
             expected = s == "return" || s == "then" || s == "do" || s == "and" || s == "or" ||
@@ -310,17 +393,19 @@ std::vector<Token> lex(const std::string &source) {
             continue;
         }
         std::string op(1, c);
-        if (p + 1 < source.size()) {
+        if (source.compare(p, 3, "//=") == 0)
+            op = "//=";
+        else if (p + 1 < source.size()) {
             auto two = source.substr(p, 2);
             if (two == "==" || two == "!=" || two == "<=" || two == ">=" || two == "+=" ||
                 two == "-=" || two == "*=" || two == "/=" || two == "%=" || two == "//" ||
-                two == ".." || two == "=>")
+                two == ".." || two == "=>" || two == "??")
                 op = two;
         }
         if (op == ".." && p + 2 < source.size() && source[p + 2] == '<')
             op = "..<";
         if (std::string("+-*/%=!<>()[]{}.,?:").find(c) == std::string::npos)
-            throw Error(loc, "invalid character (identifiers currently use ASCII)");
+            throw Error(loc, "invalid character");
         if (c == '(' || c == '[' || c == '{')
             ++group;
         if (c == ')' || c == ']' || c == '}') {
@@ -375,7 +460,9 @@ Token Parser::identifier() {
         "returns", "return",  "if",   "then",  "else",     "while",    "do",
         "for",     "in",      "end",  "break", "continue", "try",      "catch",
         "finally", "throw",   "inst", "attr",  "true",     "false",    "null",
-        "public",  "private", "void", "weak",  "and",      "or",       "not"};
+        "public",  "private", "void", "weak",  "and",      "or",       "not",
+        "enum",    "interface", "extends", "implements", "match", "case", "super", "is",
+        "elements"};
     if (t.kind != "id" || reserved.count(t.text))
         throw Error(t.loc, "expected identifier");
     return t;
@@ -438,7 +525,32 @@ std::string Parser::type() {
     }
     return r;
 }
+std::string Parser::markupName() {
+    auto first = take();
+    if (first.kind != "id")
+        throw Error(first.loc, "expected a tag or attribute name");
+    std::string name = first.text;
+    // Names continue across '-', ':' and identifier tokens written without spaces.
+    while (!peek().spaced && (peek().text == "-" || peek().text == ":") &&
+           !tokens[index(1)].spaced && tokens[index(1)].kind == "id") {
+        name += take().text;
+        name += take().text;
+    }
+    return name;
+}
+std::vector<std::string> Parser::typeParameters() {
+    std::vector<std::string> names;
+    if (!accept("<"))
+        return names;
+    do {
+        names.push_back(identifier().text);
+    } while (accept(","));
+    expect(">");
+    return names;
+}
 bool Parser::typedDeclaration() {
+    if (peek().text == "inst" || peek().text == "attr" || peek().text == "super")
+        return false;
     size_t i = pos;
     try {
         type();
@@ -654,13 +766,23 @@ EP Parser::prefix() {
     } else if (t.kind == "int" || t.kind == "real") {
         take();
         e = node(t.kind, t.text, t.loc);
+    } else if (t.kind == "char") {
+        take();
+        auto text = stringExpr({t.text, "string", t.loc});
+        if (text->kind != "string" || text->text.empty())
+            throw Error(t.loc, "character literals cannot interpolate");
+        size_t length;
+        scalarAt(text->text, 0, length);
+        if (length != text->text.size())
+            throw Error(t.loc, "character literals hold exactly one character, such as 'a'");
+        e = node("char", text->text, t.loc);
     } else if (accept("true") || accept("false"))
         e = node("bool", t.text, t.loc);
     else if (accept("null"))
         e = node("null", "", t.loc);
     else if (accept("-") || accept("+") || accept("not")) {
         e = node("unary", t.text, t.loc);
-        e->args.push_back(expression(t.text == "not" ? 2 : 8));
+        e->args.push_back(expression(t.text == "not" ? 2 : 9));
         return e;
     } else if (accept("(")) {
         e = expression();
@@ -675,17 +797,27 @@ EP Parser::prefix() {
             expect("]");
         }
     } else if (accept("{")) {
+        // {k: v, ...} is a map literal and {a, b, ...} a set literal; {} is an empty map or set.
         e = node("map", "", t.loc);
         if (!accept("}")) {
-            do {
+            e->args.push_back(expression());
+            if (!accept(":"))
+                e->kind = "set";
+            else
                 e->args.push_back(expression());
-                expect(":");
+            while (accept(",")) {
                 e->args.push_back(expression());
-            } while (accept(","));
+                if (e->kind == "map") {
+                    expect(":");
+                    e->args.push_back(expression());
+                }
+            }
             expect("}");
         }
     } else if (accept("inst") || accept("attr")) {
         e = node(t.text, identifier().text, t.loc);
+    } else if (accept("super")) {
+        e = node("super", "", t.loc);
     } else if (t.kind == "id" && t.text == "function" && peek(1).text == "(") {
         e = lambda();
     } else if (t.kind == "id" && t.text == "weak" && peek(1).text == "(") {
@@ -696,21 +828,20 @@ EP Parser::prefix() {
             "function", "class", "component", "import",   "public", "private", "returns",
             "return",   "if",    "then",      "else",     "while",  "do",      "for",
             "in",       "end",   "break",     "continue", "try",    "catch",   "finally",
-            "throw",    "as",    "void",      "weak",     "and",    "or"};
+            "throw",    "as",    "void",      "weak",     "and",    "or",      "enum",
+            "interface", "extends", "implements", "match", "case",  "is"};
         if (structural.count(t.text))
             throw Error(t.loc, "unexpected keyword '" + t.text + "' in expression");
         take();
-        if ((t.text == "array" || t.text == "tuple" || t.text == "map") && peek().text == "<") {
-            --pos;
-            e = node("name", type(), t.loc);
-        } else
-            e = node("name", t.text, t.loc);
+        static const std::set<std::string> builtinGenerics = {"array", "tuple", "map",
+                                                              "set",   "Result", "weak"};
+        e = node("name", t.text + typeArguments(builtinGenerics.count(t.text) > 0), t.loc);
     } else
         throw Error(t.loc, "expected expression, got '" + t.text + "'");
     while (true) {
         if (accept(".")) {
             auto m = identifier();
-            auto n = node("member", m.text, m.loc);
+            auto n = node("member", m.text + typeArguments(), m.loc);
             n->args.push_back(std::move(e));
             e = std::move(n);
         } else if (accept("(")) {
@@ -734,10 +865,48 @@ EP Parser::prefix() {
     }
     return e;
 }
+// `name<T, U>` written without a space before '<' supplies type arguments. Parsing is speculative:
+// `i<n do` is still a comparison because `n do` is not a type argument list.
+std::string Parser::typeArguments(bool allowSpace) {
+    if (peek().text != "<" || (peek().spaced && !allowSpace) || peek().kind != "op")
+        return "";
+    auto saved = pos;
+    try {
+        take();
+        std::string out = "<" + type();
+        while (accept(","))
+            out += "," + type();
+        expect(">");
+        return out + ">";
+    } catch (const Error &) {
+        pos = saved;
+        return "";
+    }
+}
 EP Parser::expression(int level) {
     auto e = prefix();
     while ((peek().kind == "op" || peek().kind == "id") && precedence(peek().text) > level) {
+        if (peek().text == "is" || peek().text == "as") {
+            // x is Type tests a runtime class; x as Type is a checked downcast.
+            auto op = take();
+            auto n = node(op.text, type(), op.loc);
+            n->args.push_back(std::move(e));
+            e = std::move(n);
+            continue;
+        }
         auto op = take();
+        // a < b <= c chains as a < b and b <= c, evaluating b once.
+        if (comparison(op.text) && !e->grouped && (e->kind == "binary" || e->kind == "chain") &&
+            comparison(e->kind == "chain" ? e->names.back() : e->text) &&
+            precedence(e->kind == "chain" ? e->names.back() : e->text) == precedence(op.text)) {
+            if (e->kind == "binary") {
+                e->kind = "chain";
+                e->names.push_back(e->text);
+            }
+            e->names.push_back(op.text);
+            e->args.push_back(expression(precedence(op.text)));
+            continue;
+        }
         auto n = node("binary", op.text, op.loc);
         n->args.push_back(std::move(e));
         n->args.push_back(expression(precedence(op.text)));
@@ -761,7 +930,7 @@ EP Parser::outer() {
         e = expression();
     auto k = peek().kind;
     if ((e->kind == "name" || e->kind == "member") &&
-        (k == "id" || k == "int" || k == "real" || k == "string" || k == "markup" ||
+        (k == "id" || k == "int" || k == "real" || k == "string" || k == "char" || k == "markup" ||
          peek().text == "[" || (callable && (peek().text == "-" || peek().text == "+")))) {
         auto n = node("call", "", e->loc);
         n->args.push_back(std::move(e));
@@ -771,7 +940,7 @@ EP Parser::outer() {
         const auto &last = *n->args.back();
         if ((last.kind == "name" || last.kind == "member") &&
             (peek().kind == "id" || peek().kind == "int" || peek().kind == "real" ||
-             peek().kind == "string" || peek().kind == "markup"))
+             peek().kind == "string" || peek().kind == "char" || peek().kind == "markup"))
             throw Error(peek().loc, "nested calls require parentheses around their arguments");
         e = std::move(n);
     }
@@ -782,7 +951,7 @@ std::vector<SP> Parser::block() {
     std::vector<SP> out;
     newlines();
     while (peek().kind != "eof" && peek().text != "end" && peek().text != "else" &&
-           peek().text != "catch" && peek().text != "finally")
+           peek().text != "catch" && peek().text != "finally" && peek().text != "case")
         out.push_back(statement());
     return out;
 }
@@ -848,6 +1017,48 @@ SP Parser::statement() {
         finish();
         return s;
     }
+    if (accept("match")) {
+        s->kind = "match";
+        s->expr = expression();
+        finish();
+        while (accept("case")) {
+            // A type pattern is `Type name`; anything else is a list of values to compare.
+            auto saved = pos;
+            std::string patternType, binding;
+            try {
+                patternType = type();
+                binding = identifier().text;
+                if (peek().text != "then" && peek().text != "if")
+                    throw Error(peek().loc, "pattern");
+            } catch (const Error &) {
+                pos = saved;
+                patternType.clear();
+                binding.clear();
+            }
+            std::vector<EP> values;
+            if (patternType.empty())
+                do {
+                    values.push_back(expression());
+                } while (accept(","));
+            s->catchTypes.push_back(patternType);
+            s->catchNames.push_back(binding);
+            s->patterns.push_back(std::move(values));
+            s->guards.push_back(accept("if") ? expression() : nullptr);
+            expect("then");
+            finish();
+            s->catches.push_back(block());
+        }
+        if (accept("else")) {
+            s->op = "else";
+            finish();
+            s->other = block();
+        }
+        if (s->catches.empty() && s->op.empty())
+            throw Error(s->loc, "match requires at least one case");
+        expect("end");
+        finish();
+        return s;
+    }
     if (accept("while")) {
         s->kind = "while";
         s->expr = expression();
@@ -865,6 +1076,8 @@ SP Parser::statement() {
                 peek().loc,
                 "use 'for item in items do'; parentheses are not allowed around the binding");
         s->name = identifier().text;
+        if (accept(","))
+            s->op = identifier().text; // for key, value in map / for index, item in array
         expect("in");
         s->expr = expression();
         expect("do");
@@ -900,7 +1113,7 @@ SP Parser::statement() {
     }
     s->target = outer();
     if (peek().text == "=" || peek().text == "+=" || peek().text == "-=" || peek().text == "*=" ||
-        peek().text == "/=" || peek().text == "%=") {
+        peek().text == "/=" || peek().text == "//=" || peek().text == "%=") {
         s->kind = "assign";
         s->op = take().text;
         s->expr = outer();
@@ -951,12 +1164,13 @@ EP Parser::lambda() {
     e->lambda = std::move(f);
     return e;
 }
-Function Parser::function(const std::string &owner) {
+Function Parser::function(const std::string &owner, bool signatureOnly) {
     auto t = expect("function");
     Function f;
     f.loc = t.loc;
     f.owner = owner;
     f.name = identifier().text;
+    f.typeParams = typeParameters();
     if (accept("(")) {
         if (!accept(")")) {
             do {
@@ -976,6 +1190,12 @@ Function Parser::function(const std::string &owner) {
     if (accept("returns"))
         f.result = type();
     finish();
+    if (signatureOnly) {
+        f.abstract = true;
+        if (f.result.empty())
+            f.result = "void";
+        return f;
+    }
     f.body = block();
     expect("end");
     finish();
@@ -986,7 +1206,8 @@ Program Parser::parse() {
     newlines();
     while (peek().kind != "eof") {
         bool hidden = accept("private"), visible = !hidden && accept("public");
-        size_t nf = p.functions.size(), nc = p.classes.size(), nb = p.body.size();
+        size_t nf = p.functions.size(), nc = p.classes.size(), nb = p.body.size(),
+               ne = p.enums.size();
         std::set<std::string> components;
         for (auto &[name, e] : p.components) {
             (void)e;
@@ -1015,6 +1236,8 @@ Program Parser::parse() {
                 p.wildcards.insert(alias);
             if (wildcard && name == "html")
                 p.html = true;
+            if (wildcard && name == "svg")
+                p.svg = true;
             if (p.imports.count(alias))
                 throw Error(peek().loc, "duplicate import '" + alias + "'");
             p.imports[alias] = name;
@@ -1023,14 +1246,69 @@ Program Parser::parse() {
             finish();
         } else if (peek().text == "function" && peek(1).text != "(")
             p.functions.push_back(function());
-        else if (accept("class")) {
+        else if (accept("enum")) {
+            Enum en;
+            en.loc = peek().loc;
+            en.name = identifier().text;
+            finish();
+            while (peek().text != "end" && peek().kind != "eof") {
+                auto member = identifier();
+                if (std::find(en.members.begin(), en.members.end(), member.text) != en.members.end())
+                    throw Error(member.loc, "duplicate enum member '" + member.text + "'");
+                en.members.push_back(member.text);
+                if (!accept(","))
+                    finish();
+                newlines();
+            }
+            if (en.members.empty())
+                throw Error(en.loc, "enum requires at least one member");
+            expect("end");
+            finish();
+            p.enums.push_back(std::move(en));
+        } else if (accept("elements")) {
+            ElementFamily family;
+            family.loc = peek().loc;
+            family.name = identifier().text;
+            finish();
+            while (peek().text != "end" && peek().kind != "eof") {
+                auto location = peek().loc;
+                auto tag = markupName();
+                FamilyTag info;
+                if (accept("void"))
+                    info.isVoid = true;
+                if (accept(":")) {
+                    if (accept("*"))
+                        info.anyAttribute = true;
+                    else
+                        do {
+                            info.attributes.insert(markupName());
+                        } while (accept(","));
+                }
+                if (!family.tags.emplace(tag, std::move(info)).second)
+                    throw Error(location, "duplicate tag '" + tag + "' in element family");
+                finish();
+            }
+            expect("end");
+            finish();
+            p.families.push_back(std::move(family));
+        } else if (peek().text == "class" || peek().text == "interface") {
             Class c;
+            c.isInterface = take().text == "interface";
             c.loc = peek().loc;
             c.name = identifier().text;
+            c.typeParams = typeParameters();
+            if (!c.isInterface && accept("extends"))
+                c.base = type();
+            if (accept(c.isInterface ? "extends" : "implements"))
+                do {
+                    c.interfaces.push_back(type());
+                } while (accept(","));
             finish();
             while (peek().text != "end" && peek().kind != "eof") {
                 if (peek().text == "function" && peek(1).text != "(")
-                    c.methods.push_back(function(c.name));
+                    c.methods.push_back(function(c.name, c.isInterface));
+                else if (c.isInterface)
+                    throw Error(peek().loc, "interfaces declare only function signatures");
                 else {
                     Param field;
                     field.loc = peek().loc;
@@ -1059,6 +1337,8 @@ Program Parser::parse() {
             declared = p.functions.back().name;
         else if (p.classes.size() > nc)
             declared = p.classes.back().name;
+        else if (p.enums.size() > ne)
+            declared = p.enums.back().name;
         else if (p.body.size() > nb && p.body.back()->kind == "declare")
             declared = p.body.back()->name;
         else
@@ -1071,5 +1351,84 @@ Program Parser::parse() {
             p.privateNames.insert(declared);
     }
     return p;
+}
+EP clone(const Expr &e) {
+    auto out = std::make_unique<Expr>();
+    out->kind = e.kind;
+    out->text = e.text;
+    out->grouped = e.grouped;
+    out->outer = e.outer;
+    out->loc = e.loc;
+    out->names = e.names;
+    for (auto &a : e.args)
+        out->args.push_back(a ? clone(*a) : nullptr);
+    if (e.lambda)
+        out->lambda = std::make_shared<Function>(clone(*e.lambda));
+    return out;
+}
+namespace {
+std::vector<SP> cloneBody(const std::vector<SP> &body) {
+    std::vector<SP> out;
+    for (auto &s : body)
+        out.push_back(clone(*s));
+    return out;
+}
+std::vector<Param> cloneParams(const std::vector<Param> &params) {
+    std::vector<Param> out;
+    for (auto &p : params)
+        out.push_back({p.name, p.type, p.value ? clone(*p.value) : nullptr, p.loc});
+    return out;
+}
+} // namespace
+SP clone(const Stmt &s) {
+    auto out = std::make_unique<Stmt>();
+    out->kind = s.kind;
+    out->name = s.name;
+    out->type = s.type;
+    out->op = s.op;
+    out->loc = s.loc;
+    out->expr = s.expr ? clone(*s.expr) : nullptr;
+    out->target = s.target ? clone(*s.target) : nullptr;
+    out->body = cloneBody(s.body);
+    out->other = cloneBody(s.other);
+    out->finalizer = cloneBody(s.finalizer);
+    out->catchTypes = s.catchTypes;
+    out->catchNames = s.catchNames;
+    for (auto &c : s.catches)
+        out->catches.push_back(cloneBody(c));
+    for (auto &values : s.patterns) {
+        std::vector<EP> copy;
+        for (auto &v : values)
+            copy.push_back(clone(*v));
+        out->patterns.push_back(std::move(copy));
+    }
+    for (auto &g : s.guards)
+        out->guards.push_back(g ? clone(*g) : nullptr);
+    return out;
+}
+Function clone(const Function &f) {
+    Function out;
+    out.name = f.name;
+    out.result = f.result;
+    out.owner = f.owner;
+    out.loc = f.loc;
+    out.params = cloneParams(f.params);
+    out.body = cloneBody(f.body);
+    out.abstract = f.abstract;
+    out.typeParams = f.typeParams;
+    return out;
+}
+Class clone(const Class &c) {
+    Class out;
+    out.name = c.name;
+    out.base = c.base;
+    out.loc = c.loc;
+    out.fields = cloneParams(c.fields);
+    for (auto &m : c.methods)
+        out.methods.push_back(clone(m));
+    out.interfaces = c.interfaces;
+    out.typeParams = c.typeParams;
+    out.isInterface = c.isInterface;
+    return out;
 }
 } // namespace fw

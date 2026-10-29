@@ -1,0 +1,40 @@
+# Parallel work with tasks, a channel, and a mutex.
+import thread
+
+function count_primes(int low, int high) returns int
+    int found = 0
+    for n in low..<high do
+        bool prime = n > 1
+        int d = 2
+        while d * d <= n and prime do
+            if n % d == 0 then
+                prime = false
+            end
+            d += 1
+        end
+        if prime then
+            found += 1
+        end
+    end
+    return found
+end
+
+thread.task<int>[] parts = []
+for i in 0..<4 do
+    parts.push(thread.spawn(function() => count_primes(i * 25000, (i + 1) * 25000)))
+end
+print "primes below 100000:", parts.map(function(thread.task<int> t) => t.join()).reduce(0, function(int a, int b) => a + b)
+
+thread.channel<string> messages = thread.channel()
+var sender = thread.spawn(function()
+    for word in ["ready", "steady", "go"] do
+        messages.send(word)
+    end
+    messages.close()
+end)
+var message = messages.receive()
+while message != null do
+    print message
+    message = messages.receive()
+end
+sender.join()

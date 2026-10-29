@@ -4,6 +4,8 @@
 #include <cmath>
 #include <limits>
 #include <llvm/Config/llvm-config.h>
+#include <llvm/BinaryFormat/Dwarf.h>
+#include <llvm/IR/DIBuilder.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/LegacyPassManager.h>
@@ -17,6 +19,9 @@
 #include <llvm/Target/TargetOptions.h>
 #include <llvm/TargetParser/Host.h>
 #include <optional>
+#include <deque>
+#include <filesystem>
+#include <functional>
 #include <set>
 #include <unordered_map>
 
@@ -92,9 +97,18 @@ std::vector<std::string> typeParts(const std::string &text) {
 const std::set<std::string> errorTypes = {
     "Error",         "RuntimeError",   "FileError",    "IndexError",  "KeyError",
     "NumericError",  "AssertionError", "JsonError",    "ResultError", "CastError",
-    "SelectorError", "InputError",     "ProcessError", "DesktopError"};
+    "SelectorError", "InputError",     "ProcessError", "DesktopError", "RegexError",
+    "NetworkError"};
+// Enum type names; enum values are i64 member indices.
+std::set<std::string> &enumNames() {
+    static std::set<std::string> names;
+    return names;
+}
 struct Ty {
     std::string name = "void";
+    bool enumeration() const {
+        return enumNames().count(name) > 0;
+    }
     bool operator==(const Ty &t) const {
         return name == t.name;
     }
@@ -132,6 +146,9 @@ struct Ty {
     bool map() const {
         return name.rfind("map<", 0) == 0 && name.back() == '>';
     }
+    bool set() const {
+        return name.rfind("set<", 0) == 0 && name.back() == '>';
+    }
     bool result() const {
         return name.rfind("Result<", 0) == 0 && name.back() == '>';
     }
@@ -158,7 +175,8 @@ struct Ty {
         return name == "float" ? 32 : 64;
     }
     bool object() const {
-        return !numeric() && name != "bool" && name != "void" && name.rfind("fn:", 0) != 0 &&
+        return !numeric() && name != "bool" && name != "char" && name != "void" &&
+               !enumeration() && name.rfind("fn:", 0) != 0 &&
                name.rfind("module:", 0) != 0 && !classReference();
     }
     bool classReference() const {
@@ -175,7 +193,23 @@ struct Var {
     bool constant = false;
     llvm::Value *initialized = nullptr;
     bool captured = false;
+    // A narrowed view of a nullable variable (after `x != null`): `type` is the non-null type,
+    // `storage` the declared one. Reads are null-checked. Only owners release at scope exit.
+    bool narrowed = false, owner = true;
+    // Narrowed by `x is T`; writes are rejected. Globals can change during calls, so their
+    // narrowed reads re-check the class (`checked`).
+    bool typeNarrowed = false, checked = false;
+    // A variable that lambdas capture and someone assigns lives in a shared heap cell
+    // (a one-slot Box) so every closure and the declaring scope see the same value.
+    bool cell = false;
+    Ty storage = Ty{};
 };
+bool primitive(const Ty &t) {
+    return t.numeric() || t.name == "bool" || t.name == "char" || t.enumeration();
+}
+Ty nonNull(const Ty &t) {
+    return t.nullable() && t.name != "null" ? Ty{t.name.substr(0, t.name.size() - 1)} : t;
+}
 // A lambda being compiled. Enclosing locals it reads are copied into its environment.
 struct LambdaContext {
     std::vector<std::map<std::string, Var>> *outerScopes = nullptr;
@@ -203,6 +237,14 @@ class Compiler {
     std::map<std::string, Var> globals;
     std::map<std::string, Signature> functions;
     std::map<std::string, Class *> classes;
+    std::map<std::string, Enum *> enums;
+    std::map<std::string, int64_t> enumIds;
+    std::map<std::string, Class *> templates;
+    std::map<std::string, Function *> functionTemplates;
+    std::deque<Class> instances;
+    std::deque<Function> functionInstances;
+    std::map<std::string, int> classStates; // 1 while flattening, 2 when complete
+    std::map<std::string, llvm::Constant *> classIds;
     std::vector<std::pair<llvm::BasicBlock *, llvm::BasicBlock *>> loops;
     std::vector<std::map<std::string, Val>> attrs;
     std::set<std::string> componentStack;
@@ -235,7 +277,46 @@ class Compiler {
     };
     std::vector<ProtectedValue> protectedValues;
     std::vector<LambdaContext *> lambdaStack;
+    std::set<std::string> cells; // locals of the current function stored in shared cells
     std::map<std::string, llvm::Function *> trampolines;
+    // -g: DWARF line tables for user functions, lambdas, and the program body.
+    std::unique_ptr<llvm::DIBuilder> dib;
+    llvm::DICompileUnit *unit = nullptr;
+    std::map<std::string, llvm::DIFile *> debugFiles;
+    std::string mainFile;
+    llvm::DIFile *debugFile(const std::string &path) {
+        auto name = path.empty() ? mainFile : path;
+        auto &file = debugFiles[name];
+        if (!file) {
+            auto native = std::filesystem::path(name);
+            file = dib->createFile(native.filename().string(), native.parent_path().string());
+        }
+        return file;
+    }
+    void debugFunction(llvm::Function *f, const std::string &name, Location loc) {
+        if (!dib)
+            return;
+        auto file = debugFile(loc.file);
+        auto line = static_cast<unsigned>(std::max(1, loc.line));
+        auto type = dib->createSubroutineType(dib->getOrCreateTypeArray({}));
+        f->setSubprogram(dib->createFunction(file, displayName(name), f->getName(), file, line,
+                                             type, line, llvm::DINode::FlagZero,
+                                             llvm::DISubprogram::SPFlagDefinition));
+        debugLocation();
+    }
+    // Points the builder at `location` inside the current function's subprogram, if any.
+    void debugLocation() {
+        if (!dib)
+            return;
+        auto scope = current ? current->getSubprogram() : nullptr;
+        if (!scope) {
+            b.SetCurrentDebugLocation(llvm::DebugLoc());
+            return;
+        }
+        b.SetCurrentDebugLocation(llvm::DILocation::get(
+            ctx, static_cast<unsigned>(std::max(1, location.line)),
+            static_cast<unsigned>(std::max(0, location.column)), scope));
+    }
     uint64_t lambdaCount = 0;
     // Per-function code generation state, saved while another function body is emitted.
     struct FunctionState {
@@ -257,6 +338,8 @@ class Compiler {
         std::vector<Ty> returns;
         Location location;
         std::vector<LambdaContext *> lambdaStack;
+        std::set<std::string> cells;
+        llvm::DebugLoc debug;
     };
     FunctionState saveFunction() {
         FunctionState s{b.saveIP(),
@@ -278,7 +361,10 @@ class Compiler {
                         returnType,
                         std::move(returns),
                         location,
-                        std::move(lambdaStack)};
+                        std::move(lambdaStack),
+                        std::move(cells),
+                        b.getCurrentDebugLocation()};
+        b.SetCurrentDebugLocation(llvm::DebugLoc());
         borrowed = false;
         attrs.clear();
         componentNames.clear();
@@ -290,6 +376,7 @@ class Compiler {
         loops.clear();
         returns.clear();
         lambdaStack.clear();
+        cells.clear();
         return s;
     }
     void restoreFunction(FunctionState &s) {
@@ -312,7 +399,9 @@ class Compiler {
         returns = std::move(s.returns);
         location = s.location;
         lambdaStack = std::move(s.lambdaStack);
+        cells = std::move(s.cells);
         b.restoreIP(s.ip);
+        b.SetCurrentDebugLocation(s.debug);
     }
     void releaseProtected(size_t depth) {
         for (auto &value : protectedValues)
@@ -328,6 +417,10 @@ class Compiler {
             return llvm::IntegerType::get(ctx, t.bits());
         if (t.name == "bool")
             return b.getInt1Ty();
+        if (t.name == "char")
+            return b.getInt32Ty();
+        if (t.enumeration())
+            return b.getInt64Ty();
         if (t.name == "float")
             return b.getFloatTy();
         if (t.name == "double")
@@ -337,6 +430,29 @@ class Compiler {
         return b.getPtrTy();
     }
     Ty type(std::string name) {
+        if (auto open = name.find('<'); open != std::string::npos && name.back() == '>' &&
+                                        templates.count(name.substr(0, open))) {
+            std::vector<Ty> arguments;
+            for (auto &part : typeParts(name.substr(open + 1, name.size() - open - 2)))
+                arguments.push_back(type(part));
+            return Ty{instantiateClass(name.substr(0, open), arguments)};
+        }
+        if (templates.count(name))
+            error("generic class " + displayName(name) + " needs type arguments, such as " +
+                  displayName(name) + "<int>");
+        for (std::string family : {"thread.task", "thread.channel"}) {
+            if (name == family)
+                error(family + " needs a type argument, such as " + family + "<int>");
+            if (name.rfind(family + "<", 0) == 0 && name.back() == '>') {
+                auto inner = name.substr(family.size() + 1, name.size() - family.size() - 2);
+                auto payload = inner == "void" && family == "thread.task" ? Ty{} : type(inner);
+                if (payload.name == "void" && family == "thread.channel")
+                    error("channels cannot carry void");
+                return Ty{family + "<" + payload.name + ">"};
+            }
+        }
+        if (name == "thread.mutex")
+            return Ty{name};
         if (name.rfind("array<", 0) == 0 && name.back() == '>') {
             auto parts = Ty{name}.parts();
             if (parts.size() != 1)
@@ -349,8 +465,10 @@ class Compiler {
             return Ty{type(name.substr(0, name.size() - 2)).name + "[]"};
         if (name.size() > 1 && name.back() == '?') {
             Ty inner = type(name.substr(0, name.size() - 1));
-            if (!inner.object())
-                error("nullable primitive types are not implemented yet");
+            if (inner.name == "void" || inner.nullable())
+                error("'?' requires a non-void, non-nullable type");
+            if (!inner.object() && !primitive(inner))
+                error("type '" + inner.name + "' cannot be nullable");
             return Ty{inner.name + "?"};
         }
         Ty t{name};
@@ -374,6 +492,16 @@ class Compiler {
                 error("weak<T> requires a non-null reference type such as a class or element");
             return Ty{"weak<" + target.name + ">"};
         }
+        if (t.set()) {
+            auto parts = t.parts();
+            if (parts.size() != 1)
+                error("set<T> requires one element type");
+            auto item = type(parts[0].name);
+            if (!hashable(item))
+                error("set elements must be integers, bool, char, enum, string, tuples of these, "
+                      "or classes with hash() and equals()");
+            return Ty{"set<" + item.name + ">"};
+        }
         if (t.tuple() || t.homogeneousTuple() || t.map() || t.result()) {
             auto parts = t.parts();
             if ((t.map() || t.result()) && parts.size() != 2)
@@ -396,16 +524,52 @@ class Compiler {
             Ty out{r};
             if (out.map()) {
                 auto key = out.parts()[0];
-                if (!key.integer() && key.name != "string" && key.name != "bool")
-                    error("map keys must be integers, bool, or string");
+                if (!hashable(key))
+                    error("map keys must be integers, bool, char, enum, string, tuples of these, "
+                          "or classes with hash() and equals()");
             }
             return out;
         }
-        if (t.numeric() || name == "bool" || name == "string" || name == "void" ||
+        if (t.numeric() || name == "bool" || name == "char" || name == "string" || name == "void" ||
             name == "element" || name == "fragment" || name == "json.value" ||
-            name == "desktop.window" || errorTypes.count(name) || classes.count(name))
+            name == "desktop.window" || name == "io.file" || name == "net.socket" ||
+            name == "net.listener" || errorTypes.count(name) || classes.count(name) ||
+            t.enumeration())
             return t;
         error("unknown or unsupported type '" + name + "'");
+    }
+    // Runtime slot kind for map keys: 0 signed, 1 unsigned, 3 bool, 4 reference, 5 char.
+    bool hashable(Ty t) {
+        if (t.integer() || t.name == "bool" || t.name == "char" || t.name == "string" ||
+            t.enumeration() || classes.count(t.name) || templates.count(t.name))
+            return true;
+        if (t.tuple() || t.homogeneousTuple()) {
+            for (auto &part : t.parts())
+                if (!hashable(type(part.name)) || classes.count(type(part.name).name))
+                    return false;
+            return true;
+        }
+        return false;
+    }
+    // Enum slots (kind 6) carry their enum id in the upper bits; 7 marks tuple keys and 8 class
+    // keys hashed by their hash() method.
+    int64_t mapKeyKind(Ty key) {
+        if (key.tuple() || key.homogeneousTuple())
+            return 7;
+        if (classes.count(key.name)) {
+            if (resolveMethod(key.name, "hash").empty() || resolveMethod(key.name, "equals").empty())
+                error("class " + displayName(key.name) +
+                      " is used as a map key or set element, so it must define "
+                      "hash() returns int and equals(" + displayName(key.name) +
+                      " other) returns bool");
+            return 8;
+        }
+        return key.object()           ? 4
+               : key.name == "bool"   ? 3
+               : key.name == "char"   ? 5
+               : key.enumeration()    ? 6 | (enumIds.at(key.name) << 8)
+               : key.unsigned_()      ? 1
+                                      : 0;
     }
     llvm::ConstantInt *i64(int64_t x) {
         return b.getInt64(x);
@@ -417,7 +581,7 @@ class Compiler {
         for (size_t i = scopes.size(); i > depth; --i)
             for (auto &[name, var] : scopes[i - 1]) {
                 (void)name;
-                if (var.type.object())
+                if (var.owner && (var.cell || (var.narrowed ? var.storage : var.type).object()))
                     call("fw_store", b.getVoidTy(),
                          {var.address, llvm::ConstantPointerNull::get(b.getPtrTy())});
             }
@@ -439,16 +603,66 @@ class Compiler {
         b.SetInsertPoint(ok);
     }
     bool usesWeb() const {
+        return uses("web");
+    }
+    bool uses(const std::string &module) const {
         for (auto &[alias, name] : p.imports) {
             (void)alias;
-            if (name == "web")
+            if (name == module)
                 return true;
         }
         return false;
     }
+    // Builtin classes are ordinary classes. Native code builds and reads them with this exact
+    // field order: runtime/web.inc (web.*) and runtime/stdlib.inc (os.*, time.datetime).
+    void builtinClasses() {
+        std::vector<std::pair<std::string, std::string>> sources;
+        if (uses("os"))
+            sources.emplace_back("os", R"(class process
+    string[] command
+    string cwd = ""
+    map<string, string> env = {}
+    bool inherit_env = true
+    string input = ""
+    double timeout = 0.0
+    bool capture = true
+end
+class result
+    int status = 0
+    string stdout = ""
+    string stderr = ""
+    bool timed_out = false
+end
+)");
+        if (uses("time"))
+            sources.emplace_back("time", R"(class datetime
+    int year
+    int month
+    int day
+    int hour = 0
+    int minute = 0
+    int second = 0
+    int weekday = 0
+    int yearday = 0
+end
+)");
+        for (auto &[module, source] : sources) {
+            auto program = Parser(lex(source)).parse();
+            for (auto &c : program.classes) {
+                c.name = module + "." + c.name;
+                builtinClassNames.push_back(c.name);
+                p.classes.push_back(std::move(c));
+            }
+        }
+        if (usesWeb())
+            webClasses();
+    }
+    std::vector<std::string> builtinClassNames;
     // web.request and web.response are ordinary classes; runtime/web.inc relies on this
     // field order when it builds requests and reads responses.
     void webClasses() {
+        builtinClassNames.push_back("web.request");
+        builtinClassNames.push_back("web.response");
         auto program = Parser(lex(R"(class Request
     string method = "GET"
     string path = "/"
@@ -497,7 +711,9 @@ end
             "fw_frame",         "fw_drop",          "fw_root",          "fw_sweep",
             "fw_store",         "fw_retain",        "fw_adopt",         "fw_keep",
             "fw_error_pending", "fw_error_matches", "fw_throw",         "fw_error_report",
-            "fw_error_value",   "fw_error_take",    "fw_error_restore", "fw_web_shutdown"};
+            "fw_error_value",   "fw_error_take",    "fw_error_restore", "fw_web_shutdown",
+            "fw_class_id",      "fw_enum_register", "fw_register_class", "fw_set_args",
+            "fw_gc_collect",    "fw_gc_pending"};
         if (!safe.count(name))
             checkError();
         return resultValue;
@@ -541,10 +757,26 @@ end
     Val convert(Val x, Ty to, bool explicit_ = false) {
         if (x.t == to)
             return x;
+        if (x.t.classReference() && to.function())
+            return constructorValue(x.t.name.substr(6), to);
         if (x.t.classReference())
-            error("constructor reference '" + displayName(x.t.name.substr(6)) +
-                  "' is not an instance; call it with () or use the unparenthesized class name on "
-                  "the assignment right-hand side");
+            error("'" + displayName(x.t.name.substr(6)) +
+                  "' is a class reference, not an instance; call it with () to construct one");
+        if (to.nullable() && primitive(nonNull(to)) && x.t.name != "null") {
+            // Present nullable primitives are boxed; widening applies to the payload.
+            if (!primitive(x.t))
+                error("cannot convert " + x.t.name + " to " + to.name);
+            auto payload = convert(x, nonNull(to), explicit_);
+            Val box{objectCall("fw_new", {frame, i64(1), i64(12)}), to};
+            set(box, i64(0), payload);
+            return box;
+        }
+        if (x.t.nullable() && primitive(nonNull(x.t)) && primitive(to)) {
+            if (!explicit_)
+                error("cannot implicitly convert " + x.t.name + " to " + to.name +
+                      "; check for null, use '?\?', or cast explicitly");
+            return convert(unboxChecked(x), to, true);
+        }
         if (explicit_ && x.t.nullable() && x.t.name == to.name + "?") {
             guard(b.CreateICmpNE(x.v, llvm::ConstantPointerNull::get(b.getPtrTy())),
                   "cannot cast null to " + displayName(to.name), "CastError");
@@ -560,6 +792,9 @@ end
             return {x.v, to};
         if (x.t.name == "fragment" && to.name == "element")
             return {x.v, to};
+        if (classes.count(nonNull(x.t).name) && classes.count(nonNull(to).name) &&
+            derives(nonNull(x.t).name, nonNull(to).name) && (to.nullable() || !x.t.nullable()))
+            return {x.v, to};
         if (x.t.name.rfind("fn:", 0) == 0 && to.function())
             return functionValue(x.t.name.substr(3), to);
         if (to.weak() && (x.t.name == "null" || x.t.name == to.parts()[0].name ||
@@ -569,9 +804,12 @@ end
             bool fits = false;
             if (auto ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(x.v); ci && to.integer()) {
                 auto v = ci->getValue();
-                fits = to.unsigned_()
-                           ? (!v.isNegative() && v.getActiveBits() <= unsigned(to.bits()))
-                           : v.isSignedIntN(to.bits());
+                if (x.t.unsigned_())
+                    fits = v.getActiveBits() <= unsigned(to.bits() - (to.unsigned_() ? 0 : 1));
+                else
+                    fits = to.unsigned_()
+                               ? (!v.isNegative() && v.getActiveBits() <= unsigned(to.bits()))
+                               : v.isSignedIntN(to.bits());
             }
             if (!explicit_ && !widening(x.t, to) && !fits)
                 error("cannot implicitly convert " + x.t.name + " to " + to.name +
@@ -613,13 +851,92 @@ end
         }
         error("cannot convert " + x.t.name + " to " + to.name);
     }
+    // Reads the payload of a nullable value; null raises CastError.
+    Val unboxChecked(Val x) {
+        auto inner = nonNull(x.t);
+        guard(b.CreateICmpNE(x.v, llvm::ConstantPointerNull::get(b.getPtrTy())),
+              "null value of type " + displayName(x.t.name) + " used as " +
+                  displayName(inner.name),
+              "CastError");
+        if (primitive(inner))
+            return get({x.v, x.t}, i64(0), inner);
+        return {x.v, inner};
+    }
+    // Names proven non-null when `condition` evaluates to `positive`.
+    void nonNullNames(Expr &condition, bool positive, std::vector<std::string> &names) {
+        if (condition.kind == "unary" && condition.text == "not")
+            return nonNullNames(*condition.args[0], !positive, names);
+        if (condition.kind != "binary")
+            return;
+        if (condition.text == (positive ? "and" : "or")) {
+            nonNullNames(*condition.args[0], positive, names);
+            nonNullNames(*condition.args[1], positive, names);
+            return;
+        }
+        if (condition.text != (positive ? "!=" : "=="))
+            return;
+        auto &left = *condition.args[0], &right = *condition.args[1];
+        if (left.kind == "name" && right.kind == "null")
+            names.push_back(left.text);
+        else if (right.kind == "name" && left.kind == "null")
+            names.push_back(right.text);
+    }
+    // Local names proven to hold class `T` (by `x is T`) when `condition` is `positive`.
+    void instanceNames(Expr &condition, bool positive,
+                       std::vector<std::pair<std::string, std::string>> &names) {
+        if (condition.kind == "unary" && condition.text == "not")
+            return instanceNames(*condition.args[0], !positive, names);
+        if (condition.kind == "binary" && condition.text == (positive ? "and" : "or")) {
+            instanceNames(*condition.args[0], positive, names);
+            instanceNames(*condition.args[1], positive, names);
+        } else if (positive && condition.kind == "is" && condition.args[0]->kind == "name")
+            names.emplace_back(condition.args[0]->text, condition.text);
+    }
+    void narrowTypes(const std::vector<std::pair<std::string, std::string>> &names) {
+        for (auto &[name, typeName] : names) {
+            auto variable = lookup(name);
+            auto t = type(typeName);
+            if (!variable || variable->typeNarrowed || variable->cell || !classes.count(t.name) ||
+                !variable->type.object())
+                continue;
+            Var view = *variable;
+            view.narrowed = view.typeNarrowed = true;
+            view.checked = variable->initialized != nullptr;
+            view.storage = variable->narrowed ? variable->storage : variable->type;
+            view.type = t;
+            view.owner = false;
+            scopes.back()[name] = view;
+        }
+    }
+    // Adds narrowed views of `names` to the innermost scope.
+    void narrow(const std::vector<std::string> &names) {
+        for (auto &name : names) {
+            auto variable = lookup(name);
+            if (!variable || variable->narrowed || variable->cell || !variable->type.nullable() ||
+                variable->type.name == "null" || variable->type.classReference())
+                continue;
+            Var view = *variable;
+            view.narrowed = true;
+            view.storage = variable->type;
+            view.type = nonNull(variable->type);
+            auto existing = scopes.back().find(name);
+            if (existing != scopes.back().end()) {
+                view.owner = existing->second.owner;
+                existing->second = view;
+            } else {
+                view.owner = false;
+                scopes.back()[name] = view;
+            }
+        }
+    }
     // Nullable references are unwrapped for member access; null raises CastError.
     Val unwrap(Val x) {
         if (!x.t.nullable() || x.t.name == "null")
             return x;
         Ty base{x.t.name.substr(0, x.t.name.size() - 1)};
         if (classes.count(base.name) || base.name == "element" || base.name == "fragment" ||
-            base.name == "desktop.window")
+            base.name == "desktop.window" || base.name == "io.file" || base.name == "net.socket" ||
+            base.name == "net.listener")
             return convert(x, base, true);
         return x;
     }
@@ -697,6 +1014,12 @@ end
         if (x.t.name == "bool")
             return {objectCall("fw_bool_string", {frame, b.CreateZExt(x.v, b.getInt64Ty())}),
                     Ty{"string"}};
+        if (x.t.name == "char")
+            return {objectCall("fw_char_string", {frame, b.CreateZExt(x.v, b.getInt64Ty())}),
+                    Ty{"string"}};
+        if (x.t.enumeration())
+            return {objectCall("fw_enum_name", {frame, i64(enumIds.at(x.t.name)), x.v}),
+                    Ty{"string"}};
         if (x.t.name == "null")
             return literal("null");
         if (x.t.name.rfind("fn:", 0) == 0)
@@ -746,7 +1069,7 @@ end
         auto savedFrame = frame;
         current = context.function;
         frame = context.frame;
-        auto address = allocate(outer->type, name);
+        auto address = allocate(outer->cell ? Ty{"Error"} : outer->type, name);
         current = savedCurrent;
         frame = savedFrame;
         llvm::IRBuilder<> init(context.initPoint);
@@ -758,7 +1081,7 @@ end
                 {context.env, i64(static_cast<int64_t>(index))});
         };
         auto t = outer->type;
-        if (t.object())
+        if (t.object() || outer->cell)
             init.CreateCall(module.getOrInsertFunction(
                                 "fw_store", llvm::FunctionType::get(
                                                 b.getVoidTy(), {b.getPtrTy(), b.getPtrTy()}, false)),
@@ -770,6 +1093,12 @@ end
                              address);
         Var local{address, t, true};
         local.captured = true;
+        if (outer->cell) {
+            // The closure shares the cell, so assignments are visible on both sides.
+            local.cell = true;
+            local.captured = false;
+            local.constant = outer->constant;
+        }
         return &(context.captured[name] = local);
     }
     llvm::Value *allocate(Ty t, const std::string &name) {
@@ -794,9 +1123,58 @@ end
         else
             b.CreateStore(value.v, address);
     }
+    // Names both read inside some lambda of `body` and assigned anywhere in it (by name, so a
+    // shadowed name may get a cell unnecessarily, which is harmless).
+    std::set<std::string> cellNames(std::vector<SP> &body) {
+        std::set<std::string> assigned, captured;
+        std::function<void(Expr &, bool)> expression;
+        std::function<void(std::vector<SP> &, bool)> statements = [&](std::vector<SP> &list,
+                                                                      bool inLambda) {
+            for (auto &st : list) {
+                if (st->kind == "assign" && st->target && st->target->kind == "name")
+                    assigned.insert(st->target->text);
+                if (st->expr)
+                    expression(*st->expr, inLambda);
+                if (st->target)
+                    expression(*st->target, inLambda);
+                for (auto *inner : {&st->body, &st->other, &st->finalizer})
+                    statements(*inner, inLambda);
+                for (auto &inner : st->catches)
+                    statements(inner, inLambda);
+                for (auto &values : st->patterns)
+                    for (auto &v : values)
+                        expression(*v, inLambda);
+            }
+        };
+        expression = [&](Expr &e, bool inLambda) {
+            if (e.kind == "name" && inLambda)
+                captured.insert(e.text);
+            for (auto &a : e.args)
+                if (a)
+                    expression(*a, inLambda);
+            if (e.lambda)
+                statements(e.lambda->body, true);
+        };
+        statements(body, false);
+        std::set<std::string> out;
+        for (auto &name : assigned)
+            if (captured.count(name))
+                out.insert(name);
+        return out;
+    }
     void bind(const std::string &name, Val v, bool constant = false) {
         if (scopes.back().count(name))
             error("duplicate declaration '" + name + "'");
+        if (cells.count(name) && !constant) {
+            Val cell{objectCall("fw_new", {frame, i64(1), i64(12)}), Ty{"Error"}};
+            set(cell, i64(0), v);
+            auto address = allocate(Ty{"Error"}, name);
+            store(address, cell);
+            Var var{address, v.t, constant};
+            var.cell = true;
+            scopes.back()[name] = var;
+            return;
+        }
         auto a = allocate(v.t, name);
         store(a, v);
         scopes.back()[name] = {a, v.t, constant};
@@ -805,12 +1183,28 @@ end
         if (v.initialized && !top)
             guard(b.CreateLoad(b.getInt1Ty(), v.initialized),
                   "module global read before initialization", "RuntimeError");
+        if (v.cell)
+            return get({b.CreateLoad(b.getPtrTy(), v.address), Ty{"Error"}}, i64(0), v.type);
+        if (v.narrowed) {
+            auto raw = b.CreateLoad(b.getPtrTy(), v.address);
+            Val stored{borrowed ? raw : objectCall("fw_keep", {frame, raw}), v.storage};
+            if (v.typeNarrowed) {
+                if (v.checked)
+                    guard(isInstance(stored.v, v.type.name),
+                          "narrowed value is no longer " + displayName(v.type.name), "CastError");
+                return {stored.v, v.type};
+            }
+            return unboxChecked(stored);
+        }
         auto result = b.CreateLoad(ll(v.type), v.address);
         if (v.type.object() && !borrowed)
             return {objectCall("fw_keep", {frame, result}), v.type};
         return {result, v.type};
     }
     std::pair<Class *, size_t> field(Ty t, const std::string &name) {
+        if (t.classReference())
+            error("'" + displayName(t.name.substr(6)) +
+                  "' is a class reference, not an instance; call it with () to construct one");
         auto c = classes.find(t.name);
         if (c == classes.end())
             error("type '" + t.name + "' has no field '" + name + "'");
@@ -833,7 +1227,7 @@ end
     }
     void set(Val obj, llvm::Value *index, Val x) {
         if (x.t.classReference())
-            error("constructor references cannot be stored in collections or object fields");
+            x = convert(x, constructorType(x.t.name.substr(6)));
         if (x.t.object())
             call("fw_set_object", b.getVoidTy(), {obj.v, index, x.v});
         else if (x.t.real())
@@ -843,9 +1237,11 @@ end
             call("fw_set_int", b.getVoidTy(),
                  {obj.v, index,
                   b.CreateIntCast(x.v, b.getInt64Ty(), x.t.name != "bool" && !x.t.unsigned_()),
-                  i64(x.t.name == "bool" ? 3
-                      : x.t.unsigned_()  ? 1
-                                         : 0)});
+                  i64(x.t.name == "bool"   ? 3
+                      : x.t.name == "char" ? 5
+                      : x.t.enumeration()  ? 6 | (enumIds.at(x.t.name) << 8)
+                      : x.t.unsigned_()    ? 1
+                                           : 0)});
     }
     Val receiver() {
         auto v = lookup("$inst");
@@ -854,6 +1250,19 @@ end
         return load(*v);
     }
     Val binary(const std::string &op, Val a, Val c) {
+        if (op == "+" && ((a.t.name == "string" && c.t.name == "char") ||
+                          (a.t.name == "char" && c.t.name == "string")))
+            return binary(op, stringify(a), stringify(c));
+        if (a.t.name == "char" && c.t.name == "char") {
+            static const std::map<std::string, llvm::CmpInst::Predicate> predicates = {
+                {"==", llvm::CmpInst::ICMP_EQ},  {"!=", llvm::CmpInst::ICMP_NE},
+                {"<", llvm::CmpInst::ICMP_ULT},  {"<=", llvm::CmpInst::ICMP_ULE},
+                {">", llvm::CmpInst::ICMP_UGT},  {">=", llvm::CmpInst::ICMP_UGE}};
+            auto predicate = predicates.find(op);
+            if (predicate == predicates.end())
+                error("operator '" + op + "' is not defined for char; convert with int(c) first");
+            return {b.CreateICmp(predicate->second, a.v, c.v), Ty{"bool"}};
+        }
         if (a.t.name == "string" && c.t.name == "string") {
             if (op == "+")
                 return {objectCall("fw_concat", {frame, a.v, c.v}), a.t};
@@ -862,17 +1271,51 @@ end
                 return {op == "==" ? eq : b.CreateNot(eq), Ty{"bool"}};
             }
         }
+        bool optionalA = a.t.nullable() && primitive(nonNull(a.t)),
+             optionalC = c.t.nullable() && primitive(nonNull(c.t));
+        if ((op == "==" || op == "!=") && (optionalA || optionalC) && a.t.name != "null" &&
+            c.t.name != "null") {
+            Ty t = optionalA ? a.t : c.t;
+            auto x = convert(a, t), y = convert(c, t);
+            auto eq = b.CreateICmpNE(call("fw_box_equal", b.getInt64Ty(), {x.v, y.v}), i64(0));
+            return {op == "==" ? eq : b.CreateNot(eq), Ty{"bool"}};
+        }
+        if ((optionalA || optionalC) && op != "==" && op != "!=")
+            error("operator '" + op + "' requires non-null operands; check for null or use '?\?'");
+        if ((op == "==" || op == "!=") && classes.count(a.t.name) && classes.count(c.t.name) &&
+            !resolveMethod(a.t.name, "equals").empty() &&
+            (derives(a.t.name, c.t.name) || derives(c.t.name, a.t.name))) {
+            auto eq = callNamedMethod(a, "equals", {c});
+            if (eq.t.name != "bool")
+                error(displayName(a.t.name) + ".equals must return bool");
+            return {op == "==" ? eq.v : b.CreateNot(eq.v), Ty{"bool"}};
+        }
         if ((op == "==" || op == "!=") && a.t.object() && c.t.object()) {
-            if (a.t != c.t &&
+            auto related = derives(nonNull(a.t).name, nonNull(c.t).name) ||
+                           derives(nonNull(c.t).name, nonNull(a.t).name);
+            if (a.t != c.t && !related &&
                 !((a.t.name == "null" && c.t.nullable()) || (c.t.name == "null" && a.t.nullable())))
                 error("incompatible equality operands");
             auto eq = b.CreateICmpEQ(a.v, c.v);
             return {op == "==" ? eq : b.CreateNot(eq), Ty{"bool"}};
         }
+        if (a.t.enumeration() || c.t.enumeration()) {
+            if (a.t != c.t || (op != "==" && op != "!="))
+                error("enums support only == and != with the same enum type");
+            return {op == "==" ? b.CreateICmpEQ(a.v, c.v) : b.CreateICmpNE(a.v, c.v), Ty{"bool"}};
+        }
         if (a.t.name == "bool" && c.t.name == "bool" && (op == "==" || op == "!="))
             return {op == "==" ? b.CreateICmpEQ(a.v, c.v) : b.CreateICmpNE(a.v, c.v), Ty{"bool"}};
         if (!a.t.numeric() || !c.t.numeric())
             error("operator '" + op + "' requires compatible numeric operands");
+        if (op == "//" && (a.t.real() || c.t.real())) {
+            // Floating integer division truncates toward zero, like integer '//', and returns int.
+            a = convert(a, Ty{"double"}, true);
+            c = convert(c, Ty{"double"}, true);
+            guard(b.CreateFCmpUNE(c.v, llvm::ConstantFP::get(b.getDoubleTy(), 0.0)),
+                  "division by zero");
+            return convert({b.CreateFDiv(a.v, c.v), Ty{"double"}}, Ty{"i64"}, true);
+        }
         Ty common = a.t;
         if (a.t != c.t) {
             if (widening(a.t, c.t))
@@ -931,7 +1374,7 @@ end
                 return {b.CreateFMul(a.v, c.v), common};
             if (op == "%")
                 return {b.CreateFRem(a.v, c.v), common};
-            error("'//' requires integer operands");
+            error("unsupported numeric operator '" + op + "'");
         }
         if (op == "//" || op == "%") {
             auto zero = llvm::ConstantInt::get(ll(common), 0);
@@ -985,16 +1428,67 @@ end
                 fields += ",";
             fields += f.name;
         }
-        return {
-            objectCall("fw_instance",
-                       {frame, i64(c.fields.size()), b.CreateGlobalString(c.name),
-                        b.CreateGlobalString(displayName(c.name)), b.CreateGlobalString(fields)}),
-            Ty{c.name}};
+        return {objectCall("fw_instance",
+                           {frame, i64(c.fields.size()), classId(c.name),
+                            b.CreateGlobalString(displayName(c.name)), b.CreateGlobalString(fields)}),
+                Ty{c.name}};
     }
     Val collectionCast(Val source, Ty target);
     Ty inferCollectionCast(const std::string &constructor, Ty source);
     Val explicitCast(Val source, Ty target);
     std::optional<Val> domCall(const std::string &name, std::vector<Val> args);
+    struct TagRules {
+        std::set<std::string> attributes, booleans;
+        bool any = false, isVoid = false;
+    };
+    std::map<std::string, TagRules> familyRules;
+    std::set<std::string> instantiatedComponents;
+    // Components that are never used still get their markup structure checked: tags, attribute
+    // names, and void elements. Attribute expressions are typed only when instantiated.
+    // Inserts a markup child: elements and fragments as nodes, sequences of them (or of other
+    // values) item by item, and anything else as escaped text.
+    void markupChild(Val parent, Val child) {
+        if (child.t.sequence()) {
+            eachItem(child, [&](Val item) { markupChild(parent, item); });
+            return;
+        }
+        if (nonNull(child.t).name == "element" || nonNull(child.t).name == "fragment") {
+            if (child.t.nullable()) {
+                // A null optional child adds nothing.
+                auto present = llvm::BasicBlock::Create(ctx, "child.present", current);
+                auto done = llvm::BasicBlock::Create(ctx, "child.end", current);
+                b.CreateCondBr(
+                    b.CreateICmpNE(child.v, llvm::ConstantPointerNull::get(b.getPtrTy())), present,
+                    done);
+                b.SetInsertPoint(present);
+                call("fw_child", b.getVoidTy(), {parent.v, child.v});
+                b.CreateBr(done);
+                b.SetInsertPoint(done);
+                return;
+            }
+        } else
+            child = stringify(child);
+        call("fw_child", b.getVoidTy(), {parent.v, child.v});
+    }
+    void checkTemplate(Expr &e) {
+        location = e.loc;
+        if (e.kind == "element" && !p.components.count(e.text)) {
+            auto rules = tagRules(e.text);
+            if (!e.text.empty() && !rules)
+                error("unknown tag '" + e.text + "'");
+            for (auto &name : e.names)
+                if (!(name.rfind("on", 0) == 0 && name.size() > 2) &&
+                    !attributeAllowed(*rules, name))
+                    error("unknown attribute '" + name + "' on <" + e.text + ">");
+            if (rules && rules->isVoid && e.args.size() != e.names.size())
+                error("void element <" + e.text + "> cannot have children");
+        }
+        for (auto &a : e.args)
+            if (a)
+                checkTemplate(*a);
+    }
+    const TagRules *tagRules(const std::string &tag);
+    bool attributeAllowed(const TagRules &rules, const std::string &name);
     Val invoke(Expr &e, Ty expected = Ty{});
     Val value(Expr &e, Ty expected = Ty{});
     Val defaultValue(Expr &e, Ty expected) {
@@ -1015,11 +1509,112 @@ end
         return result;
     }
     llvm::Value *mapIndex(Val map, Val key, bool insert) {
+        return keyFind(map, key, insert ? 1 : 0);
+    }
+    // Key position in a map or set. mode 0 raises KeyError when missing, 1 inserts, 2 gives -1.
+    llvm::Value *keyFind(Val container, Val key, int mode) {
+        auto kind = mapKeyKind(key.t);
+        if (kind == 7 || kind == 8) {
+            llvm::Value *hash, *equal = llvm::ConstantPointerNull::get(b.getPtrTy());
+            if (kind == 7)
+                hash = call("fw_structural_hash", b.getInt64Ty(), {key.v});
+            else {
+                hash = convert(callNamedMethod(key, "hash", {}), Ty{"i64"}).v;
+                equal = equalsCallback(key.t.name);
+            }
+            return call("fw_map_find_hashed", b.getInt64Ty(),
+                        {container.v, hash, key.v, equal, i64(mode)});
+        }
         auto integer = key.t.object() ? i64(0)
                                       : b.CreateIntCast(key.v, b.getInt64Ty(),
                                                         key.t.name != "bool" && !key.t.unsigned_());
         auto object = key.t.object() ? key.v : llvm::ConstantPointerNull::get(b.getPtrTy());
-        return call("fw_map_index", b.getInt64Ty(), {map.v, integer, object, i64(insert ? 1 : 0)});
+        if (mode == 2) {
+            auto has = call("fw_map_has", b.getInt64Ty(), {container.v, integer, object});
+            return b.CreateSelect(b.CreateICmpNE(has, i64(0)), i64(0), i64(-1));
+        }
+        return call("fw_map_index", b.getInt64Ty(), {container.v, integer, object, i64(mode)});
+    }
+    Val keyRemove(Val container, Val key) {
+        auto kind = mapKeyKind(key.t);
+        if (kind != 7 && kind != 8) {
+            auto integer =
+                key.t.object() ? i64(0)
+                               : b.CreateIntCast(key.v, b.getInt64Ty(),
+                                                 key.t.name != "bool" && !key.t.unsigned_());
+            auto object = key.t.object() ? key.v : llvm::ConstantPointerNull::get(b.getPtrTy());
+            return {b.CreateICmpNE(
+                        call("fw_map_remove", b.getInt64Ty(), {container.v, integer, object}),
+                        i64(0)),
+                    Ty{"bool"}};
+        }
+        auto index = keyFind(container, key, 2);
+        auto found = b.CreateICmpSGE(index, i64(0));
+        auto yes = llvm::BasicBlock::Create(ctx, "remove.found", current);
+        auto done = llvm::BasicBlock::Create(ctx, "remove.end", current);
+        b.CreateCondBr(found, yes, done);
+        b.SetInsertPoint(yes);
+        call("fw_map_remove_at", b.getVoidTy(), {container.v, index});
+        b.CreateBr(done);
+        b.SetInsertPoint(done);
+        return {found, Ty{"bool"}};
+    }
+    Val newSet(Ty t) {
+        return {objectCall("fw_map_new", {frame, i64(mapKeyKind(t.parts()[0]) | (1LL << 40))}), t};
+    }
+    // Calls receiver.method(args...) with already evaluated values.
+    Val callNamedMethod(Val receiver, const std::string &method, std::vector<Val> args) {
+        scopes.emplace_back();
+        Expr call;
+        call.kind = "call";
+        call.loc = location;
+        auto callee = std::make_unique<Expr>();
+        callee->kind = "member";
+        callee->text = method;
+        callee->loc = location;
+        auto self = "$r" + std::to_string(hiddenCount++);
+        bind(self, receiver, true);
+        callee->args.push_back(syntheticName(self, location));
+        call.args.push_back(std::move(callee));
+        for (auto &arg : args) {
+            auto name = "$p" + std::to_string(hiddenCount++);
+            bind(name, arg, true);
+            call.args.push_back(syntheticName(name, location));
+        }
+        auto result = invoke(call);
+        releaseScopes(scopes.size() - 1);
+        scopes.pop_back();
+        return result;
+    }
+    // int64_t equal(key, candidate) for class keys: key.equals(candidate).
+    llvm::Value *equalsCallback(const std::string &className) {
+        return closureCode("equals." + className, Ty{"function<i64," + className + ">"},
+                           [&](llvm::Value *env, Expr &call) {
+                               (void)call;
+                               auto self = callNamedMethod({env, Ty{className}}, "equals",
+                                                           {load(*lookup("$a0"))});
+                               if (self.t.name != "bool")
+                                   error(displayName(className) + ".equals must return bool");
+                               return Val{b.CreateZExt(self.v, b.getInt64Ty()), Ty{"i64"}};
+                           });
+    }
+    // Emits `body(item)` for each item of a sequence value.
+    void eachItem(Val sequence, const std::function<void(Val)> &body) {
+        auto size = call("fw_length", b.getInt64Ty(), {sequence.v});
+        auto index = allocate(Ty{"i64"}, "each");
+        b.CreateStore(i64(0), index);
+        auto cond = llvm::BasicBlock::Create(ctx, "each.condition", current);
+        auto loop = llvm::BasicBlock::Create(ctx, "each.body", current);
+        auto end = llvm::BasicBlock::Create(ctx, "each.end", current);
+        b.CreateBr(cond);
+        b.SetInsertPoint(cond);
+        auto i = b.CreateLoad(b.getInt64Ty(), index);
+        b.CreateCondBr(b.CreateICmpSLT(i, size), loop, end);
+        b.SetInsertPoint(loop);
+        body(get(sequence, i, sequence.t.item()));
+        b.CreateStore(b.CreateAdd(b.CreateLoad(b.getInt64Ty(), index), i64(1)), index);
+        b.CreateBr(cond);
+        b.SetInsertPoint(end);
     }
     std::optional<int64_t> constantIndex(Expr &e) {
         if (e.kind == "int") {
@@ -1217,18 +1812,80 @@ end
         return result;
     }
     Val lambda(Expr &e, Ty expected);
+    Val coalesce(Expr &e, Ty expected);
+    Val typeTest(Expr &e);
+    bool hasField(const std::string &className, const std::string &name) {
+        auto c = classes.find(className);
+        if (c == classes.end())
+            return false;
+        for (auto &f : c->second->fields)
+            if (f.name == name)
+                return true;
+        return false;
+    }
+    static EP syntheticName(const std::string &name, Location loc) {
+        auto e = std::make_unique<Expr>();
+        e->kind = "name";
+        e->text = name;
+        e->loc = loc;
+        return e;
+    }
+    // Builds `R code(ptr env, P...)` for a closure of type `function`; `emit` receives the
+    // environment and the parameters bound as locals $a0, $a1, ... and returns the result.
+    llvm::Function *closureCode(const std::string &key, Ty function,
+                                const std::function<Val(llvm::Value *, Expr &)> &emit);
+    Ty constructorType(const std::string &className);
+    std::string instantiateClass(const std::string &base, const std::vector<Ty> &arguments);
+    std::string instantiateFunction(const std::string &base, const std::vector<Ty> &arguments);
+    std::optional<Val> genericCall(Expr &e, const std::string &name, Ty expected);
+    uint64_t hiddenCount = 0;
+    Val constructorValue(const std::string &className, Ty to);
+    Val boundMethod(Val receiver, const std::string &method);
+    Val callMethod(Val receiver, const std::string &staticType, const std::string &method, Expr &e,
+                   bool direct);
+    void validateClasses();
+    void checkInit(Class &c, Function &init);
+    void match(Stmt &s);
+    void iterate(Stmt &s, Val source);
     Ty lambdaBody(Function &f, const std::vector<Ty> &params, Ty result, bool inference,
                   LambdaContext &context);
     Val sequenceMethod(Val sequence, const std::string &method, Expr &call);
+    Val stringMethod(Val text, const std::string &method, Expr &call);
+    std::optional<Val> sequenceTool(Val sequence, const std::string &method, Expr &call);
+    std::optional<Val> mathCall(const std::string &name, std::vector<Val> &args);
+    std::optional<Val> stdlibCall(const std::string &name, std::vector<Val> &args, Ty expected);
+    std::optional<Val> resourceMethod(Val receiver, const std::string &method, Expr &e);
+    Val jsonDecode(Ty t, Val json);
+    llvm::Value *jsonDecodeFunction(Ty t);
+    std::map<std::string, llvm::Function *> jsonDecoders;
+    llvm::Function *lessTrampoline(Ty item, Ty function);
+    llvm::Function *taskRunner(Ty function);
+    // Named functions passed where a function value is expected become closures.
+    Val asFunction(Val f) {
+        if (f.t.name.rfind("fn:", 0) != 0)
+            return f;
+        auto &sig = signature(f.t.name.substr(3));
+        std::string t = "function<" + sig.result.name;
+        for (auto &param : sig.ast->params)
+            t += "," + type(param.type).name;
+        return convert(f, Ty{t + ">"});
+    }
     void declareFunction(Function &f) {
         std::string key = f.owner.empty() ? f.name : f.owner + "." + f.name;
-        if (functions.count(key) || (!f.owner.empty() && f.name == "init"))
-            error(f.name == "init" ? "custom init constructors are not implemented yet"
-                                   : "duplicate function '" + key + "'");
+        location = f.loc;
+        if (functions.count(key))
+            error("duplicate function '" + displayName(key) + "'");
+        if (f.name == "init" && !f.owner.empty() && !f.result.empty() && f.result != "void")
+            error("init cannot return a value");
+        if (!f.typeParams.empty() && !f.owner.empty())
+            error("methods cannot declare type parameters; make the class generic instead");
         Signature sig;
         sig.ast = &f;
-        sig.result = f.result.empty() ? Ty{"$infer"} : type(f.result);
-        if (sig.result.name != "$infer") {
+        sig.result = f.result.empty() ? (f.name == "init" ? Ty{"void"} : Ty{"$infer"})
+                                      : type(f.result);
+        if (f.abstract)
+            sig.done = true;
+        else if (sig.result.name != "$infer") {
             std::vector<llvm::Type *> args;
             if (!f.owner.empty())
                 args.push_back(b.getPtrTy());
@@ -1258,44 +1915,187 @@ end
         module.setTargetTriple(llvm::Triple(triple));
 
         module.setDataLayout(machine->createDataLayout());
-        if (usesWeb())
-            webClasses();
+        builtinClasses();
+        for (auto &family : p.families)
+            for (auto &[tag, info] : family.tags) {
+                auto &rules = familyRules[tag];
+                rules.attributes.insert(info.attributes.begin(), info.attributes.end());
+                rules.any = rules.any || info.anyAttribute;
+                rules.isVoid = rules.isVoid || info.isVoid;
+            }
+        enumNames().clear();
+        for (auto &en : p.enums) {
+            enums[en.name] = &en;
+            enumIds[en.name] = static_cast<int64_t>(enumIds.size());
+            enumNames().insert(en.name);
+        }
         for (auto &c : p.classes) {
             location = c.loc;
-            if (classes.count(c.name))
+            if (classes.count(c.name) || templates.count(c.name) || enums.count(c.name))
                 error("duplicate class");
-            classes[c.name] = &c;
-            std::set<std::string> fields;
-            for (auto &f : c.fields)
-                if (!fields.insert(f.name).second)
-                    error("duplicate field");
+            if (!c.typeParams.empty())
+                templates[c.name] = &c;
+            else
+                classes[c.name] = &c;
         }
-        static const std::set<std::string> modules = {"desktop", "html", "math",       "fs",
-                                                      "os",      "json", "web",        "time",
-                                                      "testing", "core", "collections"};
+        std::vector<Class *> declared;
+        for (auto &[name, c] : classes) {
+            (void)name;
+            declared.push_back(c);
+        }
+        for (auto c : declared)
+            finishClass(*c);
+        static const std::set<std::string> modules = {
+            "desktop", "html", "math", "fs",          "os", "json",  "web", "time",
+            "testing", "core", "io",   "collections", "net", "regex", "thread", "gc",
+            "svg"};
         for (auto &[alias, name] : p.imports) {
             if (!modules.count(name))
                 error("module '" + name +
                       "' is not implemented yet (local modules are not supported)");
             (void)alias;
         }
-        for (auto &f : p.functions)
-            declareFunction(f);
-        for (auto &c : p.classes)
-            for (auto &f : c.methods)
+        for (auto &f : p.functions) {
+            if (!f.typeParams.empty()) {
+                if (functionTemplates.count(f.name))
+                    error("duplicate function '" + displayName(f.name) + "'");
+                functionTemplates[f.name] = &f;
+            } else
                 declareFunction(f);
+        }
+        for (auto &c : p.classes)
+            if (c.typeParams.empty())
+                for (auto &f : c.methods)
+                    declareFunction(f);
+    }
+    // Flattens inherited fields (base fields first) and checks the class header.
+    void finishClass(Class &c) {
+        auto &state = classStates[c.name];
+        if (state == 2)
+            return;
+        location = c.loc;
+        if (state == 1)
+            error("inheritance cycle through '" + displayName(c.name) + "'");
+        state = 1;
+        std::set<std::string> names;
+        for (auto &f : c.fields)
+            if (!names.insert(f.name).second)
+                error("duplicate field '" + f.name + "'");
+        if (!c.base.empty()) {
+            c.base = type(c.base).name;
+            auto base = classes.find(c.base);
+            if (base == classes.end() || base->second->isInterface)
+                error("'" + displayName(c.base) + "' is not a class; use implements for interfaces");
+            finishClass(*base->second);
+            std::vector<Param> fields;
+            for (auto &f : base->second->fields) {
+                if (names.count(f.name))
+                    error("field '" + f.name + "' is already declared by base class '" +
+                          displayName(c.base) + "'");
+                fields.push_back({f.name, f.type, f.value ? clone(*f.value) : nullptr, f.loc});
+            }
+            for (auto &f : c.fields)
+                fields.push_back(std::move(f));
+            c.fields = std::move(fields);
+        }
+        for (auto &i : c.interfaces) {
+            i = type(i).name;
+            auto it = classes.find(i);
+            if (it == classes.end() || !it->second->isInterface)
+                error("'" + displayName(i) + "' is not an interface");
+            finishClass(*it->second);
+        }
+        state = 2;
+    }
+    // True when values of class/interface `from` may be used as `to`.
+    bool derives(const std::string &from, const std::string &to) {
+        if (from == to)
+            return true;
+        auto it = classes.find(from);
+        if (it == classes.end())
+            return false;
+        auto &c = *it->second;
+        if (!c.base.empty() && derives(c.base, to))
+            return true;
+        for (auto &i : c.interfaces)
+            if (derives(i, to))
+                return true;
+        return false;
+    }
+    // Concrete classes whose instances can have static type `name`.
+    std::vector<std::string> concreteClasses(const std::string &name) {
+        std::vector<std::string> out;
+        for (auto &[candidate, c] : classes)
+            if (!c->isInterface && derives(candidate, name))
+                out.push_back(candidate);
+        return out;
+    }
+    // The function key implementing `method` for class or interface `name` ("" if none).
+    std::string resolveMethod(const std::string &name, const std::string &method) {
+        auto it = classes.find(name);
+        if (it == classes.end())
+            return "";
+        if (functions.count(name + "." + method))
+            return name + "." + method;
+        auto &c = *it->second;
+        if (!c.base.empty())
+            if (auto found = resolveMethod(c.base, method); !found.empty())
+                return found;
+        for (auto &i : c.interfaces)
+            if (auto found = resolveMethod(i, method); !found.empty())
+                return found;
+        return "";
+    }
+    // One canonical name string per class doubles as its runtime class identity.
+    llvm::Constant *classId(const std::string &name) {
+        auto &id = classIds[name];
+        if (!id)
+            id = b.CreateGlobalString(name, "class." + name, 0, &module);
+        return id;
+    }
+    llvm::Value *isInstance(llvm::Value *object, const std::string &type) {
+        auto id = call("fw_class_id", b.getPtrTy(), {object});
+        llvm::Value *match = b.getFalse();
+        for (auto &c : concreteClasses(type))
+            match = b.CreateOr(match, b.CreateICmpEQ(id, classId(c)));
+        return match;
     }
     void run(const Options &opts) {
         desktopBackend = opts.desktopBackend;
-        current = llvm::Function::Create(llvm::FunctionType::get(b.getInt32Ty(), false),
-                                         llvm::GlobalValue::ExternalLinkage, "main", module);
+        if (opts.debug) {
+            dib = std::make_unique<llvm::DIBuilder>(module);
+            mainFile = module.getModuleIdentifier();
+            unit = dib->createCompileUnit(llvm::dwarf::DW_LANG_C, debugFile(mainFile), "flywheel",
+                                          opts.optimization > 0, "", 0);
+            module.addModuleFlag(llvm::Module::Warning, "Debug Info Version",
+                                 llvm::DEBUG_METADATA_VERSION);
+            module.addModuleFlag(llvm::Module::Warning, "Dwarf Version", 5);
+        }
+        current = llvm::Function::Create(
+            llvm::FunctionType::get(b.getInt32Ty(), {b.getInt32Ty(), b.getPtrTy()}, false),
+            llvm::GlobalValue::ExternalLinkage, "main", module);
         auto entry = llvm::BasicBlock::Create(ctx, "entry", current);
         b.SetInsertPoint(entry);
+        if (dib)
+            debugFunction(current, "main", {1, 1, mainFile});
         frame = objectCall("fw_frame", {});
+        call("fw_set_args", b.getVoidTy(),
+             {b.CreateSExt(current->getArg(0), b.getInt64Ty()), current->getArg(1)});
+        for (auto &name : builtinClassNames)
+            call("fw_register_class", b.getVoidTy(), {b.CreateGlobalString(name), classId(name)});
         failure = llvm::BasicBlock::Create(ctx, "propagate.error", current);
         scopes.emplace_back();
         top = true;
         returnType = Ty{"void"};
+        for (auto &[name, en] : enums) {
+            std::string names;
+            for (auto &m : en->members)
+                names += (names.empty() ? "" : ",") + m;
+            call("fw_enum_register", b.getVoidTy(),
+                 {i64(enumIds.at(name)), b.CreateGlobalString(names)});
+        }
+        validateClasses();
+        cells = cellNames(p.body);
         block(p.body, false);
         if (!terminated()) {
             if (usesWeb()) {
@@ -1303,17 +2103,35 @@ end
                 call("fw_web_shutdown", b.getVoidTy(), {});
             }
             call("fw_drop", b.getVoidTy(), {frame});
+            // Globals are released with the frame; collect any cycles they kept alive.
+            call("fw_gc_collect", b.getInt64Ty(), {});
             b.CreateRet(b.getInt32(0));
         }
         emitFailure();
         top = false;
-        for (auto &[name, sig] : functions) {
-            (void)name;
-            if (sig.result.name == "$infer")
-                buildFunction(sig, true);
-            if (!sig.done)
-                buildFunction(sig, false);
+        // Building a body can instantiate generic functions and classes, adding signatures.
+        for (bool pending = true; pending;) {
+            pending = false;
+            std::vector<std::string> names;
+            for (auto &[name, sig] : functions)
+                if (!sig.ast->abstract && !sig.done)
+                    names.push_back(name);
+            for (auto &name : names) {
+                auto &sig = functions.at(name);
+                if (sig.done)
+                    continue;
+                pending = true;
+                if (sig.result.name == "$infer")
+                    buildFunction(sig, true);
+                if (!sig.done)
+                    buildFunction(sig, false);
+            }
         }
+        for (auto &[name, body] : p.components)
+            if (!instantiatedComponents.count(name))
+                checkTemplate(*body);
+        if (dib)
+            dib->finalize();
         if (llvm::verifyModule(module, &llvm::errs()))
             throw std::runtime_error("internal error: LLVM verification failed");
         if (opts.optimization) {
@@ -1450,55 +2268,66 @@ Val Compiler::explicitCast(Val source, Ty target) {
     if (source.t == target && !target.array() && !target.tuple() && !target.homogeneousTuple() &&
         !target.map())
         return source;
+    if (target.name == "char") {
+        if (source.t.name == "string")
+            return {b.CreateTrunc(call("fw_string_to_char", b.getInt64Ty(), {source.v}),
+                                  b.getInt32Ty()),
+                    target};
+        if (!source.t.integer())
+            error("char() converts an integer code point or a one-character string");
+        auto code = convert(source, Ty{"i64"}, true);
+        return {b.CreateTrunc(call("fw_int_to_char", b.getInt64Ty(), {code.v}), b.getInt32Ty()),
+                target};
+    }
+    if (source.t.enumeration() && target.numeric())
+        return convert({source.v, Ty{"i64"}}, target, true);
+    if (source.t.name == "char" && target.numeric())
+        return convert({b.CreateZExt(source.v, b.getInt64Ty()), Ty{"i64"}}, target, true);
     if ((source.t.numeric() || source.t.name == "bool") && target.numeric())
         return convert(source, target, true);
     return collectionCast(source, target);
 }
 Val Compiler::value(Expr &e, Ty expected) {
     location = e.loc;
+    debugLocation();
     if (e.kind == "name" || e.kind == "member") {
         auto name = callable(e);
-        bool referenceVariable = false;
         if (e.kind == "name")
             if (auto variable = lookup(name)) {
-                referenceVariable = variable->type.classReference();
-                if (referenceVariable) {
-                    // Check global initialization even though the constructor identity is static.
-                    auto reference = load(*variable);
-                    if (e.grouped || !e.outer)
-                        return reference;
-                    name = variable->type.name.substr(6);
-                } else
-                    name.clear();
+                // Check global initialization even though the constructor identity is static.
+                if (variable->type.classReference())
+                    return load(*variable);
+                name.clear();
             }
         if (name == "desktop.Window")
             name = "desktop.window";
-        if (referenceVariable || classes.count(name) || name == "desktop.window") {
-            if (e.outer && !e.grouped) {
-                Expr call;
-                call.kind = "call";
-                call.loc = e.loc;
-                auto callee = std::make_unique<Expr>();
-                callee->kind = "name";
-                callee->text = name;
-                callee->loc = e.loc;
-                call.args.push_back(std::move(callee));
-                return invoke(call, expected);
+        if (auto open = name.find('<'); open != std::string::npos) {
+            auto base = name.substr(0, open);
+            std::vector<Ty> arguments;
+            for (auto &part : typeParts(name.substr(open + 1, name.size() - open - 2)))
+                arguments.push_back(type(part));
+            if (templates.count(base))
+                name = instantiateClass(base, arguments);
+            else if (functionTemplates.count(base)) {
+                auto key = instantiateFunction(base, arguments);
+                return {signature(key).function, Ty{"fn:" + key}};
             }
-            // Constructor identity lives in the static type; this payload is never ARC-managed.
+        } else if (functionTemplates.count(name))
+            error("generic function " + displayName(name) +
+                  " needs type arguments to be used as a value, such as " + displayName(name) +
+                  "<int>");
+        // A bare class name is a constructor reference; construction always uses a call.
+        if (classes.count(name) || name == "desktop.window")
             return {llvm::ConstantPointerNull::get(b.getPtrTy()), Ty{"class:" + name}};
-        }
     }
     if (e.kind == "int") {
-        try {
-            size_t used;
-            auto n = std::stoll(e.text, &used);
-            if (used != e.text.size())
-                error("invalid integer literal");
-            return {i64(n), Ty{"i64"}};
-        } catch (const std::exception &) {
-            error("integer literal exceeds int range");
-        }
+        llvm::APInt n;
+        if (llvm::StringRef(e.text).getAsInteger(10, n) || n.getActiveBits() > 64)
+            error("integer literal exceeds u64 range");
+        // Literals above the signed 64-bit maximum are u64 constants.
+        if (n.getActiveBits() == 64)
+            return {b.getInt64(n.getZExtValue()), Ty{"u64"}};
+        return {i64(static_cast<int64_t>(n.getZExtValue())), Ty{"i64"}};
     }
     if (e.kind == "real") {
         try {
@@ -1512,6 +2341,15 @@ Val Compiler::value(Expr &e, Ty expected) {
     }
     if (e.kind == "bool")
         return {b.getInt1(e.text == "true"), Ty{"bool"}};
+    if (e.kind == "char") {
+        uint32_t scalar = 0;
+        auto c = static_cast<unsigned char>(e.text[0]);
+        size_t n = c < 0x80 ? 1 : c < 0xe0 ? 2 : c < 0xf0 ? 3 : 4;
+        scalar = n == 1 ? c : c & (0x3f >> (n - 1));
+        for (size_t i = 1; i < n; ++i)
+            scalar = (scalar << 6) | (static_cast<unsigned char>(e.text[i]) & 63);
+        return {b.getInt32(scalar), Ty{"char"}};
+    }
     if (e.kind == "null")
         return {llvm::ConstantPointerNull::get(b.getPtrTy()), Ty{"null"}};
     if (e.kind == "string")
@@ -1549,19 +2387,50 @@ Val Compiler::value(Expr &e, Ty expected) {
     }
     if (e.kind == "inst") {
         auto obj = receiver();
+        if (!hasField(obj.t.name, e.text) && !resolveMethod(obj.t.name, e.text).empty())
+            return boundMethod(obj, e.text);
         auto [c, i] = field(obj.t, e.text);
         return get(obj, i64(i), type(c->fields[i].type));
     }
+    if (e.kind == "member" && e.args[0]->kind == "name" && enums.count(e.args[0]->text) &&
+        !lookup(e.args[0]->text)) {
+        auto &en = *enums.at(e.args[0]->text);
+        auto it = std::find(en.members.begin(), en.members.end(), e.text);
+        if (it == en.members.end())
+            error("enum " + displayName(en.name) + " has no member '" + e.text + "'");
+        return {i64(it - en.members.begin()), Ty{en.name}};
+    }
+    if (e.kind == "is" || e.kind == "as")
+        return typeTest(e);
+    if (e.kind == "super")
+        error("'super' must be followed by a method call, such as super.init(...)");
     if (e.kind == "member") {
         auto obj = unwrap(value(*e.args[0]));
-        if (obj.t.name == "module:math" && e.text == "PI")
-            return {llvm::ConstantFP::get(b.getDoubleTy(), 3.141592653589793), Ty{"double"}};
+        if (obj.t.enumeration()) {
+            if (e.text == "value")
+                return {obj.v, Ty{"i64"}};
+            if (e.text == "name")
+                return stringify(obj);
+            error("enum values have .name and .value");
+        }
+        if (obj.t.name == "module:math") {
+            static const std::map<std::string, double> constants = {
+                {"PI", 3.141592653589793},
+                {"TAU", 6.283185307179586},
+                {"E", 2.718281828459045},
+                {"INF", std::numeric_limits<double>::infinity()},
+                {"NAN", std::numeric_limits<double>::quiet_NaN()}};
+            if (constants.count(e.text))
+                return {llvm::ConstantFP::get(b.getDoubleTy(), constants.at(e.text)),
+                        Ty{"double"}};
+        }
         if (obj.t.name == "module:desktop")
             error("module 'desktop' has no member '" + e.text +
                   "'; use desktop.window or desktop.Window");
         if (obj.t.result() && e.text == "is_ok")
             return get(obj, i64(0), Ty{"bool"});
-        if ((obj.t.name == "string" || obj.t.sequence() || obj.t.map() || obj.t.tuple()) &&
+        if ((obj.t.name == "string" || obj.t.sequence() || obj.t.map() || obj.t.set() ||
+             obj.t.tuple()) &&
             e.text == "length")
             return {call("fw_length", b.getInt64Ty(), {obj.v}), Ty{"i64"}};
         if (obj.t.name == "element" || obj.t.name == "fragment") {
@@ -1571,15 +2440,46 @@ Val Compiler::value(Expr &e, Ty expected) {
                 e.text == "inner_html" || e.text == "outer_html" || e.text == "id" ||
                 e.text == "class_name")
                 return *domCall("html." + e.text, {obj});
+            if (e.text == "parent" || e.text == "next_sibling" || e.text == "previous_sibling")
+                return {objectCall("fw_dom_relative",
+                                   {frame, obj.v,
+                                    i64(e.text == "parent" ? 0 : e.text == "next_sibling" ? 1 : 2)}),
+                        Ty{"element?"}};
         }
         if (errorTypes.count(obj.t.name) && e.text == "message")
             return {objectCall("fw_error_message", {frame, obj.v}), Ty{"string"}};
+        if (classes.count(obj.t.name) && !hasField(obj.t.name, e.text) &&
+            !resolveMethod(obj.t.name, e.text).empty())
+            return boundMethod(obj, e.text);
         auto [c, i] = field(obj.t, e.text);
         return get(obj, i64(i), type(c->fields[i].type));
     }
     if (e.kind == "index") {
         auto obj = value(*e.args[0]);
-        auto [index, t] = indexOf(obj, *e.args[1], false);
+        auto &position = *e.args[1];
+        if ((obj.t.name == "string" || obj.t.sequence()) && position.kind == "binary" &&
+            !position.grouped && (position.text == ".." || position.text == "..<")) {
+            auto from = convert(value(*position.args[0]), Ty{"i64"});
+            auto to = convert(value(*position.args[1]), Ty{"i64"});
+            auto mode = i64(position.text == ".." ? 2 : 1);
+            if (obj.t.name == "string")
+                return {objectCall("fw_string_slice", {frame, obj.v, from.v, to.v, mode}), obj.t};
+            return {objectCall("fw_array_slice", {frame, obj.v, from.v, to.v, mode}), obj.t};
+        }
+        if (obj.t.name == "string") {
+            auto index = convert(value(position), Ty{"i64"});
+            return {b.CreateTrunc(call("fw_string_char_at", b.getInt64Ty(), {obj.v, index.v}),
+                                  b.getInt32Ty()),
+                    Ty{"char"}};
+        }
+        if (obj.t.name == "json.value") {
+            // json[0] indexes an array; json["key"] reads an object field.
+            auto key = value(position);
+            if (key.t.name == "string")
+                return {objectCall("fw_json_get", {frame, obj.v, key.v}), obj.t};
+            return {objectCall("fw_json_at", {frame, obj.v, convert(key, Ty{"i64"}).v}), obj.t};
+        }
+        auto [index, t] = indexOf(obj, position, false);
         return get(obj, index, t);
     }
     if (e.kind == "call")
@@ -1595,6 +2495,8 @@ Val Compiler::value(Expr &e, Ty expected) {
         bool tuple = expected.tuple();
         for (size_t i = 0; i < e.args.size(); ++i) {
             auto v = value(*e.args[i], expected.tuple() ? parts[i] : item);
+            if (v.t.classReference())
+                v = convert(v, item.function() ? item : constructorType(v.t.name.substr(6)));
             items.push_back(v);
             if (item.name == "void")
                 item = v.t;
@@ -1629,6 +2531,20 @@ Val Compiler::value(Expr &e, Ty expected) {
         }
         return out;
     }
+    if (e.kind == "set" || (e.kind == "map" && e.args.empty() && expected.set())) {
+        Ty item = expected.set() ? expected.parts()[0] : Ty{};
+        std::vector<Val> items;
+        for (auto &a : e.args) {
+            auto v = value(*a, item);
+            if (item.name == "void")
+                item = v.t;
+            items.push_back(v);
+        }
+        auto out = newSet(type("set<" + item.name + ">"));
+        for (auto &v : items)
+            keyFind(out, convert(v, item), 1);
+        return out;
+    }
     if (e.kind == "map") {
         if (e.args.empty() && !expected.map())
             error("empty maps require an expected map type");
@@ -1646,10 +2562,7 @@ Val Compiler::value(Expr &e, Ty expected) {
             values.push_back(v);
         }
         Ty t = type("map<" + key.name + "," + item.name + ">");
-        Val out{objectCall("fw_map_new", {frame, i64(key.object()         ? 4
-                                                     : key.name == "bool" ? 3
-                                                     : key.unsigned_()    ? 1
-                                                                          : 0)}),
+        Val out{objectCall("fw_map_new", {frame, i64(mapKeyKind(key))}),
                 t};
         for (size_t i = 0; i < keys.size(); ++i) {
             auto index = mapIndex(out, convert(keys[i], key), true);
@@ -1674,6 +2587,8 @@ Val Compiler::value(Expr &e, Ty expected) {
             return {b.CreateFNeg(a.v), a.t};
         return binary("-", {llvm::ConstantInt::get(ll(a.t), 0), a.t}, a);
     }
+    if (e.kind == "binary" && e.text == "??")
+        return coalesce(e, expected);
     if (e.kind == "binary") {
         auto a = value(*e.args[0]);
         if (e.text == "and" || e.text == "or") {
@@ -1685,7 +2600,23 @@ Val Compiler::value(Expr &e, Ty expected) {
             bool and_ = e.text == "and";
             b.CreateCondBr(a.v, and_ ? right : merge, and_ ? merge : right);
             b.SetInsertPoint(right);
-            auto c = value(*e.args[1]);
+            // `x != null and x > 0` reads x as non-null on the right-hand side.
+            std::vector<std::string> proven;
+            nonNullNames(*e.args[0], and_, proven);
+            std::vector<std::pair<std::string, std::string>> instances;
+            if (and_)
+                instanceNames(*e.args[0], true, instances);
+            scopes.emplace_back();
+            narrow(proven);
+            narrowTypes(instances);
+            Val c;
+            try {
+                c = value(*e.args[1]);
+            } catch (...) {
+                scopes.pop_back();
+                throw;
+            }
+            scopes.pop_back();
             if (c.t.name != "bool")
                 error("boolean operators require bool operands");
             auto tail = b.GetInsertBlock();
@@ -1744,19 +2675,20 @@ Val Compiler::value(Expr &e, Ty expected) {
         if (e.text == "*" && (a.t.map() || c.t.map()))
             error("maps cannot be repeated because keys must be unique");
         if (e.text == "in") {
-            if (c.t.map()) {
+            if (c.t.map() || c.t.set()) {
                 auto key = convert(a, c.t.parts()[0]);
-                auto integer = key.t.object()
-                                   ? i64(0)
-                                   : b.CreateIntCast(key.v, b.getInt64Ty(),
-                                                     key.t.name != "bool" && !key.t.unsigned_());
-                auto object = key.t.object() ? key.v : llvm::ConstantPointerNull::get(b.getPtrTy());
-                return {b.CreateICmpNE(call("fw_map_has", b.getInt64Ty(), {c.v, integer, object}),
+                return {b.CreateICmpSGE(keyFind(c, key, 2), i64(0)), Ty{"bool"}};
+            }
+            if (c.t.name == "string") {
+                if (a.t.name != "string" && a.t.name != "char")
+                    error("string membership requires a string or char");
+                return {b.CreateICmpNE(call("fw_string_search", b.getInt64Ty(),
+                                            {c.v, stringify(a).v, i64(1)}),
                                        i64(0)),
                         Ty{"bool"}};
             }
             if (!c.t.sequence())
-                error("membership requires an array, homogeneous tuple, or map");
+                error("membership requires an array, homogeneous tuple, string, or map");
             a = convert(a, c.t.item());
             std::string suffix = a.t.object() ? "object" : a.t.real() ? "real" : "int";
             llvm::Value *item = a.v;
@@ -1771,8 +2703,34 @@ Val Compiler::value(Expr &e, Ty expected) {
         }
         return binary(e.text, a, c);
     }
+    if (e.kind == "chain") {
+        // Each comparison is evaluated only while the previous ones hold.
+        auto left = value(*e.args[0]);
+        auto merge = llvm::BasicBlock::Create(ctx, "chain.end", current);
+        std::vector<std::pair<llvm::BasicBlock *, llvm::Value *>> exits;
+        Val result;
+        for (size_t i = 1; i < e.args.size(); ++i) {
+            auto right = value(*e.args[i]);
+            result = binary(e.names[i - 1], left, right);
+            if (i + 1 == e.args.size())
+                break;
+            auto next = llvm::BasicBlock::Create(ctx, "chain.next", current);
+            exits.emplace_back(b.GetInsertBlock(), b.getFalse());
+            b.CreateCondBr(result.v, next, merge);
+            b.SetInsertPoint(next);
+            left = right;
+        }
+        exits.emplace_back(b.GetInsertBlock(), result.v);
+        b.CreateBr(merge);
+        b.SetInsertPoint(merge);
+        auto phi = b.CreatePHI(b.getInt1Ty(), static_cast<unsigned>(exits.size()));
+        for (auto &[block, v] : exits)
+            phi->addIncoming(v, block);
+        return {phi, Ty{"bool"}};
+    }
     if (e.kind == "element") {
         if (p.components.count(e.text)) {
+            instantiatedComponents.insert(e.text);
             if (!componentStack.insert(e.text).second)
                 error("recursive component expansion is not supported");
             std::map<std::string, Val> supplied;
@@ -1781,10 +2739,7 @@ Val Compiler::value(Expr &e, Ty expected) {
             auto empty = literal("");
             Val inner{objectCall("fw_element", {frame, empty.v}), Ty{"fragment"}};
             for (size_t i = e.names.size(); i < e.args.size(); ++i) {
-                auto child = value(*e.args[i]);
-                if (child.t.name != "element" && child.t.name != "fragment")
-                    child = stringify(child);
-                call("fw_child", b.getVoidTy(), {inner.v, child.v});
+                markupChild(inner, value(*e.args[i]));
             }
             if (supplied.count("inner"))
                 error("'inner' is reserved for component child content");
@@ -1799,48 +2754,38 @@ Val Compiler::value(Expr &e, Ty expected) {
             componentStack.erase(e.text);
             return result;
         }
-        static const std::set<std::string> tags = {
-            "html",  "head",    "title",    "body",       "div",    "span",  "h1",     "h2",
-            "h3",    "h4",      "h5",       "h6",         "p",      "a",     "button", "input",
-            "label", "form",    "textarea", "select",     "option", "ul",    "ol",     "li",
-            "table", "thead",   "tbody",    "tr",         "td",     "th",    "br",     "hr",
-            "img",   "meta",    "link",     "script",     "style",  "main",  "header", "footer",
-            "nav",   "section", "article",  "aside",      "strong", "em",    "b",      "i",
-            "code",  "pre",     "small",    "blockquote", "video",  "audio", "source"};
-        if (!e.text.empty() && (!p.html || !tags.count(e.text)))
+        auto rules = tagRules(e.text);
+        if (!e.text.empty() && !rules)
             error("unknown tag '" + e.text + "'");
         auto tag = literal(e.text);
         Val tree{objectCall("fw_element", {frame, tag.v}),
                  Ty{e.text.empty() ? "fragment" : "element"}};
-        static const std::set<std::string> global = {"id",   "class", "style", "title",
-                                                     "lang", "dir",   "role",  "tabindex"};
-        static const std::map<std::string, std::set<std::string>> specific = {
-            {"a", {"href", "target", "rel"}},
-            {"img", {"src", "alt", "width", "height"}},
-            {"input", {"type", "name", "value", "placeholder", "disabled", "checked", "required"}},
-            {"button", {"type", "disabled", "name", "value"}},
-            {"form", {"action", "method"}},
-            {"label", {"for"}},
-            {"meta", {"charset", "name", "content"}},
-            {"link", {"href", "rel"}},
-            {"script", {"src", "type"}},
-            {"textarea", {"name", "placeholder", "disabled", "required", "rows", "cols"}},
-            {"option", {"value", "selected", "disabled"}}};
-        static const std::set<std::string> booleans = {"disabled", "checked", "required",
-                                                       "selected", "hidden"};
         for (size_t i = 0; i < e.names.size(); ++i) {
             auto &name = e.names[i];
-            if (name.rfind("on", 0) == 0)
-                error("native event handlers require a client backend, which is not implemented");
-            auto it = specific.find(e.text);
-            if (!global.count(name) && name != "hidden" && name.rfind("data-", 0) != 0 &&
-                name.rfind("aria-", 0) != 0 && (it == specific.end() || !it->second.count(name)))
+            if (name.rfind("on", 0) == 0 && name.size() > 2) {
+                // String handlers are inline JavaScript. Function handlers run Flywheel code in
+                // desktop windows; HTML rendered for the web omits them.
+                auto handler = asFunction(value(*e.args[i], Ty{"function<void>"}));
+                auto key = literal(name);
+                if (handler.t.name == "string") {
+                    call("fw_attribute", b.getVoidTy(), {tree.v, key.v, handler.v});
+                    continue;
+                }
+                if (handler.t.name != "function<void>" && handler.t.name != "function<void,string>")
+                    error("event attribute '" + name +
+                          "' expects JavaScript text, a function() returns void, or a "
+                          "function(string value) returns void");
+                call("fw_element_event", b.getVoidTy(),
+                     {tree.v, key.v, handler.v, i64(handler.t.parts().size() - 1)});
+                continue;
+            }
+            if (!attributeAllowed(*rules, name))
                 error("unknown attribute '" + name + "' on <" + e.text + ">");
             auto x = value(*e.args[i]);
             auto key = literal(name);
-            if (booleans.count(name)) {
+            if (rules->booleans.count(name)) {
                 if (x.t.name != "bool")
-                    error("boolean HTML attribute '" + name + "' requires bool");
+                    error("boolean attribute '" + name + "' requires bool");
                 auto yes = llvm::BasicBlock::Create(ctx, "attribute", current);
                 auto after = llvm::BasicBlock::Create(ctx, "attribute.end", current);
                 b.CreateCondBr(x.v, yes, after);
@@ -1850,30 +2795,173 @@ Val Compiler::value(Expr &e, Ty expected) {
                 b.CreateBr(after);
                 b.SetInsertPoint(after);
             } else {
+                // Numbers and chars render with their usual text; other values need string().
+                if (x.t.numeric() || x.t.name == "char" || x.t.enumeration())
+                    x = stringify(x);
                 if (x.t.name != "string")
-                    error("HTML attribute '" + name + "' requires string");
+                    error("attribute '" + name + "' requires a string or number, not " +
+                          displayName(x.t.name));
                 call("fw_attribute", b.getVoidTy(), {tree.v, key.v, x.v});
             }
         }
-        static const std::set<std::string> voidTags = {"br",   "hr",   "img",   "input",
-                                                       "meta", "link", "source"};
-        if (voidTags.count(e.text) && e.args.size() != e.names.size())
-            error("void HTML elements cannot have children");
+        if (rules && rules->isVoid && e.args.size() != e.names.size())
+            error("void element <" + e.text + "> cannot have children");
         for (size_t i = e.names.size(); i < e.args.size(); ++i) {
-            auto child = value(*e.args[i]);
-            if (child.t.name != "element" && child.t.name != "fragment")
-                child = stringify(child);
-            call("fw_child", b.getVoidTy(), {tree.v, child.v});
+            markupChild(tree, value(*e.args[i]));
         }
         return tree;
     }
     error("unsupported expression '" + e.kind + "'");
+}
+// Allowed attributes per tag for HTML (import html.*), SVG (import svg.*), and declared
+// element families. data-*, aria-*, and on* event attributes are accepted on every tag.
+const Compiler::TagRules *Compiler::tagRules(const std::string &tag) {
+    static const std::set<std::string> htmlBooleans = {
+        "disabled", "checked",   "required", "selected", "hidden",   "readonly",
+        "multiple", "autofocus", "autoplay", "controls", "loop",     "muted",
+        "open",     "novalidate", "reversed", "defer",   "async",    "allowfullscreen",
+        "default",  "ismap",     "playsinline", "nomodule", "formnovalidate", "inert",
+        "itemscope"};
+    static const std::map<std::string, TagRules> html = [] {
+        std::set<std::string> global = {
+            "accesskey", "autocapitalize", "autofocus", "class", "contenteditable", "dir",
+            "draggable", "enterkeyhint", "hidden", "id", "inert", "inputmode", "is", "itemid",
+            "itemprop", "itemref", "itemscope", "itemtype", "lang", "nonce", "popover", "role",
+            "slot", "spellcheck", "style", "tabindex", "title", "translate"};
+        std::map<std::string, std::set<std::string>> specific = {
+            {"a", {"href", "target", "rel", "download", "hreflang", "ping", "referrerpolicy",
+                   "type"}},
+            {"area", {"alt", "coords", "shape", "href", "target", "rel", "download"}},
+            {"audio", {"src", "controls", "autoplay", "loop", "muted", "preload", "crossorigin"}},
+            {"video", {"src", "controls", "autoplay", "loop", "muted", "preload", "poster",
+                       "width", "height", "playsinline", "crossorigin"}},
+            {"base", {"href", "target"}},
+            {"blockquote", {"cite"}},
+            {"q", {"cite"}},
+            {"del", {"cite", "datetime"}},
+            {"ins", {"cite", "datetime"}},
+            {"button", {"type", "disabled", "name", "value", "form", "formaction", "formmethod",
+                        "formenctype", "formnovalidate", "formtarget", "popovertarget",
+                        "popovertargetaction"}},
+            {"canvas", {"width", "height"}},
+            {"col", {"span"}},
+            {"colgroup", {"span"}},
+            {"data", {"value"}},
+            {"details", {"open", "name"}},
+            {"dialog", {"open"}},
+            {"embed", {"src", "type", "width", "height"}},
+            {"fieldset", {"disabled", "form", "name"}},
+            {"form", {"action", "method", "enctype", "target", "novalidate", "autocomplete",
+                      "name", "accept-charset", "rel"}},
+            {"iframe", {"src", "srcdoc", "name", "sandbox", "allow", "allowfullscreen", "width",
+                        "height", "loading", "referrerpolicy"}},
+            {"img", {"src", "alt", "width", "height", "srcset", "sizes", "loading", "decoding",
+                     "crossorigin", "usemap", "ismap", "referrerpolicy", "fetchpriority"}},
+            {"input", {"type", "name", "value", "placeholder", "disabled", "checked", "required",
+                       "readonly", "min", "max", "step", "minlength", "maxlength", "pattern",
+                       "size", "multiple", "accept", "autocomplete", "list", "form", "src",
+                       "alt", "width", "height", "capture", "dirname", "formaction",
+                       "formmethod"}},
+            {"label", {"for", "form"}},
+            {"li", {"value"}},
+            {"link", {"href", "rel", "type", "media", "sizes", "crossorigin", "integrity", "as",
+                      "hreflang", "referrerpolicy"}},
+            {"map", {"name"}},
+            {"meta", {"charset", "name", "content", "http-equiv", "property", "media"}},
+            {"meter", {"value", "min", "max", "low", "high", "optimum"}},
+            {"object", {"data", "type", "name", "width", "height", "form"}},
+            {"ol", {"reversed", "start", "type"}},
+            {"optgroup", {"label", "disabled"}},
+            {"option", {"value", "selected", "disabled", "label"}},
+            {"output", {"for", "form", "name"}},
+            {"progress", {"value", "max"}},
+            {"script", {"src", "type", "async", "defer", "crossorigin", "integrity", "nomodule",
+                        "referrerpolicy"}},
+            {"select", {"name", "disabled", "required", "multiple", "size", "form",
+                        "autocomplete"}},
+            {"source", {"src", "type", "srcset", "sizes", "media", "width", "height"}},
+            {"style", {"media"}},
+            {"td", {"colspan", "rowspan", "headers"}},
+            {"th", {"colspan", "rowspan", "headers", "scope", "abbr"}},
+            {"template", {"shadowrootmode"}},
+            {"textarea", {"name", "placeholder", "disabled", "required", "readonly", "rows",
+                          "cols", "minlength", "maxlength", "wrap", "form", "autocomplete"}},
+            {"time", {"datetime"}},
+            {"track", {"src", "kind", "srclang", "label", "default"}}};
+        std::set<std::string> voids = {"area", "base", "br",   "col",   "embed", "hr", "img",
+                                       "input", "link", "meta", "source", "track", "wbr"};
+        std::map<std::string, TagRules> out;
+        for (auto tag : {"a", "abbr", "address", "area", "article", "aside", "audio", "b", "base",
+                         "bdi", "bdo", "blockquote", "body", "br", "button", "canvas", "caption",
+                         "cite", "code", "col", "colgroup", "data", "datalist", "dd", "del",
+                         "details", "dfn", "dialog", "div", "dl", "dt", "em", "embed", "fieldset",
+                         "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5",
+                         "h6", "head", "header", "hgroup", "hr", "html", "i", "iframe", "img",
+                         "input", "ins", "kbd", "label", "legend", "li", "link", "main", "map",
+                         "mark", "menu", "meta", "meter", "nav", "noscript", "object", "ol",
+                         "optgroup", "option", "output", "p", "picture", "pre", "progress", "q",
+                         "rp", "rt", "ruby", "s", "samp", "script", "search", "section",
+                         "select", "slot", "small", "source", "span", "strong", "style", "sub",
+                         "summary", "sup", "table", "tbody", "td", "template", "textarea",
+                         "tfoot", "th", "thead", "time", "title", "tr", "track", "u", "ul",
+                         "var", "video", "wbr"}) {
+            TagRules rules;
+            rules.attributes = global;
+            if (auto it = specific.find(tag); it != specific.end())
+                rules.attributes.insert(it->second.begin(), it->second.end());
+            rules.isVoid = voids.count(tag) > 0;
+            rules.booleans = htmlBooleans;
+            out[tag] = std::move(rules);
+        }
+        return out;
+    }();
+    static const std::map<std::string, TagRules> svg = [] {
+        std::set<std::string> attributes = {
+            "id", "class", "style", "lang", "tabindex", "role", "viewBox", "xmlns", "xmlns:xlink",
+            "width", "height", "x", "y", "x1", "y1", "x2", "y2", "cx", "cy", "r", "rx", "ry", "dx",
+            "dy", "d", "points", "pathLength", "fill", "fill-opacity", "fill-rule", "stroke",
+            "stroke-width", "stroke-linecap", "stroke-linejoin", "stroke-dasharray",
+            "stroke-dashoffset", "stroke-opacity", "stroke-miterlimit", "opacity", "transform",
+            "href", "xlink:href", "offset", "stop-color", "stop-opacity", "gradientUnits",
+            "gradientTransform", "spreadMethod", "fx", "fy", "font-size", "font-family",
+            "font-weight", "text-anchor", "dominant-baseline", "letter-spacing", "lengthAdjust",
+            "textLength", "preserveAspectRatio", "clip-path", "clipPathUnits", "mask",
+            "maskUnits", "marker-start", "marker-mid", "marker-end", "refX", "refY",
+            "markerWidth", "markerHeight", "markerUnits", "orient", "patternUnits",
+            "patternContentUnits", "patternTransform", "visibility", "display", "filter",
+            "vector-effect", "shape-rendering", "color"};
+        std::map<std::string, TagRules> out;
+        for (auto tag : {"svg", "g", "path", "circle", "ellipse", "line", "polyline", "polygon",
+                         "rect", "text", "tspan", "textPath", "defs", "use", "symbol",
+                         "linearGradient", "radialGradient", "stop", "clipPath", "mask",
+                         "pattern", "image", "title", "desc", "marker", "foreignObject",
+                         "switch", "view"}) {
+            TagRules rules;
+            rules.attributes = attributes;
+            out[tag] = std::move(rules);
+        }
+        return out;
+    }();
+    if (p.html)
+        if (auto it = html.find(tag); it != html.end())
+            return &it->second;
+    if (p.svg)
+        if (auto it = svg.find(tag); it != svg.end())
+            return &it->second;
+    if (auto it = familyRules.find(tag); it != familyRules.end())
+        return &it->second;
+    return nullptr;
+}
+bool Compiler::attributeAllowed(const TagRules &rules, const std::string &name) {
+    return rules.any || rules.attributes.count(name) || name.rfind("data-", 0) == 0 ||
+           name.rfind("aria-", 0) == 0;
 }
 std::optional<Val> Compiler::domCall(const std::string &name, std::vector<Val> args) {
     if (name.rfind("html.", 0) != 0)
         return std::nullopt;
     auto method = name.substr(5);
     static const std::set<std::string> methods = {"attributes",
+                                                  "closest",
                                                   "query",
                                                   "query_all",
                                                   "get_by_id",
@@ -1921,6 +3009,10 @@ std::optional<Val> Compiler::domCall(const std::string &name, std::vector<Val> a
         count(2);
         return Val{objectCall("fw_dom_query", {frame, root.v, text(1), i64(method == "query_all")}),
                    Ty{method == "query_all" ? "element[]" : "element?"}};
+    }
+    if (method == "closest") {
+        count(2);
+        return Val{objectCall("fw_dom_closest", {frame, root.v, text(1)}), Ty{"element?"}};
     }
     if (method == "get_by_id") {
         count(2);
@@ -2007,6 +3099,79 @@ Val Compiler::invoke(Expr &e, Ty expected) {
     std::vector<Expr *> rest;
     for (size_t i = 1; i < e.args.size(); ++i)
         rest.push_back(e.args[i].get());
+    if (callee.kind == "inst" && !owner.empty() && !resolveMethod(owner, callee.text).empty())
+        return callMethod(receiver(), owner, callee.text, e, false);
+    if (callee.kind == "member" && callee.args[0]->kind == "super") {
+        if (owner.empty())
+            error("'super' is valid only in a method");
+        auto &c = *classes.at(owner);
+        if (c.base.empty())
+            error("'super' requires a base class; " + displayName(owner) + " has none");
+        auto self = receiver();
+        if (callee.text == "init" && resolveMethod(c.base, "init").empty()) {
+            // The base class's generated constructor: assign its fields positionally.
+            auto &base = *classes.at(c.base);
+            if (e.args.size() - 1 > base.fields.size())
+                error("too many arguments to super.init for " + displayName(c.base));
+            for (size_t i = 0; i < base.fields.size(); ++i) {
+                auto &f = base.fields[i];
+                Ty t = type(f.type);
+                Val v;
+                if (i + 1 < e.args.size())
+                    v = value(*e.args[i + 1], t);
+                else if (f.value)
+                    v = defaultValue(*f.value, t);
+                else
+                    error("missing super.init argument for field '" + f.name + "'");
+                set(self, i64(static_cast<int64_t>(i)), convert(v, t));
+            }
+            return {};
+        }
+        if (resolveMethod(c.base, callee.text).empty())
+            error("base class " + displayName(c.base) + " has no method '" + callee.text + "'");
+        return callMethod({self.v, Ty{c.base}}, c.base, callee.text, e, true);
+    }
+    if (callee.kind == "member" && callee.args[0]->kind == "name" &&
+        enums.count(callee.args[0]->text) && !lookup(callee.args[0]->text)) {
+        auto &en = *enums.at(callee.args[0]->text);
+        Ty t{en.name};
+        if (callee.text == "values") {
+            if (e.args.size() != 1)
+                error("values expects no arguments");
+            Val out{objectCall("fw_new", {frame, i64(static_cast<int64_t>(en.members.size())),
+                                          i64(1)}),
+                    Ty{en.name + "[]"}};
+            for (size_t i = 0; i < en.members.size(); ++i)
+                set(out, i64(static_cast<int64_t>(i)), {i64(static_cast<int64_t>(i)), t});
+            return out;
+        }
+        if (callee.text == "from_name") {
+            if (e.args.size() != 2)
+                error("from_name expects one string");
+            auto text = convert(value(*e.args[1]), Ty{"string"});
+            std::string names;
+            for (auto &m : en.members)
+                names += (names.empty() ? "" : ",") + m;
+            auto index = call("fw_enum_index", b.getInt64Ty(),
+                              {b.CreateGlobalString(names), text.v});
+            auto found = llvm::BasicBlock::Create(ctx, "enum.found", current);
+            auto missing = llvm::BasicBlock::Create(ctx, "enum.missing", current);
+            auto done = llvm::BasicBlock::Create(ctx, "enum.end", current);
+            b.CreateCondBr(b.CreateICmpSGE(index, i64(0)), found, missing);
+            b.SetInsertPoint(found);
+            auto present = convert({index, t}, Ty{en.name + "?"});
+            auto foundEnd = b.GetInsertBlock();
+            b.CreateBr(done);
+            b.SetInsertPoint(missing);
+            b.CreateBr(done);
+            b.SetInsertPoint(done);
+            auto phi = b.CreatePHI(b.getPtrTy(), 2);
+            phi->addIncoming(present.v, foundEnd);
+            phi->addIncoming(llvm::ConstantPointerNull::get(b.getPtrTy()), missing);
+            return {phi, Ty{en.name + "?"}};
+        }
+        error("enum " + displayName(en.name) + " supports values() and from_name(text)");
+    }
     if (callee.kind != "name" && callee.kind != "member") {
         auto function = value(callee);
         if (!function.t.function())
@@ -2014,6 +3179,9 @@ Val Compiler::invoke(Expr &e, Ty expected) {
         return callClosure(function, rest);
     }
     std::string name = callable(callee);
+    if (callee.kind == "name" && !lookup(name))
+        if (auto result = genericCall(e, name, expected))
+            return *result;
     if (callee.kind == "name") {
         if (auto variable = lookup(name); variable && variable->type.classReference()) {
             load(*variable);
@@ -2026,50 +3194,14 @@ Val Compiler::invoke(Expr &e, Ty expected) {
     Val receiverValue;
     bool method = false;
     if (callee.kind == "member" && callee.text == "from_json" && callee.args[0]->kind == "name" &&
-        classes.count(callee.args[0]->text)) {
+        (classes.count(callee.args[0]->text) ||
+         (callee.args[0]->text.find('<') != std::string::npos &&
+          templates.count(callee.args[0]->text.substr(0, callee.args[0]->text.find('<')))))) {
         if (e.args.size() != 2)
             error("from_json expects one JSON string");
-        auto c = classes.at(callee.args[0]->text);
+        auto target = type(callee.args[0]->text);
         auto text = convert(value(*e.args[1]), Ty{"string"});
-        auto json = objectCall("fw_json_parse", {frame, text.v});
-        Val obj = newInstance(*c);
-        for (size_t i = 0; i < c->fields.size(); ++i) {
-            auto &f = c->fields[i];
-            auto t = type(f.type);
-            auto key = literal(f.name);
-            llvm::BasicBlock *merge = nullptr;
-            if (f.value) {
-                auto present = llvm::BasicBlock::Create(ctx, "json.present", current);
-                auto missing = llvm::BasicBlock::Create(ctx, "json.default", current);
-                merge = llvm::BasicBlock::Create(ctx, "json.next", current);
-                auto has =
-                    b.CreateICmpNE(call("fw_json_has", b.getInt64Ty(), {json, key.v}), i64(0));
-                b.CreateCondBr(has, present, missing);
-                b.SetInsertPoint(missing);
-                set(obj, i64(i), convert(defaultValue(*f.value, t), t));
-                b.CreateBr(merge);
-                b.SetInsertPoint(present);
-            }
-            auto child = objectCall("fw_json_get", {frame, json, key.v});
-            Val x;
-            if (t.name == "string")
-                x = {objectCall("fw_json_string", {frame, child}), t};
-            else if (t.integer())
-                x = convert({call("fw_json_int", b.getInt64Ty(), {child}), Ty{"i64"}}, t, true);
-            else if (t.real())
-                x = convert({call("fw_json_real", b.getDoubleTy(), {child}), Ty{"double"}}, t,
-                            true);
-            else if (t.name == "bool")
-                x = {b.CreateICmpNE(call("fw_json_bool", b.getInt64Ty(), {child}), i64(0)), t};
-            else
-                error("from_json currently supports scalar string, bool and numeric fields");
-            set(obj, i64(i), x);
-            if (merge) {
-                b.CreateBr(merge);
-                b.SetInsertPoint(merge);
-            }
-        }
-        return obj;
+        return jsonDecode(target, {objectCall("fw_json_parse", {frame, text.v}), Ty{"json.value"}});
     }
     if (name.empty() && callee.kind == "member" &&
         !(callee.args[0]->kind == "name" && callee.args[0]->text == "Result")) {
@@ -2080,6 +3212,9 @@ Val Compiler::invoke(Expr &e, Ty expected) {
         name = receiverValue.t.name + "." + callee.text;
         method = true;
     }
+    if (method && classes.count(receiverValue.t.name) &&
+        !resolveMethod(receiverValue.t.name, callee.text).empty())
+        return callMethod(receiverValue, receiverValue.t.name, callee.text, e, false);
     if (method && classes.count(receiverValue.t.name) && !functions.count(name)) {
         auto c = classes.at(receiverValue.t.name);
         for (size_t i = 0; i < c->fields.size(); ++i)
@@ -2138,6 +3273,24 @@ Val Compiler::invoke(Expr &e, Ty expected) {
                  {receiverValue.v, b.CreateGlobalString(desktopBackend)});
             return {};
         }
+        if (callee.text == "bind") {
+            if (e.args.size() != 3)
+                error("desktop.window.bind expects a name and a function(string) returns string");
+            auto bindingName = convert(value(*e.args[1]), Ty{"string"});
+            Ty expectedType{"function<string,string>"};
+            auto handler = asFunction(value(*e.args[2], expectedType));
+            if (handler.t != expectedType)
+                error("desktop.window.bind expects a function(string) returns string");
+            call("fw_desktop_bind", b.getVoidTy(), {receiverValue.v, bindingName.v, handler.v});
+            return {};
+        }
+        if (callee.text == "eval") {
+            if (e.args.size() != 2)
+                error("desktop.window.eval expects JavaScript text");
+            call("fw_desktop_eval", b.getVoidTy(),
+                 {receiverValue.v, convert(value(*e.args[1]), Ty{"string"}).v});
+            return {};
+        }
         error("unknown desktop.window method '" + callee.text + "'");
     }
     if (method && receiverValue.t.result()) {
@@ -2154,6 +3307,78 @@ Val Compiler::invoke(Expr &e, Ty expected) {
                   "attempted to unwrap the wrong Result variant", "ResultError");
             return get(receiverValue, i64(1), receiverValue.t.parts()[success ? 0 : 1]);
         }
+    }
+    if (method && receiverValue.t.name == "string")
+        return stringMethod(receiverValue, callee.text, e);
+    if (method)
+        if (auto result = resourceMethod(receiverValue, callee.text, e))
+            return *result;
+    if (method && receiverValue.t.sequence())
+        if (auto result = sequenceTool(receiverValue, callee.text, e))
+            return *result;
+    if (method && receiverValue.t.set()) {
+        auto self = receiverValue;
+        auto item = self.t.parts()[0];
+        auto &m = callee.text;
+        size_t supplied = e.args.size() - 1;
+        auto expect = [&](size_t n) {
+            if (supplied != n)
+                error("set." + m + " expects " + std::to_string(n) + " argument(s)");
+        };
+        if (m == "add" || m == "remove" || m == "contains") {
+            expect(1);
+            auto x = convert(value(*e.args[1], item), item);
+            if (m == "remove")
+                return keyRemove(self, x);
+            if (m == "contains")
+                return {b.CreateICmpSGE(keyFind(self, x, 2), i64(0)), Ty{"bool"}};
+            keyFind(self, x, 1);
+            return {};
+        }
+        if (m == "clear") {
+            expect(0);
+            call("fw_collection_clear", b.getVoidTy(), {self.v});
+            return {};
+        }
+        if (m == "items") {
+            expect(0);
+            return {objectCall("fw_map_keys", {frame, self.v}), Ty{item.name + "[]"}};
+        }
+        if (m == "union" || m == "intersection" || m == "difference" || m == "is_subset") {
+            expect(1);
+            auto other = value(*e.args[1], self.t);
+            if (other.t != self.t)
+                error("set." + m + " expects another " + displayName(self.t.name));
+            Val mine{objectCall("fw_map_keys", {frame, self.v}), Ty{item.name + "[]"}};
+            Val theirs{objectCall("fw_map_keys", {frame, other.v}), Ty{item.name + "[]"}};
+            if (m == "is_subset") {
+                auto result = allocate(Ty{"bool"}, "subset");
+                b.CreateStore(b.getTrue(), result);
+                eachItem(mine, [&](Val v) {
+                    auto present = b.CreateICmpSGE(keyFind(other, v, 2), i64(0));
+                    b.CreateStore(b.CreateAnd(b.CreateLoad(b.getInt1Ty(), result), present), result);
+                });
+                return {b.CreateLoad(b.getInt1Ty(), result), Ty{"bool"}};
+            }
+            auto out = newSet(self.t);
+            auto addIf = [&](Val v, Val container, bool wanted) {
+                auto present = b.CreateICmpSGE(keyFind(container, v, 2), i64(0));
+                auto yes = llvm::BasicBlock::Create(ctx, "set.add", current);
+                auto done = llvm::BasicBlock::Create(ctx, "set.next", current);
+                b.CreateCondBr(wanted ? present : b.CreateNot(present), yes, done);
+                b.SetInsertPoint(yes);
+                keyFind(out, v, 1);
+                b.CreateBr(done);
+                b.SetInsertPoint(done);
+            };
+            if (m == "union") {
+                eachItem(mine, [&](Val v) { keyFind(out, v, 1); });
+                eachItem(theirs, [&](Val v) { keyFind(out, v, 1); });
+            } else
+                eachItem(mine, [&](Val v) { addIf(v, other, m == "intersection"); });
+            return out;
+        }
+        error("unknown set method '" + m + "'");
     }
     if (method && (receiverValue.t.array() || receiverValue.t.map())) {
         auto obj = receiverValue;
@@ -2180,6 +3405,11 @@ Val Compiler::invoke(Expr &e, Ty expected) {
             call("fw_collection_clear", b.getVoidTy(), {obj.v});
             return {};
         }
+        if (obj.t.map() && methodName == "values") {
+            if (e.args.size() != 1)
+                error("values expects no arguments");
+            return {objectCall("fw_map_values", {frame, obj.v}), Ty{obj.t.parts()[1].name + "[]"}};
+        }
         if (obj.t.map() && methodName == "keys") {
             if (e.args.size() != 1)
                 error("keys expects no arguments");
@@ -2189,14 +3419,7 @@ Val Compiler::invoke(Expr &e, Ty expected) {
             if (e.args.size() != 2)
                 error("remove expects one key");
             auto key = convert(value(*e.args[1], obj.t.parts()[0]), obj.t.parts()[0]);
-            auto integer = key.t.object()
-                               ? i64(0)
-                               : b.CreateIntCast(key.v, b.getInt64Ty(),
-                                                 key.t.name != "bool" && !key.t.unsigned_());
-            auto object = key.t.object() ? key.v : llvm::ConstantPointerNull::get(b.getPtrTy());
-            return {b.CreateICmpNE(call("fw_map_remove", b.getInt64Ty(), {obj.v, integer, object}),
-                                   i64(0)),
-                    Ty{"bool"}};
+            return keyRemove(obj, key);
         }
     }
     if (method && callee.text == "render" &&
@@ -2228,6 +3451,20 @@ Val Compiler::invoke(Expr &e, Ty expected) {
     }
     if (classes.count(name)) {
         auto c = classes.at(name);
+        if (c->isInterface)
+            error("interface " + displayName(name) + " cannot be constructed");
+        if (!resolveMethod(name, "init").empty()) {
+            // Fields with defaults are set first; init assigns the rest.
+            Val obj = newInstance(*c);
+            for (size_t i = 0; i < c->fields.size(); ++i)
+                if (c->fields[i].value) {
+                    Ty t = type(c->fields[i].type);
+                    set(obj, i64(static_cast<int64_t>(i)),
+                        convert(defaultValue(*c->fields[i].value, t), t));
+                }
+            callMethod(obj, name, "init", e, true);
+            return obj;
+        }
         if (e.args.size() - 1 > c->fields.size())
             error("too many constructor arguments for " + name);
         Val obj = newInstance(*c);
@@ -2254,8 +3491,8 @@ Val Compiler::invoke(Expr &e, Ty expected) {
         if (e.args.size() != 2)
             error("len expects one argument");
         auto a = value(*e.args[1]);
-        if (a.t.name != "string" && !a.t.sequence() && !a.t.map() && !a.t.tuple())
-            error("len expects string or array");
+        if (a.t.name != "string" && !a.t.sequence() && !a.t.map() && !a.t.set() && !a.t.tuple())
+            error("len expects a string or collection");
         return {call("fw_length", b.getInt64Ty(), {a.v}), Ty{"i64"}};
     }
     if (name == "weak") {
@@ -2268,6 +3505,33 @@ Val Compiler::invoke(Expr &e, Ty expected) {
         return {objectCall("fw_weak_new", {frame, target.v}), t};
     }
     std::string constructor = name.substr(0, name.find('<'));
+    if (constructor == "set") {
+        if (e.args.size() > 2)
+            error("set() expects at most one sequence");
+        Ty target = name.find('<') != std::string::npos ? type(name)
+                    : expected.set()                    ? expected
+                                                        : Ty{};
+        Val source;
+        if (e.args.size() == 2) {
+            source = value(*e.args[1]);
+            if (source.t.set() || source.t.map())
+                source = {objectCall("fw_map_keys", {frame, source.v}),
+                          Ty{source.t.parts()[0].name + "[]"}};
+            if (source.t.name == "string")
+                source = {objectCall("fw_string_chars", {frame, source.v}), Ty{"char[]"}};
+            if (!source.t.sequence())
+                error("set() expects an array, tuple, string, map, or set");
+            if (target.name == "void")
+                target = type("set<" + source.t.item().name + ">");
+        }
+        if (target.name == "void")
+            error("empty set() needs an expected type or set<T>()");
+        auto out = newSet(target);
+        auto item = target.parts()[0];
+        if (source.v)
+            eachItem(source, [&](Val v) { keyFind(out, convert(v, item), 1); });
+        return out;
+    }
     if (constructor == "array" || constructor == "tuple" || constructor == "map") {
         if (e.args.size() > 2)
             error("collection casts expect at most one value");
@@ -2286,10 +3550,7 @@ Val Compiler::invoke(Expr &e, Ty expected) {
                 error("empty collection casts need an expected type or explicit type arguments");
             if (target.map()) {
                 auto key = target.parts()[0];
-                return {objectCall("fw_map_new", {frame, i64(key.object()         ? 4
-                                                             : key.name == "bool" ? 3
-                                                             : key.unsigned_()    ? 1
-                                                                                  : 0)}),
+                return {objectCall("fw_map_new", {frame, i64(mapKeyKind(key))}),
                         target};
             }
             return {objectCall("fw_new", {frame, i64(0), i64(target.array() ? 1 : 7)}), target};
@@ -2301,7 +3562,8 @@ Val Compiler::invoke(Expr &e, Ty expected) {
     }
     static const std::set<std::string> casts = {"int",    "i8",   "i16",    "i32",     "i64",
                                                 "u8",     "u16",  "u32",    "u64",     "float",
-                                                "double", "bool", "string", "element", "fragment"};
+                                                "double", "bool", "string", "element", "fragment",
+                                                "char"};
     if (casts.count(name)) {
         if (e.args.size() != 2)
             error("cast expects exactly one argument");
@@ -2348,6 +3610,17 @@ Val Compiler::invoke(Expr &e, Ty expected) {
     };
     auto str = [&](size_t i) { return convert(args[i], Ty{"string"}).v; };
     auto real = [&](size_t i) { return convert(args[i], Ty{"double"}).v; };
+    if (name == "desktop.run") {
+        if (args.size() != 1 || args[0].t.name != "desktop.window[]")
+            error("desktop.run expects an array of windows");
+        call("fw_desktop_run_all", b.getVoidTy(), {args[0].v, b.CreateGlobalString(desktopBackend)});
+        return {};
+    }
+    if (name == "desktop.quit") {
+        count(0);
+        call("fw_desktop_quit", b.getVoidTy(), {});
+        return {};
+    }
     if (name == "desktop.window" || name == "desktop.Window") {
         if (args.size() > 3)
             error("desktop.window expects optional title, width, and height");
@@ -2372,8 +3645,15 @@ Val Compiler::invoke(Expr &e, Ty expected) {
         return {call("fw_command", b.getInt64Ty(), {args[0].v}), Ty{"i64"}};
     }
     if (name == "print" || name == "core.print") {
-        count(1);
+        if (args.empty())
+            error("print expects at least one value");
+        // Several values print on one line separated by spaces.
         auto x = stringify(args[0]);
+        for (size_t i = 1; i < args.size(); ++i) {
+            auto space = literal(" ");
+            x = {objectCall("fw_concat", {frame, x.v, space.v}), Ty{"string"}};
+            x = {objectCall("fw_concat", {frame, x.v, stringify(args[i]).v}), Ty{"string"}};
+        }
         call("fw_print", b.getVoidTy(), {x.v});
         return {};
     }
@@ -2385,9 +3665,13 @@ Val Compiler::invoke(Expr &e, Ty expected) {
     }
     if (auto result = domCall(name, args))
         return *result;
+    // Listeners bind 127.0.0.1 unless a host is given, such as "0.0.0.0" or "::".
+    auto host = [&](size_t i) { return args.size() > i ? str(i) : literal("127.0.0.1").v; };
     if (name == "web.serve" || name == "web.route") {
         size_t offset = name == "web.route" ? 1 : 0;
-        count(3 + offset);
+        if (args.size() != 3 + offset && args.size() != 4 + offset)
+            error(name + " expects " + std::to_string(3 + offset) +
+                  " arguments and an optional host");
         auto method = offset ? str(0) : literal("GET").v;
         auto handler = args[offset + 1];
         if (handler.t.name.rfind("fn:", 0) == 0) {
@@ -2408,12 +3692,21 @@ Val Compiler::invoke(Expr &e, Ty expected) {
         return {objectCall("fw_serve",
                            {frame, method, str(offset), handler.v,
                             i64(static_cast<int64_t>(parts.size() - 1)),
-                            convert(args[offset + 2], Ty{"i64"}).v}),
+                            convert(args[offset + 2], Ty{"i64"}).v, host(offset + 3)}),
                 Ty{"string"}};
     }
     if (name == "web.static") {
-        count(3);
-        return {objectCall("fw_serve_static", {frame, str(0), str(1), convert(args[2], Ty{"i64"}).v}),
+        if (args.size() != 3 && args.size() != 4)
+            error("web.static expects route, directory, port, and an optional host");
+        return {objectCall("fw_serve_static",
+                           {frame, str(0), str(1), convert(args[2], Ty{"i64"}).v, host(3)}),
+                Ty{"string"}};
+    }
+    if (name == "web.tls") {
+        if (args.size() != 3 && args.size() != 4)
+            error("web.tls expects certificate file, key file, port, and an optional host");
+        return {objectCall("fw_web_tls",
+                           {frame, str(0), str(1), convert(args[2], Ty{"i64"}).v, host(3)}),
                 Ty{"string"}};
     }
     if (name == "web.text" || name == "web.html" || name == "web.json" || name == "web.redirect") {
@@ -2444,6 +3737,11 @@ Val Compiler::invoke(Expr &e, Ty expected) {
         set(response, i64(1), body);
         set(response, i64(2), headers);
         return response;
+    }
+    if (name == "web.workers") {
+        count(1);
+        call("fw_web_workers", b.getVoidTy(), {convert(args[0], Ty{"i64"}).v});
+        return {};
     }
     if (name == "web.wait") {
         count(0);
@@ -2515,6 +3813,10 @@ Val Compiler::invoke(Expr &e, Ty expected) {
         call("fw_sleep", b.getVoidTy(), {real(0)});
         return {};
     }
+    if (auto result = mathCall(name, args))
+        return *result;
+    if (auto result = stdlibCall(name, args, expected))
+        return *result;
     if (name == "math.sqrt" || name == "math.sin" || name == "math.cos") {
         count(1);
         return {call("fw_" + name.substr(5), b.getDoubleTy(), {real(0)}), Ty{"double"}};
@@ -2543,10 +3845,35 @@ Val Compiler::invoke(Expr &e, Ty expected) {
         call("fw_assert", b.getVoidTy(), {b.CreateZExt(args[0].v, b.getInt64Ty()), message.v});
         return {};
     }
+    if (name == "testing.assert_equal") {
+        if (args.size() != 2 && args.size() != 3)
+            error("testing.assert_equal expects actual, expected, and an optional message");
+        auto equal = binary("==", args[0], args[1]);
+        auto text = literal("expected ");
+        auto message = stringify(args[1]);
+        Val out{objectCall("fw_concat", {frame, text.v, message.v}), Ty{"string"}};
+        auto got = literal(", got ");
+        out = {objectCall("fw_concat", {frame, out.v, got.v}), Ty{"string"}};
+        out = {objectCall("fw_concat", {frame, out.v, stringify(args[0]).v}), Ty{"string"}};
+        if (args.size() == 3) {
+            auto separator = literal(": ");
+            auto prefix = convert(args[2], Ty{"string"});
+            auto head = Val{objectCall("fw_concat", {frame, prefix.v, separator.v}), Ty{"string"}};
+            out = {objectCall("fw_concat", {frame, head.v, out.v}), Ty{"string"}};
+        }
+        call("fw_assert", b.getVoidTy(), {b.CreateZExt(equal.v, b.getInt64Ty()), out.v});
+        return {};
+    }
+    if (name == "testing.fail") {
+        count(1);
+        call("fw_assert", b.getVoidTy(), {i64(0), str(0)});
+        return {};
+    }
     error("unknown or unimplemented callable '" + name + "'");
 }
 void Compiler::statement(Stmt &s) {
     location = s.loc;
+    debugLocation();
     if (s.kind == "throw") {
         auto x = value(*s.expr);
         if (x.t.classReference() || x.t.name == "void" || x.t.nullable() ||
@@ -2690,7 +4017,10 @@ void Compiler::statement(Stmt &s) {
                       "'; lambdas capture copies, so share state through an object or collection");
             if (variable->constant)
                 error("cannot assign to const '" + s.target->text + "'");
-            target = variable->type;
+            if (variable->typeNarrowed)
+                error("cannot assign to '" + s.target->text +
+                      "' while it is narrowed by 'is'; use a new variable");
+            target = variable->narrowed ? variable->storage : variable->type;
         } else if (s.target->kind == "member" || s.target->kind == "inst") {
             object = unwrap(s.target->kind == "inst" ? receiver() : value(*s.target->args[0]));
             if ((object.t.name == "element" || object.t.name == "fragment") &&
@@ -2705,6 +4035,8 @@ void Compiler::statement(Stmt &s) {
             }
         } else if (s.target->kind == "index") {
             object = value(*s.target->args[0]);
+            if (object.t.name == "string")
+                error("strings are immutable; build a new string instead");
             if (object.t.map()) {
                 mapKey =
                     convert(value(*s.target->args[1], object.t.parts()[0]), object.t.parts()[0]);
@@ -2725,11 +4057,15 @@ void Compiler::statement(Stmt &s) {
                                          : get(object, index, target);
         auto rhs = value(*s.expr, target);
         if (s.op != "=")
-            rhs = binary(s.op.substr(0, 1), old, rhs);
+            rhs = binary(s.op.substr(0, s.op.size() - 1), old, rhs);
+        if (variable && variable->narrowed && s.op == "=" && rhs.t == variable->type)
+            rhs = convert(rhs, variable->storage);
         rhs = convert(rhs, target);
         if (object.t.map())
             index = mapIndex(object, mapKey, true);
-        if (variable)
+        if (variable && variable->cell)
+            set({b.CreateLoad(b.getPtrTy(), variable->address), Ty{"Error"}}, i64(0), rhs);
+        else if (variable)
             store(variable->address, rhs);
         else if (!domProperty.empty()) {
             if (domProperty == "text_content")
@@ -2745,11 +4081,12 @@ void Compiler::statement(Stmt &s) {
     if (s.kind == "expr") {
         auto name = callable(*s.target);
         auto variable = lookup(name);
-        bool groupedConstructor =
-            s.target->grouped &&
+        if ((s.target->kind == "name" || s.target->kind == "member") &&
             (classes.count(name) || name == "desktop.window" || name == "desktop.Window" ||
-             (variable && variable->type.classReference()));
-        if (!groupedConstructor && (s.target->kind == "name" || s.target->kind == "member")) {
+             (variable && variable->type.classReference())))
+            error("'" + displayName(name) +
+                  "' is a class reference; call it with () to construct an instance");
+        if (s.target->kind == "name" || s.target->kind == "member") {
             Expr call;
             call.kind = "call";
             call.loc = s.loc;
@@ -2812,20 +4149,38 @@ void Compiler::statement(Stmt &s) {
         auto end = llvm::BasicBlock::Create(ctx, "if.end", current);
         b.CreateCondBr(c.v, yes, no);
         b.SetInsertPoint(yes);
-        block(s.body);
+        std::vector<std::string> whenTrue, whenFalse;
+        nonNullNames(*s.expr, true, whenTrue);
+        nonNullNames(*s.expr, false, whenFalse);
+        std::vector<std::pair<std::string, std::string>> instances;
+        instanceNames(*s.expr, true, instances);
+        auto branch = [&](std::vector<SP> &body, const std::vector<std::string> &proven) {
+            scopes.emplace_back();
+            narrow(proven);
+            if (&body == &s.body)
+                narrowTypes(instances);
+            block(body);
+            scopes.pop_back();
+        };
+        branch(s.body, whenTrue);
         bool yesEnds = terminated();
         if (!yesEnds)
             b.CreateBr(end);
         b.SetInsertPoint(no);
-        block(s.other);
+        branch(s.other, whenFalse);
         bool noEnds = terminated();
         if (!noEnds)
             b.CreateBr(end);
         b.SetInsertPoint(end);
         if (yesEnds && noEnds)
             b.CreateUnreachable();
+        // `if x == null then return end` proves x non-null for the rest of the block.
+        else if (yesEnds && s.other.empty())
+            narrow(whenFalse);
         return;
     }
+    if (s.kind == "match")
+        return match(s);
     if (s.kind == "while") {
         auto cond = llvm::BasicBlock::Create(ctx, "while.condition", current);
         auto body = llvm::BasicBlock::Create(ctx, "while.body", current);
@@ -2842,7 +4197,13 @@ void Compiler::statement(Stmt &s) {
         b.SetInsertPoint(body);
         loops.emplace_back(end, cond);
         loopScopes.push_back(scopes.size());
+        // `while x != null do` reads x as non-null in the body (re-checked on each read).
+        std::vector<std::string> proven;
+        nonNullNames(*s.expr, true, proven);
+        scopes.emplace_back();
+        narrow(proven);
         block(s.body);
+        scopes.pop_back();
         loops.pop_back();
         loopScopes.pop_back();
         if (!terminated())
@@ -2852,13 +4213,31 @@ void Compiler::statement(Stmt &s) {
     }
     if (s.kind == "for") {
         auto array = value(*s.expr);
-        if (array.t.map())
+        if (classes.count(array.t.name))
+            return iterate(s, array);
+        bool pairs = !s.op.empty();
+        Val values;
+        if (array.t.map()) {
+            if (pairs)
+                values = {objectCall("fw_map_values", {frame, array.v}),
+                          Ty{array.t.parts()[1].name + "[]"}};
             array = {objectCall("fw_map_keys", {frame, array.v}),
                      Ty{array.t.parts()[0].name + "[]"}};
+        } else if (array.t.set()) {
+            if (pairs)
+                error("sets have no index; iterate with one name");
+            array = {objectCall("fw_map_keys", {frame, array.v}),
+                     Ty{array.t.parts()[0].name + "[]"}};
+        }
+        if (array.t.name == "string")
+            array = {objectCall("fw_string_chars", {frame, array.v}), Ty{"char[]"}};
         if (!array.t.sequence())
-            error("for requires an array, homogeneous tuple, or map");
+            error("for requires an array, tuple, string, map, set, or a class with iterator() "
+                  "or next()");
         scopes.emplace_back();
         bind("$iterable", array, true);
+        if (values.v)
+            bind("$values", values, true);
         auto size = call("fw_length", b.getInt64Ty(), {array.v});
         auto index = allocate(Ty{"i64"}, "iterator");
         b.CreateStore(i64(0), index);
@@ -2873,7 +4252,15 @@ void Compiler::statement(Stmt &s) {
         b.SetInsertPoint(body);
         auto loopDepth = scopes.size();
         scopes.emplace_back();
-        bind(s.name, get(array, i, array.t.item()));
+        if (!pairs)
+            bind(s.name, get(array, i, array.t.item()));
+        else if (values.v) {
+            bind(s.name, get(array, i, array.t.item()));
+            bind(s.op, get(values, i, values.t.item()));
+        } else {
+            bind(s.name, {i, Ty{"i64"}});
+            bind(s.op, get(array, i, array.t.item()));
+        }
         loops.emplace_back(end, next);
         loopScopes.push_back(loopDepth);
         block(s.body, false);
@@ -2930,8 +4317,12 @@ void Compiler::buildFunction(Signature &sig, bool inference) {
     else
         current = sig.function;
     b.SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", current));
+    location = sig.ast->loc;
+    if (!inference)
+        debugFunction(current, (owner.empty() ? "" : owner + ".") + sig.ast->name, sig.ast->loc);
     frame = objectCall("fw_frame", {});
     failure = llvm::BasicBlock::Create(ctx, "propagate.error", current);
+    cells = cellNames(sig.ast->body);
     size_t index = 0;
     if (!owner.empty())
         bind("$inst", {current->getArg(index++), Ty{owner}});
@@ -3054,6 +4445,1876 @@ Val Compiler::sequenceMethod(Val sequence, const std::string &method, Expr &e) {
         store(state.address, {llvm::ConstantPointerNull::get(b.getPtrTy()), state.type});
     return final;
 }
+std::optional<Val> Compiler::stdlibCall(const std::string &name, std::vector<Val> &args,
+                                        Ty expected) {
+    auto dot = name.find('.');
+    if (dot == std::string::npos)
+        return std::nullopt;
+    auto module = name.substr(0, dot);
+    auto function = name.substr(dot + 1);
+    static const std::set<std::string> modules = {"fs", "time", "regex", "io",    "json",
+                                                  "os", "net",  "gc",    "thread"};
+    if (!modules.count(module))
+        return std::nullopt;
+    auto arity = [&](size_t low, size_t high) {
+        if (args.size() < low || args.size() > high)
+            error(name + " expects " +
+                  (low == high ? std::to_string(low) + " argument(s)"
+                               : std::to_string(low) + " to " + std::to_string(high) +
+                                     " arguments"));
+    };
+    auto str = [&](size_t i) { return convert(args[i], Ty{"string"}).v; };
+    auto integer = [&](size_t i) { return convert(args[i], Ty{"i64"}).v; };
+    auto real = [&](size_t i) {
+        if (!args[i].t.numeric())
+            error(name + " expects a number");
+        return convert(args[i], Ty{"double"}, true).v;
+    };
+    auto object = [&](const std::string &f, std::vector<llvm::Value *> values, Ty t) {
+        values.insert(values.begin(), frame);
+        return Val{objectCall(f, std::move(values)), t};
+    };
+    auto flag = [&](const std::string &f, std::vector<llvm::Value *> values) {
+        return Val{b.CreateICmpNE(call(f, b.getInt64Ty(), std::move(values)), i64(0)), Ty{"bool"}};
+    };
+    auto stringList = [&](size_t i) {
+        if (args[i].t.name != "string[]")
+            error(name + " expects string[]");
+        return args[i].v;
+    };
+    if (module == "fs") {
+        static const std::map<std::string, int> paths = {{"basename", 0}, {"dirname", 1},
+                                                         {"extension", 2}, {"stem", 3},
+                                                         {"absolute", 4}, {"normalize", 5}};
+        if (auto it = paths.find(function); it != paths.end()) {
+            arity(1, 1);
+            return object("fw_fs_path", {str(0), i64(it->second)}, Ty{"string"});
+        }
+        if (function == "list" || function == "walk") {
+            arity(1, 1);
+            return object("fw_fs_list", {str(0), i64(function == "walk")}, Ty{"string[]"});
+        }
+        if (function == "mkdir") {
+            arity(1, 1);
+            call("fw_fs_mkdir", b.getVoidTy(), {str(0)});
+            return Val{};
+        }
+        if (function == "append") {
+            arity(2, 2);
+            call("fw_fs_append", b.getVoidTy(), {str(0), str(1)});
+            return Val{};
+        }
+        if (function == "is_dir" || function == "is_file") {
+            arity(1, 1);
+            return flag("fw_fs_query", {str(0), i64(function == "is_file")});
+        }
+        if (function == "size") {
+            arity(1, 1);
+            return Val{call("fw_fs_query", b.getInt64Ty(), {str(0), i64(2)}), Ty{"i64"}};
+        }
+        if (function == "copy" || function == "move") {
+            arity(2, 2);
+            call("fw_fs_copy", b.getVoidTy(), {str(0), str(1), i64(function == "move")});
+            return Val{};
+        }
+        if (function == "remove_all") {
+            arity(1, 1);
+            return Val{call("fw_fs_remove_all", b.getInt64Ty(), {str(0)}), Ty{"i64"}};
+        }
+        if (function == "join") {
+            if (args.size() == 1 && args[0].t.name == "string[]")
+                return object("fw_fs_join", {args[0].v}, Ty{"string"});
+            if (args.empty())
+                error("fs.join expects path parts");
+            Val parts{objectCall("fw_new", {frame, i64(static_cast<int64_t>(args.size())), i64(1)}),
+                      Ty{"string[]"}};
+            for (size_t i = 0; i < args.size(); ++i)
+                set(parts, i64(static_cast<int64_t>(i)), {str(i), Ty{"string"}});
+            return object("fw_fs_join", {parts.v}, Ty{"string"});
+        }
+        if (function == "cwd" || function == "temp_dir") {
+            arity(0, 0);
+            return object("fw_fs_location", {i64(function == "temp_dir")}, Ty{"string"});
+        }
+        return std::nullopt;
+    }
+    if (module == "time") {
+        if (function == "now") {
+            arity(0, 0);
+            return Val{call("fw_time_now", b.getDoubleTy(), {}), Ty{"double"}};
+        }
+        if (function == "format" || function == "format_local") {
+            arity(1, 2);
+            bool local = function == "format_local";
+            auto pattern = args.size() == 2 ? str(1)
+                                            : literal(local ? "%Y-%m-%d %H:%M:%S"
+                                                            : "%Y-%m-%dT%H:%M:%SZ")
+                                                  .v;
+            return object("fw_time_format", {real(0), pattern, i64(local)}, Ty{"string"});
+        }
+        if (function == "parse") {
+            arity(1, 2);
+            auto pattern = args.size() == 2 ? str(1) : literal("%Y-%m-%dT%H:%M:%SZ").v;
+            return Val{call("fw_time_parse", b.getDoubleTy(), {str(0), pattern}), Ty{"double"}};
+        }
+        if (function == "date" || function == "local_date") {
+            arity(1, 1);
+            return object("fw_time_date", {real(0), i64(function == "local_date")},
+                          Ty{"time.datetime"});
+        }
+        if (function == "from_date") {
+            arity(3, 6);
+            std::vector<llvm::Value *> values;
+            for (size_t i = 0; i < 5; ++i)
+                values.push_back(i < args.size() ? integer(i) : i64(0));
+            values.push_back(args.size() == 6 ? real(5)
+                                              : llvm::ConstantFP::get(b.getDoubleTy(), 0.0));
+            return Val{call("fw_time_from_date", b.getDoubleTy(), values), Ty{"double"}};
+        }
+        return std::nullopt;
+    }
+    if (module == "regex") {
+        if (function == "matches" || function == "contains") {
+            arity(2, 2);
+            return flag("fw_regex_test", {str(0), str(1), i64(function == "matches")});
+        }
+        if (function == "find") {
+            arity(2, 2);
+            return object("fw_regex_find", {str(0), str(1)}, Ty{"string?"});
+        }
+        if (function == "find_all" || function == "groups") {
+            arity(2, 2);
+            return object("fw_regex_list", {str(0), str(1), i64(function == "groups")},
+                          Ty{function == "groups" ? "string[]?" : "string[]"});
+        }
+        if (function == "replace") {
+            arity(3, 3);
+            return object("fw_regex_replace", {str(0), str(1), str(2)}, Ty{"string"});
+        }
+        if (function == "split") {
+            arity(2, 2);
+            return object("fw_regex_split", {str(0), str(1)}, Ty{"string[]"});
+        }
+        return std::nullopt;
+    }
+    if (module == "io") {
+        if (function == "write" || function == "write_error") {
+            arity(1, 1);
+            call("fw_io_write", b.getVoidTy(),
+                 {stringify(args[0]).v, i64(function == "write_error")});
+            return Val{};
+        }
+        if (function == "flush") {
+            arity(0, 0);
+            call("fw_io_flush", b.getVoidTy(), {});
+            return Val{};
+        }
+        if (function == "read_line") {
+            arity(0, 0);
+            return object("fw_io_read_line", {}, Ty{"string?"});
+        }
+        if (function == "read_all") {
+            arity(0, 0);
+            return object("fw_io_read_all", {}, Ty{"string"});
+        }
+        if (function == "open") {
+            arity(1, 2);
+            return object("fw_io_open", {str(0), args.size() == 2 ? str(1) : literal("r").v},
+                          Ty{"io.file"});
+        }
+        return std::nullopt;
+    }
+    if (module == "json") {
+        auto json = [&](size_t i) {
+            if (args[i].t.name != "json.value")
+                error(name + " expects a json.value");
+            return args[i].v;
+        };
+        if (function == "at") {
+            arity(2, 2);
+            return object("fw_json_at", {json(0), integer(1)}, Ty{"json.value"});
+        }
+        if (function == "length") {
+            arity(1, 1);
+            return Val{call("fw_json_length", b.getInt64Ty(), {json(0)}), Ty{"i64"}};
+        }
+        if (function == "items" || function == "keys") {
+            arity(1, 1);
+            return object("fw_json_list", {json(0), i64(function == "keys")},
+                          Ty{function == "keys" ? "string[]" : "json.value[]"});
+        }
+        if (function == "is_null") {
+            arity(1, 1);
+            return flag("fw_json_is_null", {json(0)});
+        }
+        if (function == "encode") {
+            arity(1, 2);
+            if (args[0].t.classReference() || args[0].t.name.rfind("fn:", 0) == 0 ||
+                args[0].t.function() || args[0].t.name == "void")
+                error("json.encode cannot encode " + displayName(args[0].t.name));
+            Val box{objectCall("fw_new", {frame, i64(1), i64(2)}), Ty{"Error"}};
+            set(box, i64(0), args[0]);
+            return object("fw_json_encode", {box.v, args.size() == 2 ? integer(1) : i64(0)},
+                          Ty{"string"});
+        }
+        if (function == "decode" || function.rfind("decode<", 0) == 0) {
+            arity(1, 1);
+            Ty target = function == "decode" ? expected
+                                             : type(function.substr(7, function.size() - 8));
+            if (target.name == "void")
+                error("json.decode needs a target type: declare the result type or write "
+                      "json.decode<T>(text)");
+            auto source = args[0];
+            if (source.t.name == "string")
+                source = {objectCall("fw_json_parse", {frame, source.v}), Ty{"json.value"}};
+            if (source.t.name != "json.value")
+                error("json.decode expects a JSON string or json.value");
+            return jsonDecode(target, source);
+        }
+        return std::nullopt;
+    }
+    if (module == "os") {
+        if (function == "args") {
+            arity(0, 0);
+            return object("fw_os_args", {}, Ty{"string[]"});
+        }
+        if (function == "exit") {
+            arity(0, 1);
+            call("fw_os_exit", b.getVoidTy(), {args.empty() ? i64(0) : integer(0)});
+            return Val{};
+        }
+        if (function == "run") {
+            arity(1, 1);
+            auto process = newInstance(*classes.at("os.process"));
+            auto &c = *classes.at("os.process");
+            set(process, i64(0), {stringList(0), Ty{"string[]"}});
+            for (size_t i = 1; i < c.fields.size(); ++i) {
+                Ty t = type(c.fields[i].type);
+                set(process, i64(static_cast<int64_t>(i)),
+                    convert(defaultValue(*c.fields[i].value, t), t));
+            }
+            return object("fw_os_run", {process.v}, Ty{"os.result"});
+        }
+        if (function == "pipeline") {
+            arity(1, 2);
+            if (args[0].t.name != "string[][]")
+                error("os.pipeline expects an array of commands (string[][])");
+            return object("fw_os_pipeline",
+                          {args[0].v, args.size() == 2 ? str(1) : literal("").v}, Ty{"os.result"});
+        }
+        return std::nullopt;
+    }
+    if (module == "gc") {
+        if (function == "collect") {
+            arity(0, 0);
+            return Val{call("fw_gc_collect", b.getInt64Ty(), {}), Ty{"i64"}};
+        }
+        if (function == "pending") {
+            arity(0, 0);
+            return Val{call("fw_gc_pending", b.getInt64Ty(), {}), Ty{"i64"}};
+        }
+        return std::nullopt;
+    }
+    if (module == "thread") {
+        if (function == "spawn") {
+            arity(1, 1);
+            auto task = asFunction(args[0]);
+            if (!task.t.function() || task.t.parts().size() != 1)
+                error("thread.spawn expects a function taking no arguments");
+            auto result = task.t.parts()[0];
+            return object("fw_thread_spawn", {task.v, taskRunner(task.t)},
+                          Ty{"thread.task<" + result.name + ">"});
+        }
+        if (function == "mutex") {
+            arity(0, 0);
+            return object("fw_thread_mutex", {}, Ty{"thread.mutex"});
+        }
+        if (function == "cores") {
+            arity(0, 0);
+            return Val{call("fw_thread_cores", b.getInt64Ty(), {}), Ty{"i64"}};
+        }
+        if (function == "channel" || function.rfind("channel<", 0) == 0) {
+            arity(0, 1);
+            Ty t = function == "channel" ? expected : type("thread." + function);
+            if (t.name.rfind("thread.channel<", 0) != 0)
+                error("thread.channel needs an element type: declare the variable type or "
+                      "write thread.channel<T>()");
+            return object("fw_channel_new", {args.empty() ? i64(0) : integer(0)}, t);
+        }
+        return std::nullopt;
+    }
+    if (function == "resolve") {
+        arity(1, 1);
+        return object("fw_net_resolve", {str(0)}, Ty{"string[]"});
+    }
+    if (function == "connect") {
+        arity(2, 3);
+        auto timeout = args.size() == 3 ? real(2) : llvm::ConstantFP::get(b.getDoubleTy(), 0.0);
+        return object("fw_net_connect", {str(0), integer(1), timeout}, Ty{"net.socket"});
+    }
+    if (function == "listen") {
+        arity(2, 2);
+        return object("fw_net_listen", {str(0), integer(1)}, Ty{"net.listener"});
+    }
+    return std::nullopt;
+}
+std::optional<Val> Compiler::resourceMethod(Val receiver, const std::string &method, Expr &e) {
+    auto t = nonNull(receiver.t).name;
+    bool generic = t.back() == '>';
+    bool task = generic && t.rfind("thread.task<", 0) == 0,
+         channel = generic && t.rfind("thread.channel<", 0) == 0;
+    if (t != "io.file" && t != "net.socket" && t != "net.listener" && t != "os.process" &&
+        t != "thread.mutex" && !task && !channel)
+        return std::nullopt;
+    if (receiver.t.nullable())
+        receiver = convert(receiver, Ty{t}, true);
+    size_t supplied = e.args.size() - 1;
+    auto arity = [&](size_t low, size_t high) {
+        if (supplied < low || supplied > high)
+            error(t + "." + method + " expects " +
+                  (low == high ? std::to_string(low) + " argument(s)"
+                               : std::to_string(low) + " to " + std::to_string(high) +
+                                     " arguments"));
+    };
+    auto argument = [&](size_t i, Ty type) { return convert(value(*e.args[i], type), type).v; };
+    auto object = [&](const std::string &f, std::vector<llvm::Value *> values, Ty type) {
+        values.insert(values.begin(), frame);
+        return Val{objectCall(f, std::move(values)), type};
+    };
+    if (task) {
+        auto result = Ty{receiver.t.parts()[0]};
+        if (method == "done") {
+            arity(0, 0);
+            return Val{b.CreateICmpNE(call("fw_thread_done", b.getInt64Ty(), {receiver.v}), i64(0)),
+                       Ty{"bool"}};
+        }
+        if (method != "join")
+            error("thread.task has join and done");
+        arity(0, 0);
+        auto box = objectCall("fw_thread_join", {frame, receiver.v});
+        if (result.name == "void")
+            return Val{};
+        return get({box, Ty{"Error"}}, i64(0), result);
+    }
+    if (t == "thread.mutex") {
+        static const std::map<std::string, int> operations = {
+            {"lock", 0}, {"unlock", 1}, {"try_lock", 2}};
+        auto it = operations.find(method);
+        if (it == operations.end())
+            error("thread.mutex has lock, unlock, and try_lock");
+        arity(0, 0);
+        auto status = call("fw_mutex_operation", b.getInt64Ty(), {receiver.v, i64(it->second)});
+        if (method == "try_lock")
+            return Val{b.CreateICmpNE(status, i64(0)), Ty{"bool"}};
+        return Val{};
+    }
+    if (channel) {
+        auto item = receiver.t.parts()[0];
+        if (method == "send") {
+            arity(1, 1);
+            Val box{objectCall("fw_new", {frame, i64(1), i64(2)}), Ty{"Error"}};
+            set(box, i64(0), convert(value(*e.args[1], item), item));
+            call("fw_channel_send", b.getVoidTy(), {receiver.v, box.v});
+            return Val{};
+        }
+        if (method == "close") {
+            arity(0, 0);
+            call("fw_channel_close", b.getVoidTy(), {receiver.v});
+            return Val{};
+        }
+        if (method != "receive" && method != "try_receive")
+            error("thread.channel has send, receive, try_receive, and close");
+        arity(0, 0);
+        // A null holder means closed and drained (receive) or empty (try_receive).
+        auto holder = objectCall("fw_channel_receive",
+                                 {frame, receiver.v, i64(method == "receive")});
+        Ty optional{item.name + "?"};
+        auto present = llvm::BasicBlock::Create(ctx, "channel.value", current);
+        auto missing = llvm::BasicBlock::Create(ctx, "channel.empty", current);
+        auto done = llvm::BasicBlock::Create(ctx, "channel.end", current);
+        b.CreateCondBr(b.CreateICmpNE(holder, llvm::ConstantPointerNull::get(b.getPtrTy())),
+                       present, missing);
+        b.SetInsertPoint(present);
+        auto payload = convert(get({holder, Ty{"Error"}}, i64(0), item), optional);
+        auto presentEnd = b.GetInsertBlock();
+        b.CreateBr(done);
+        b.SetInsertPoint(missing);
+        b.CreateBr(done);
+        b.SetInsertPoint(done);
+        auto phi = b.CreatePHI(b.getPtrTy(), 2);
+        phi->addIncoming(payload.v, presentEnd);
+        phi->addIncoming(llvm::ConstantPointerNull::get(b.getPtrTy()), missing);
+        return Val{phi, optional};
+    }
+    if (t == "os.process") {
+        if (method != "run")
+            return std::nullopt;
+        arity(0, 0);
+        return object("fw_os_run", {receiver.v}, Ty{"os.result"});
+    }
+    if (t == "io.file") {
+        static const std::map<std::string, std::pair<int, std::string>> reads = {
+            {"read_line", {0, "string?"}}, {"read_all", {1, "string"}}, {"lines", {2, "string[]"}}};
+        if (auto it = reads.find(method); it != reads.end()) {
+            arity(0, 0);
+            return object("fw_io_file_read", {receiver.v, i64(it->second.first)},
+                          Ty{it->second.second});
+        }
+        if (method == "write") {
+            arity(1, 1);
+            call("fw_io_file_write", b.getVoidTy(), {receiver.v, stringify(value(*e.args[1])).v});
+            return Val{};
+        }
+        if (method == "close") {
+            arity(0, 0);
+            call("fw_io_file_close", b.getVoidTy(), {receiver.v});
+            return Val{};
+        }
+        error("io.file has read_line, read_all, lines, write, and close");
+    }
+    if (method == "close") {
+        arity(0, 0);
+        call("fw_net_close", b.getVoidTy(), {receiver.v});
+        return Val{};
+    }
+    if (method == "address" || method == "peer") {
+        arity(0, 0);
+        return object("fw_net_address", {receiver.v, i64(method == "peer")}, Ty{"string"});
+    }
+    if (method == "port") {
+        arity(0, 0);
+        return Val{call("fw_net_port", b.getInt64Ty(), {receiver.v}), Ty{"i64"}};
+    }
+    if (t == "net.listener") {
+        if (method != "accept")
+            error("net.listener has accept, port, address, and close");
+        arity(0, 0);
+        return object("fw_net_accept", {receiver.v}, Ty{"net.socket"});
+    }
+    if (method == "send") {
+        arity(1, 1);
+        call("fw_net_send", b.getVoidTy(), {receiver.v, argument(1, Ty{"string"})});
+        return Val{};
+    }
+    if (method == "receive") {
+        arity(0, 1);
+        auto limit = supplied ? argument(1, Ty{"i64"}) : i64(65536);
+        return object("fw_net_receive", {receiver.v, limit, i64(0)}, Ty{"string"});
+    }
+    if (method == "receive_line") {
+        arity(0, 0);
+        return object("fw_net_receive", {receiver.v, i64(0), i64(1)}, Ty{"string?"});
+    }
+    if (method == "set_timeout") {
+        arity(1, 1);
+        auto seconds = value(*e.args[1]);
+        if (!seconds.t.numeric())
+            error("set_timeout expects seconds");
+        call("fw_net_timeout", b.getVoidTy(), {receiver.v, convert(seconds, Ty{"double"}, true).v});
+        return Val{};
+    }
+    error("net.socket has send, receive, receive_line, set_timeout, peer, address, port, and "
+          "close");
+}
+// Generated JSON decoding. Scalars decode inline; collections, nullable values and classes
+// use one function per type so recursive types work.
+Val Compiler::jsonDecode(Ty t, Val json) {
+    if (t.name == "json.value")
+        return json;
+    if (t.name == "string")
+        return {objectCall("fw_json_string", {frame, json.v}), t};
+    if (t.integer())
+        return convert({call("fw_json_int", b.getInt64Ty(), {json.v}), Ty{"i64"}}, t, true);
+    if (t.real())
+        return convert({call("fw_json_real", b.getDoubleTy(), {json.v}), Ty{"double"}}, t, true);
+    if (t.name == "bool")
+        return {b.CreateICmpNE(call("fw_json_bool", b.getInt64Ty(), {json.v}), i64(0)), t};
+    if (t.name == "char") {
+        auto text = objectCall("fw_json_string", {frame, json.v});
+        return {b.CreateTrunc(call("fw_string_to_char", b.getInt64Ty(), {text}), b.getInt32Ty()), t};
+    }
+    if (t.enumeration()) {
+        auto text = objectCall("fw_json_string", {frame, json.v});
+        std::string names;
+        for (auto &m : enums.at(t.name)->members)
+            names += (names.empty() ? "" : ",") + m;
+        auto index = call("fw_enum_index", b.getInt64Ty(), {b.CreateGlobalString(names), text});
+        guard(b.CreateICmpSGE(index, i64(0)), "unknown " + displayName(t.name) + " member in JSON",
+              "JsonError");
+        return {index, t};
+    }
+    auto code = jsonDecodeFunction(t);
+    auto result = b.CreateCall(
+        llvm::FunctionType::get(ll(t), {b.getPtrTy()}, false), code, {json.v});
+    checkError();
+    if (t.object())
+        objectCall("fw_adopt", {frame, result});
+    return {result, t};
+}
+llvm::Value *Compiler::jsonDecodeFunction(Ty t) {
+    auto &code = jsonDecoders[t.name];
+    if (code)
+        return code;
+    bool supported = t.nullable() || t.array() || t.homogeneousTuple() || t.tuple() || t.set() ||
+                     t.map() || (classes.count(t.name) && !classes.at(t.name)->isInterface);
+    if (!supported)
+        error("cannot decode " + displayName(t.name) + " from JSON");
+    auto saved = saveFunction();
+    top = false;
+    infer = false;
+    owner.clear();
+    returnType = t;
+    current = llvm::Function::Create(llvm::FunctionType::get(ll(t), {b.getPtrTy()}, false),
+                                     llvm::GlobalValue::InternalLinkage, "fly.json." + t.name,
+                                     module);
+    code = current;
+    b.SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", current));
+    frame = objectCall("fw_frame", {});
+    failure = llvm::BasicBlock::Create(ctx, "propagate.error", current);
+    scopes.emplace_back();
+    Val json{current->getArg(0), Ty{"json.value"}};
+    Val result;
+    if (t.nullable()) {
+        auto inner = nonNull(t);
+        auto present = llvm::BasicBlock::Create(ctx, "json.present", current);
+        auto missing = llvm::BasicBlock::Create(ctx, "json.null", current);
+        b.CreateCondBr(b.CreateICmpNE(call("fw_json_is_null", b.getInt64Ty(), {json.v}), i64(0)),
+                       missing, present);
+        b.SetInsertPoint(missing);
+        call("fw_drop", b.getVoidTy(), {frame});
+        b.CreateRet(llvm::ConstantPointerNull::get(b.getPtrTy()));
+        b.SetInsertPoint(present);
+        result = convert(jsonDecode(inner, json), t);
+    } else if (t.map()) {
+        auto parts = t.parts();
+        Val out{objectCall("fw_map_new", {frame, i64(mapKeyKind(parts[0]))}), t};
+        Val keys{objectCall("fw_json_list", {frame, json.v, i64(1)}), Ty{"string[]"}};
+        eachItem(keys, [&](Val key) {
+            auto item = jsonDecode(parts[1], {objectCall("fw_json_get", {frame, json.v, key.v}),
+                                              Ty{"json.value"}});
+            // JSON object keys are strings: enum keys use member names; numbers, bools, and
+            // chars convert like explicit casts from string.
+            Val typedKey = key;
+            if (parts[0].enumeration()) {
+                std::string names;
+                for (auto &m : enums.at(parts[0].name)->members)
+                    names += (names.empty() ? "" : ",") + m;
+                auto index =
+                    call("fw_enum_index", b.getInt64Ty(), {b.CreateGlobalString(names), key.v});
+                guard(b.CreateICmpSGE(index, i64(0)),
+                      "unknown " + displayName(parts[0].name) + " member in JSON key", "JsonError");
+                typedKey = {index, parts[0]};
+            } else if (parts[0].integer() || parts[0].name == "bool" || parts[0].name == "char")
+                typedKey = explicitCast(key, parts[0]);
+            else if (parts[0].name != "string")
+                error("cannot decode map keys of type " + displayName(parts[0].name) +
+                      " from JSON object keys");
+            set(out, mapIndex(out, typedKey, true), convert(item, parts[1]));
+        });
+        result = out;
+    } else if (t.tuple()) {
+        auto parts = t.parts();
+        auto n = call("fw_json_length", b.getInt64Ty(), {json.v});
+        guard(b.CreateICmpEQ(n, i64(static_cast<int64_t>(parts.size()))),
+              "JSON array length does not match " + displayName(t.name), "JsonError");
+        Val out{objectCall("fw_new", {frame, i64(static_cast<int64_t>(parts.size())), i64(7)}), t};
+        for (size_t i = 0; i < parts.size(); ++i) {
+            auto item = jsonDecode(parts[i], {objectCall("fw_json_at", {frame, json.v,
+                                                                        i64(static_cast<int64_t>(i))}),
+                                              Ty{"json.value"}});
+            set(out, i64(static_cast<int64_t>(i)), convert(item, parts[i]));
+        }
+        result = out;
+    } else if (t.array() || t.homogeneousTuple() || t.set()) {
+        auto item = t.set() ? t.parts()[0] : t.item();
+        Val out = t.set() ? newSet(t)
+                          : Val{objectCall("fw_new", {frame, i64(0), i64(t.array() ? 1 : 7)}), t};
+        Val items{objectCall("fw_json_list", {frame, json.v, i64(0)}), Ty{"json.value[]"}};
+        eachItem(items, [&](Val element) {
+            auto decoded = convert(jsonDecode(item, element), item);
+            if (t.set())
+                keyFind(out, decoded, 1);
+            else
+                set(out, call("fw_array_append", b.getInt64Ty(), {out.v}), decoded);
+        });
+        result = out;
+    } else {
+        // Classes: fields decode by name; defaults and null fill missing optional fields.
+        auto &c = *classes.at(t.name);
+        Val obj = newInstance(c);
+        for (size_t i = 0; i < c.fields.size(); ++i) {
+            auto &f = c.fields[i];
+            Ty ft = type(f.type);
+            auto key = literal(f.name);
+            llvm::BasicBlock *merge = nullptr;
+            if (f.value || ft.nullable()) {
+                auto present = llvm::BasicBlock::Create(ctx, "json.field", current);
+                auto missing = llvm::BasicBlock::Create(ctx, "json.default", current);
+                merge = llvm::BasicBlock::Create(ctx, "json.next", current);
+                b.CreateCondBr(
+                    b.CreateICmpNE(call("fw_json_has", b.getInt64Ty(), {json.v, key.v}), i64(0)),
+                    present, missing);
+                b.SetInsertPoint(missing);
+                set(obj, i64(static_cast<int64_t>(i)),
+                    f.value ? convert(defaultValue(*f.value, ft), ft)
+                            : Val{llvm::ConstantPointerNull::get(b.getPtrTy()), ft});
+                b.CreateBr(merge);
+                b.SetInsertPoint(present);
+            }
+            auto field = jsonDecode(ft, {objectCall("fw_json_get", {frame, json.v, key.v}),
+                                         Ty{"json.value"}});
+            set(obj, i64(static_cast<int64_t>(i)), convert(field, ft));
+            if (merge) {
+                b.CreateBr(merge);
+                b.SetInsertPoint(merge);
+            }
+        }
+        result = obj;
+    }
+    if (result.t.object())
+        call("fw_retain", b.getVoidTy(), {result.v});
+    call("fw_drop", b.getVoidTy(), {frame});
+    b.CreateRet(result.v);
+    emitFailure();
+    restoreFunction(saved);
+    return code;
+}
+Val Compiler::stringMethod(Val text, const std::string &method, Expr &e) {
+    size_t supplied = e.args.size() - 1;
+    auto arity = [&](size_t low, size_t high) {
+        if (supplied < low || supplied > high)
+            error("string." + method + " expects " +
+                  (low == high ? std::to_string(low) + " argument(s)"
+                               : std::to_string(low) + " to " + std::to_string(high) +
+                                     " arguments"));
+    };
+    auto argument = [&](size_t i, Ty t) { return convert(value(*e.args[i], t), t); };
+    auto textArgument = [&](size_t i) {
+        auto v = value(*e.args[i], Ty{"string"});
+        return v.t.name == "char" ? stringify(v) : convert(v, Ty{"string"});
+    };
+    auto result = [&](const std::string &function, std::vector<llvm::Value *> values, Ty t) {
+        values.insert(values.begin(), frame);
+        return Val{objectCall(function, std::move(values)), t};
+    };
+    static const std::map<std::string, int> transforms = {
+        {"upper", 0}, {"lower", 1}, {"trim", 2}, {"trim_start", 3}, {"trim_end", 4}, {"reverse", 5}};
+    static const std::map<std::string, int> searches = {{"find", 0},        {"contains", 1},
+                                                        {"starts_with", 2}, {"ends_with", 3},
+                                                        {"count", 4},       {"find_last", 5}};
+    auto null = llvm::ConstantPointerNull::get(b.getPtrTy());
+    if (auto it = transforms.find(method); it != transforms.end()) {
+        arity(0, 0);
+        return result("fw_string_transform", {text.v, i64(it->second)}, Ty{"string"});
+    }
+    if (auto it = searches.find(method); it != searches.end()) {
+        arity(1, 1);
+        auto found =
+            call("fw_string_search", b.getInt64Ty(), {text.v, textArgument(1).v, i64(it->second)});
+        if (it->second >= 1 && it->second <= 3)
+            return {b.CreateICmpNE(found, i64(0)), Ty{"bool"}};
+        return {found, Ty{"i64"}};
+    }
+    if (method == "split") {
+        arity(0, 1);
+        llvm::Value *separator = supplied ? textArgument(1).v : null;
+        return result("fw_string_split", {text.v, separator, i64(0)}, Ty{"string[]"});
+    }
+    if (method == "lines") {
+        arity(0, 0);
+        return result("fw_string_split", {text.v, null, i64(1)}, Ty{"string[]"});
+    }
+    if (method == "chars") {
+        arity(0, 0);
+        return result("fw_string_chars", {text.v}, Ty{"char[]"});
+    }
+    if (method == "replace") {
+        arity(2, 2);
+        auto from = textArgument(1);
+        auto to = textArgument(2);
+        return result("fw_string_replace", {text.v, from.v, to.v}, Ty{"string"});
+    }
+    if (method == "slice") {
+        arity(1, 2);
+        auto from = argument(1, Ty{"i64"});
+        auto to = supplied == 2 ? argument(2, Ty{"i64"}) : Val{i64(0), Ty{"i64"}};
+        return result("fw_string_slice", {text.v, from.v, to.v, i64(supplied == 2 ? 1 : 0)},
+                      Ty{"string"});
+    }
+    if (method == "pad_start" || method == "pad_end") {
+        arity(1, 2);
+        auto width = argument(1, Ty{"i64"});
+        auto fill = supplied == 2 ? textArgument(2) : literal(" ");
+        return result("fw_string_pad", {text.v, width.v, fill.v, i64(method == "pad_end")},
+                      Ty{"string"});
+    }
+    if (method == "join") {
+        arity(1, 1);
+        auto items = value(*e.args[1]);
+        if (!items.t.sequence())
+            error("string.join expects an array or homogeneous tuple");
+        return result("fw_array_join", {items.v, text.v}, Ty{"string"});
+    }
+    if (method == "repeat") {
+        arity(1, 1);
+        return result("fw_repeat", {text.v, argument(1, Ty{"i64"}).v}, Ty{"string"});
+    }
+    if (method == "is_empty") {
+        arity(0, 0);
+        return {b.CreateICmpEQ(call("fw_length", b.getInt64Ty(), {text.v}), i64(0)), Ty{"bool"}};
+    }
+    error("unknown string method '" + method + "'");
+}
+std::optional<Val> Compiler::sequenceTool(Val sequence, const std::string &method, Expr &e) {
+    static const std::set<std::string> tools = {"sort",   "reverse",   "slice",  "index_of",
+                                                "contains", "insert",  "remove_at", "remove",
+                                                "extend", "copy",      "join"};
+    if (!tools.count(method))
+        return std::nullopt;
+    size_t supplied = e.args.size() - 1;
+    auto item = sequence.t.item();
+    auto arity = [&](size_t low, size_t high) {
+        if (supplied < low || supplied > high)
+            error(method + " expects " +
+                  (low == high ? std::to_string(low) + " argument(s)"
+                               : std::to_string(low) + " to " + std::to_string(high) +
+                                     " arguments"));
+    };
+    static const std::set<std::string> mutating = {"sort",      "reverse", "insert",
+                                                   "remove_at", "remove",  "extend"};
+    if (mutating.count(method) && !sequence.t.array())
+        error("tuples are immutable; '" + method + "' requires an array");
+    auto argument = [&](size_t i, Ty t) { return convert(value(*e.args[i], t), t); };
+    auto search = [&](size_t i) {
+        Val box{objectCall("fw_new", {frame, i64(1), i64(2)}), Ty{"Error"}};
+        set(box, i64(0), argument(i, item));
+        return call("fw_array_index_of", b.getInt64Ty(), {sequence.v, box.v});
+    };
+    if (method == "sort") {
+        arity(0, 1);
+        if (supplied == 0) {
+            if (!item.numeric() && item.name != "char" && item.name != "bool" &&
+                item.name != "string")
+                error("sort() without a comparator requires numbers, chars, bools, or strings; "
+                      "pass a function(" + displayName(item.name) + ", " +
+                      displayName(item.name) + ") returns bool");
+            call("fw_array_sort", b.getVoidTy(), {sequence.v});
+            return Val{};
+        }
+        Ty hint{"function<bool," + item.name + "," + item.name + ">"};
+        auto less = asFunction(value(*e.args[1], hint));
+        if (less.t != hint)
+            error("sort expects a function(" + displayName(item.name) + ", " +
+                  displayName(item.name) + ") returns bool");
+        call("fw_array_sort_by", b.getVoidTy(),
+             {sequence.v, less.v, lessTrampoline(item, less.t)});
+        return Val{};
+    }
+    if (method == "reverse") {
+        arity(0, 0);
+        call("fw_array_reverse", b.getVoidTy(), {sequence.v});
+        return Val{};
+    }
+    if (method == "slice") {
+        arity(1, 2);
+        auto from = argument(1, Ty{"i64"});
+        auto to = supplied == 2 ? argument(2, Ty{"i64"}) : Val{i64(0), Ty{"i64"}};
+        return Val{objectCall("fw_array_slice", {frame, sequence.v, from.v, to.v,
+                                                 i64(supplied == 2 ? 1 : 0)}),
+                   sequence.t};
+    }
+    if (method == "index_of" || method == "contains") {
+        arity(1, 1);
+        auto index = search(1);
+        if (method == "contains")
+            return Val{b.CreateICmpSGE(index, i64(0)), Ty{"bool"}};
+        return Val{index, Ty{"i64"}};
+    }
+    if (method == "insert") {
+        arity(2, 2);
+        auto position = argument(1, Ty{"i64"});
+        auto x = argument(2, item);
+        set(sequence, call("fw_array_insert", b.getInt64Ty(), {sequence.v, position.v}), x);
+        return Val{};
+    }
+    if (method == "remove_at") {
+        arity(1, 1);
+        auto position = argument(1, Ty{"i64"});
+        auto removed = get(sequence, position.v, item);
+        call("fw_array_remove_at", b.getVoidTy(), {sequence.v, position.v});
+        return removed;
+    }
+    if (method == "remove") {
+        arity(1, 1);
+        auto index = search(1);
+        auto found = b.CreateICmpSGE(index, i64(0));
+        auto yes = llvm::BasicBlock::Create(ctx, "remove.found", current);
+        auto done = llvm::BasicBlock::Create(ctx, "remove.end", current);
+        b.CreateCondBr(found, yes, done);
+        b.SetInsertPoint(yes);
+        call("fw_array_remove_at", b.getVoidTy(), {sequence.v, index});
+        b.CreateBr(done);
+        b.SetInsertPoint(done);
+        return Val{found, Ty{"bool"}};
+    }
+    if (method == "extend") {
+        arity(1, 1);
+        auto other = value(*e.args[1], sequence.t);
+        if (!other.t.sequence() || other.t.item() != item)
+            error("extend expects a sequence of " + displayName(item.name));
+        call("fw_array_extend", b.getVoidTy(), {sequence.v, other.v});
+        return Val{};
+    }
+    if (method == "copy") {
+        arity(0, 0);
+        return Val{objectCall("fw_array_copy", {frame, sequence.v}), sequence.t};
+    }
+    arity(0, 1);
+    auto separator = supplied ? argument(1, Ty{"string"}) : literal("");
+    return Val{objectCall("fw_array_join", {frame, sequence.v, separator.v}), Ty{"string"}};
+}
+// less(closure, array, i, j) for fw_array_sort_by; returns 0 after a callback error.
+llvm::Function *Compiler::lessTrampoline(Ty item, Ty function) {
+    auto &code = trampolines["less:" + function.name];
+    if (code)
+        return code;
+    auto saved = saveFunction();
+    top = false;
+    infer = false;
+    returnType = Ty{"i64"};
+    current = llvm::Function::Create(
+        llvm::FunctionType::get(b.getInt64Ty(),
+                                {b.getPtrTy(), b.getPtrTy(), b.getInt64Ty(), b.getInt64Ty()},
+                                false),
+        llvm::GlobalValue::InternalLinkage, "fly.less", module);
+    code = current;
+    b.SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", current));
+    frame = objectCall("fw_frame", {});
+    failure = llvm::BasicBlock::Create(ctx, "propagate.error", current);
+    scopes.emplace_back();
+    Val array{current->getArg(1), Ty{item.name + "[]"}};
+    auto x = get(array, current->getArg(2), item);
+    auto y = get(array, current->getArg(3), item);
+    auto result = callClosure(Val{current->getArg(0), function}, std::vector<Val>{x, y});
+    auto answer = b.CreateZExt(result.v, b.getInt64Ty());
+    call("fw_drop", b.getVoidTy(), {frame});
+    b.CreateRet(answer);
+    emitFailure();
+    restoreFunction(saved);
+    return code;
+}
+// run(closure, result) for fw_thread_spawn: calls the task and stores its result in slot 0.
+llvm::Function *Compiler::taskRunner(Ty function) {
+    auto &code = trampolines["task:" + function.name];
+    if (code)
+        return code;
+    auto saved = saveFunction();
+    top = false;
+    infer = false;
+    owner.clear();
+    returnType = Ty{"void"};
+    current = llvm::Function::Create(
+        llvm::FunctionType::get(b.getVoidTy(), {b.getPtrTy(), b.getPtrTy()}, false),
+        llvm::GlobalValue::InternalLinkage, "fly.task", module);
+    code = current;
+    b.SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", current));
+    frame = objectCall("fw_frame", {});
+    failure = llvm::BasicBlock::Create(ctx, "propagate.error", current);
+    scopes.emplace_back();
+    auto result = callClosure(Val{current->getArg(0), function}, std::vector<Val>{});
+    if (result.t.name != "void")
+        set({current->getArg(1), Ty{"Error"}}, i64(0), result);
+    call("fw_drop", b.getVoidTy(), {frame});
+    b.CreateRetVoid();
+    emitFailure();
+    restoreFunction(saved);
+    return code;
+}
+std::optional<Val> Compiler::mathCall(const std::string &name, std::vector<Val> &args) {
+    if (name.rfind("math.", 0) != 0)
+        return std::nullopt;
+    auto method = name.substr(5);
+    auto count = [&](size_t n) {
+        if (args.size() != n)
+            error(name + " expects " + std::to_string(n) + " argument(s)");
+    };
+    auto real = [&](size_t i) {
+        if (!args[i].t.numeric())
+            error(name + " requires numeric arguments");
+        return convert(args[i], Ty{"double"}, true).v;
+    };
+    auto common = [&](std::vector<Val> values) {
+        Ty t = values[0].t;
+        for (auto &v : values) {
+            if (!v.t.numeric())
+                error(name + " requires numeric arguments");
+            if (widening(t, v.t))
+                t = v.t;
+            else if (!widening(v.t, t))
+                error(name + " needs arguments with a lossless common numeric type");
+        }
+        return t;
+    };
+    auto select = [&](const std::string &op, Val a, Val c) {
+        auto less = binary(op, a, c);
+        return Val{b.CreateSelect(less.v, a.v, c.v), a.t};
+    };
+    static const std::map<std::string, int> unary = {
+        {"floor", 0}, {"ceil", 1}, {"round", 2},  {"trunc", 3},  {"log10", 5}, {"log2", 6},
+        {"exp", 7},   {"tan", 8},  {"asin", 9},   {"acos", 10},  {"atan", 11}};
+    if (auto it = unary.find(method); it != unary.end()) {
+        count(1);
+        return Val{call("fw_math_unary", b.getDoubleTy(), {real(0), i64(it->second)}),
+                   Ty{"double"}};
+    }
+    if (method == "log") {
+        if (args.size() != 1 && args.size() != 2)
+            error("math.log expects a value and an optional base");
+        auto natural = call("fw_math_unary", b.getDoubleTy(), {real(0), i64(4)});
+        if (args.size() == 1)
+            return Val{natural, Ty{"double"}};
+        auto base = call("fw_math_unary", b.getDoubleTy(), {real(1), i64(4)});
+        return Val{b.CreateFDiv(natural, base), Ty{"double"}};
+    }
+    if (method == "atan2" || method == "hypot") {
+        count(2);
+        return Val{call("fw_math_binary", b.getDoubleTy(),
+                        {real(0), real(1), i64(method == "atan2" ? 0 : 1)}),
+                   Ty{"double"}};
+    }
+    if (method == "is_nan" || method == "is_finite") {
+        count(1);
+        auto x = real(0);
+        if (method == "is_nan")
+            return Val{b.CreateFCmpUNO(x, x), Ty{"bool"}};
+        auto magnitude = call("fw_math_unary", b.getDoubleTy(), {x, i64(12)});
+        return Val{b.CreateFCmpOLT(magnitude, llvm::ConstantFP::getInfinity(b.getDoubleTy())),
+                   Ty{"bool"}};
+    }
+    if (method == "abs") {
+        count(1);
+        auto x = args[0];
+        if (!x.t.numeric())
+            error("math.abs requires a number");
+        if (x.t.real())
+            return Val{b.CreateFPCast(call("fw_math_unary", b.getDoubleTy(),
+                                           {real(0), i64(12)}),
+                                      ll(x.t)),
+                       x.t};
+        if (x.t.unsigned_())
+            return x;
+        auto zero = Val{llvm::ConstantInt::get(ll(x.t), 0), x.t};
+        auto negative = b.CreateICmpSLT(x.v, zero.v);
+        auto flip = llvm::BasicBlock::Create(ctx, "abs.negative", current);
+        auto done = llvm::BasicBlock::Create(ctx, "abs.end", current);
+        auto entry = b.GetInsertBlock();
+        b.CreateCondBr(negative, flip, done);
+        b.SetInsertPoint(flip);
+        auto negated = binary("-", zero, x);
+        auto flipped = b.GetInsertBlock();
+        b.CreateBr(done);
+        b.SetInsertPoint(done);
+        auto phi = b.CreatePHI(ll(x.t), 2);
+        phi->addIncoming(x.v, entry);
+        phi->addIncoming(negated.v, flipped);
+        return Val{phi, x.t};
+    }
+    if (method == "min" || method == "max") {
+        if (args.size() < 2)
+            error(name + " expects at least two values");
+        auto t = common(args);
+        auto best = convert(args[0], t);
+        for (size_t i = 1; i < args.size(); ++i)
+            best = select(method == "min" ? "<=" : ">=", best, convert(args[i], t));
+        return best;
+    }
+    if (method == "clamp") {
+        count(3);
+        auto t = common(args);
+        auto low = convert(args[1], t), high = convert(args[2], t);
+        guard(binary("<=", low, high).v, "math.clamp requires low <= high");
+        return select(">=", select("<=", convert(args[0], t), high), low);
+    }
+    if (method == "random") {
+        count(0);
+        return Val{call("fw_random", b.getDoubleTy(), {}), Ty{"double"}};
+    }
+    if (method == "random_int") {
+        count(2);
+        return Val{call("fw_random_int", b.getInt64Ty(),
+                        {convert(args[0], Ty{"i64"}).v, convert(args[1], Ty{"i64"}).v}),
+                   Ty{"i64"}};
+    }
+    if (method == "seed") {
+        count(1);
+        call("fw_random_seed", b.getVoidTy(), {convert(args[0], Ty{"i64"}).v});
+        return Val{};
+    }
+    return std::nullopt;
+}
+// a ?? b: a's payload when a is not null, otherwise b (evaluated only then).
+Val Compiler::coalesce(Expr &e, Ty expected) {
+    auto a = value(*e.args[0], expected.name == "void" ? expected : Ty{expected.name + "?"});
+    if (a.t.name == "null")
+        return value(*e.args[1], expected);
+    if (!a.t.nullable())
+        error("'?\?' requires a nullable left operand, not " + a.t.name);
+    auto inner = nonNull(a.t);
+    auto present = llvm::BasicBlock::Create(ctx, "coalesce.present", current);
+    auto missing = llvm::BasicBlock::Create(ctx, "coalesce.missing", current);
+    auto merge = llvm::BasicBlock::Create(ctx, "coalesce.end", current);
+    b.CreateCondBr(b.CreateICmpNE(a.v, llvm::ConstantPointerNull::get(b.getPtrTy())), present,
+                   missing);
+    b.SetInsertPoint(missing);
+    auto fallback = value(*e.args[1], inner);
+    // A nullable fallback keeps the result nullable; otherwise the result is the payload type.
+    Ty result = fallback.t.nullable() ? a.t : inner;
+    fallback = convert(fallback, result);
+    auto missingEnd = b.GetInsertBlock();
+    b.CreateBr(merge);
+    b.SetInsertPoint(present);
+    auto payload = result == a.t ? a : unboxChecked(a);
+    auto presentEnd = b.GetInsertBlock();
+    b.CreateBr(merge);
+    b.SetInsertPoint(merge);
+    auto phi = b.CreatePHI(ll(result), 2);
+    phi->addIncoming(payload.v, presentEnd);
+    phi->addIncoming(fallback.v, missingEnd);
+    return {phi, result};
+}
+llvm::Function *Compiler::closureCode(const std::string &key, Ty function,
+                                      const std::function<Val(llvm::Value *, Expr &)> &emit) {
+    auto &code = trampolines[key];
+    if (code)
+        return code;
+    auto parts = function.parts();
+    auto saved = saveFunction();
+    top = false;
+    infer = false;
+    owner.clear();
+    returnType = parts[0];
+    std::vector<llvm::Type *> types{b.getPtrTy()};
+    for (size_t i = 1; i < parts.size(); ++i)
+        types.push_back(ll(parts[i]));
+    current = llvm::Function::Create(llvm::FunctionType::get(ll(parts[0]), types, false),
+                                     llvm::GlobalValue::InternalLinkage, "fly.closure." + key,
+                                     module);
+    code = current;
+    b.SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", current));
+    frame = objectCall("fw_frame", {});
+    failure = llvm::BasicBlock::Create(ctx, "propagate.error", current);
+    scopes.emplace_back();
+    Expr synthetic;
+    synthetic.kind = "call";
+    synthetic.loc = location;
+    synthetic.args.emplace_back();
+    for (size_t i = 1; i < parts.size(); ++i) {
+        auto name = "$a" + std::to_string(i - 1);
+        bind(name, {current->getArg(static_cast<unsigned>(i)), parts[i]});
+        synthetic.args.push_back(syntheticName(name, location));
+    }
+    auto result = emit(current->getArg(0), synthetic);
+    if (parts[0].name == "void") {
+        call("fw_drop", b.getVoidTy(), {frame});
+        b.CreateRetVoid();
+    } else {
+        result = convert(result, parts[0]);
+        if (result.t.object())
+            call("fw_retain", b.getVoidTy(), {result.v});
+        call("fw_drop", b.getVoidTy(), {frame});
+        b.CreateRet(result.v);
+    }
+    emitFailure();
+    restoreFunction(saved);
+    return code;
+}
+namespace {
+// Replaces identifiers naming type parameters inside a type spelling.
+std::string substituteType(const std::string &text,
+                           const std::map<std::string, std::string> &bindings) {
+    std::string out;
+    for (size_t i = 0; i < text.size();) {
+        auto c = static_cast<unsigned char>(text[i]);
+        if (std::isalpha(c) || c == '_' || c == '$' || c >= 0x80) {
+            size_t end = i + 1;
+            while (end < text.size() &&
+                   (std::isalnum(static_cast<unsigned char>(text[end])) || text[end] == '_' ||
+                    text[end] == '$' || text[end] == '.' ||
+                    static_cast<unsigned char>(text[end]) >= 0x80))
+                ++end;
+            auto word = text.substr(i, end - i);
+            auto it = bindings.find(word);
+            out += it == bindings.end() ? word : it->second;
+            i = end;
+        } else
+            out += text[i++];
+    }
+    return out;
+}
+void substitute(Function &f, const std::map<std::string, std::string> &bindings);
+void substitute(Expr &e, const std::map<std::string, std::string> &bindings) {
+    if (e.kind == "is" || e.kind == "as" || e.kind == "name")
+        e.text = substituteType(e.text, bindings);
+    for (auto &a : e.args)
+        if (a)
+            substitute(*a, bindings);
+    if (e.lambda)
+        substitute(*e.lambda, bindings);
+}
+void substitute(std::vector<SP> &body, const std::map<std::string, std::string> &bindings) {
+    for (auto &st : body) {
+        st->type = substituteType(st->type, bindings);
+        for (auto &t : st->catchTypes)
+            t = substituteType(t, bindings);
+        if (st->expr)
+            substitute(*st->expr, bindings);
+        if (st->target)
+            substitute(*st->target, bindings);
+        substitute(st->body, bindings);
+        substitute(st->other, bindings);
+        substitute(st->finalizer, bindings);
+        for (auto &c : st->catches)
+            substitute(c, bindings);
+        for (auto &values : st->patterns)
+            for (auto &v : values)
+                substitute(*v, bindings);
+        for (auto &g : st->guards)
+            if (g)
+                substitute(*g, bindings);
+    }
+}
+void substitute(Function &f, const std::map<std::string, std::string> &bindings) {
+    f.result = substituteType(f.result, bindings);
+    for (auto &param : f.params) {
+        param.type = substituteType(param.type, bindings);
+        if (param.value)
+            substitute(*param.value, bindings);
+    }
+    substitute(f.body, bindings);
+}
+// Binds type parameters by matching a declared parameter type against an argument type.
+void unify(std::string pattern, const std::string &concrete, const std::set<std::string> &params,
+           std::map<std::string, std::string> &bound) {
+    if (params.count(pattern)) {
+        bound.emplace(pattern, concrete);
+        return;
+    }
+    if (pattern.rfind("array<", 0) == 0 && pattern.back() == '>')
+        pattern = pattern.substr(6, pattern.size() - 7) + "[]";
+    auto ends = [](const std::string &text, const std::string &suffix) {
+        return text.size() >= suffix.size() &&
+               text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
+    };
+    if (ends(pattern, "[]") && ends(concrete, "[]"))
+        return unify(pattern.substr(0, pattern.size() - 2), concrete.substr(0, concrete.size() - 2),
+                     params, bound);
+    if (ends(pattern, "?"))
+        return unify(pattern.substr(0, pattern.size() - 1),
+                     ends(concrete, "?") ? concrete.substr(0, concrete.size() - 1) : concrete,
+                     params, bound);
+    auto open = pattern.find('<'), concreteOpen = concrete.find('<');
+    bool tuples = !pattern.empty() && pattern.front() == '[' && !concrete.empty() &&
+                  concrete.front() == '[';
+    if (tuples || (open != std::string::npos && concreteOpen != std::string::npos &&
+                   pattern.substr(0, open) == concrete.substr(0, concreteOpen))) {
+        size_t a = tuples ? 1 : open + 1, c = tuples ? 1 : concreteOpen + 1;
+        auto left = typeParts(pattern.substr(a, pattern.size() - a - 1));
+        auto right = typeParts(concrete.substr(c, concrete.size() - c - 1));
+        for (size_t i = 0; i < left.size() && i < right.size(); ++i)
+            unify(left[i], right[i], params, bound);
+    }
+}
+} // namespace
+std::string Compiler::instantiateClass(const std::string &base, const std::vector<Ty> &arguments) {
+    auto &templ = *templates.at(base);
+    if (arguments.size() != templ.typeParams.size())
+        error(displayName(base) + " expects " + std::to_string(templ.typeParams.size()) +
+              " type argument(s)");
+    std::string key = base + "<";
+    std::map<std::string, std::string> bindings;
+    for (size_t i = 0; i < arguments.size(); ++i) {
+        if (arguments[i].name == "void")
+            error("type arguments cannot be void");
+        key += (i ? "," : "") + arguments[i].name;
+        bindings[templ.typeParams[i]] = arguments[i].name;
+    }
+    key += ">";
+    if (classes.count(key))
+        return key;
+    if (key.size() > 2000)
+        error("generic instantiation of " + displayName(base) + " is too deeply nested");
+    auto saved = location;
+    instances.push_back(clone(templ));
+    auto &c = instances.back();
+    c.name = key;
+    c.typeParams.clear();
+    c.base = substituteType(c.base, bindings);
+    for (auto &i : c.interfaces)
+        i = substituteType(i, bindings);
+    for (auto &f : c.fields) {
+        f.type = substituteType(f.type, bindings);
+        if (f.value)
+            substitute(*f.value, bindings);
+    }
+    classes[key] = &c;
+    finishClass(c);
+    for (auto &m : c.methods) {
+        substitute(m, bindings);
+        m.owner = key;
+        declareFunction(m);
+    }
+    location = saved;
+    return key;
+}
+std::string Compiler::instantiateFunction(const std::string &base,
+                                          const std::vector<Ty> &arguments) {
+    auto &templ = *functionTemplates.at(base);
+    if (arguments.size() != templ.typeParams.size())
+        error(displayName(base) + " expects " + std::to_string(templ.typeParams.size()) +
+              " type argument(s)");
+    std::string key = base + "<";
+    std::map<std::string, std::string> bindings;
+    for (size_t i = 0; i < arguments.size(); ++i) {
+        if (arguments[i].name == "void")
+            error("type arguments cannot be void");
+        key += (i ? "," : "") + arguments[i].name;
+        bindings[templ.typeParams[i]] = arguments[i].name;
+    }
+    key += ">";
+    if (functions.count(key))
+        return key;
+    auto saved = location;
+    functionInstances.push_back(clone(templ));
+    auto &f = functionInstances.back();
+    f.name = key;
+    f.typeParams.clear();
+    substitute(f, bindings);
+    declareFunction(f);
+    location = saved;
+    return key;
+}
+// Calls of generic functions and classes: explicit `f<int>(x)` or arguments inferred from
+// the argument types (and, for constructors, from the expected type).
+std::optional<Val> Compiler::genericCall(Expr &e, const std::string &name, Ty expected) {
+    if (classes.count(name) || functions.count(name))
+        return std::nullopt; // already an instantiation
+    auto open = name.find('<');
+    auto base = name.substr(0, open);
+    bool isClass = templates.count(base) > 0;
+    if (!isClass && !functionTemplates.count(base))
+        return std::nullopt;
+    std::vector<Ty> arguments;
+    std::vector<Val> values;
+    if (open != std::string::npos) {
+        for (auto &part : typeParts(name.substr(open + 1, name.size() - open - 2)))
+            arguments.push_back(type(part));
+    } else {
+        auto &params = isClass ? templates.at(base)->typeParams : functionTemplates.at(base)->typeParams;
+        std::vector<std::string> declared;
+        if (isClass) {
+            auto &templ = *templates.at(base);
+            auto init = std::find_if(templ.methods.begin(), templ.methods.end(),
+                                     [](Function &f) { return f.name == "init"; });
+            if (init != templ.methods.end())
+                for (auto &param : init->params)
+                    declared.push_back(param.type);
+            else
+                for (auto &f : templ.fields)
+                    declared.push_back(f.type);
+        } else
+            for (auto &param : functionTemplates.at(base)->params)
+                declared.push_back(param.type);
+        std::set<std::string> names(params.begin(), params.end());
+        std::map<std::string, std::string> bound;
+        if (isClass && expected.name.rfind(base + "<", 0) == 0 && expected.name.back() == '>') {
+            auto parts = typeParts(expected.name.substr(base.size() + 1,
+                                                        expected.name.size() - base.size() - 2));
+            for (size_t i = 0; i < parts.size() && i < params.size(); ++i)
+                bound.emplace(params[i], parts[i]);
+        }
+        for (size_t i = 1; i < e.args.size(); ++i) {
+            auto v = asFunction(value(*e.args[i]));
+            if (v.t.classReference())
+                v = convert(v, constructorType(v.t.name.substr(6)));
+            if (i - 1 < declared.size())
+                unify(declared[i - 1], v.t.name, names, bound);
+            values.push_back(v);
+        }
+        for (auto &param : params) {
+            if (!bound.count(param))
+                error("cannot infer type parameter " + param + " of " + displayName(base) +
+                      "; write " + displayName(base) + "<...>(...)");
+            arguments.push_back(type(bound.at(param)));
+        }
+    }
+    auto key = isClass ? instantiateClass(base, arguments) : instantiateFunction(base, arguments);
+    Expr call;
+    call.kind = "call";
+    call.loc = e.loc;
+    call.args.push_back(syntheticName(key, e.loc));
+    if (open != std::string::npos) {
+        for (size_t i = 1; i < e.args.size(); ++i)
+            call.args.push_back(clone(*e.args[i]));
+        return invoke(call, expected);
+    }
+    // Arguments were evaluated for inference; pass them through hidden locals.
+    scopes.emplace_back();
+    for (auto &v : values) {
+        auto hidden = "$g" + std::to_string(hiddenCount++);
+        bind(hidden, v, true);
+        call.args.push_back(syntheticName(hidden, e.loc));
+    }
+    auto result = invoke(call, expected);
+    releaseScopes(scopes.size() - 1);
+    scopes.pop_back();
+    return result;
+}
+// The natural function type of a constructor: init parameters, or all fields in order.
+Ty Compiler::constructorType(const std::string &className) {
+    std::string t = "function<" + className;
+    if (className == "desktop.window")
+        return Ty{t + ",string,i64,i64>"};
+    auto c = classes.find(className);
+    if (c == classes.end() || c->second->isInterface)
+        error("'" + displayName(className) + "' cannot be used as a constructor");
+    auto init = resolveMethod(className, "init");
+    if (!init.empty())
+        for (auto &param : signature(init).ast->params)
+            t += "," + type(param.type).name;
+    else
+        for (auto &f : c->second->fields)
+            t += "," + type(f.type).name;
+    return Ty{t + ">"};
+}
+// A constructor used as a function value; trailing parameters with defaults may be omitted.
+Val Compiler::constructorValue(const std::string &className, Ty to) {
+    auto natural = constructorType(className).parts();
+    auto wanted = to.parts();
+    bool ok = wanted[0].name == className || (classes.count(nonNull(wanted[0]).name) &&
+                                              derives(className, nonNull(wanted[0]).name));
+    ok = ok && wanted.size() <= natural.size();
+    for (size_t i = 1; ok && i < wanted.size(); ++i)
+        ok = wanted[i] == natural[i];
+    if (ok && wanted.size() < natural.size() && className != "desktop.window") {
+        auto init = resolveMethod(className, "init");
+        for (size_t i = wanted.size() - 1; ok && i + 1 < natural.size(); ++i)
+            ok = init.empty() ? classes.at(className)->fields[i].value != nullptr
+                              : signature(init).ast->params[i].value != nullptr;
+    }
+    if (!ok)
+        error("constructor " + displayName(className) + " does not match type " + to.name);
+    auto code = closureCode("new." + to.name + "." + className, to, [&](llvm::Value *, Expr &call) {
+        call.args[0] = syntheticName(className, location);
+        return invoke(call);
+    });
+    return {objectCall("fw_closure_new", {frame, code, i64(0)}), to};
+}
+// receiver.method as a value: a closure holding the receiver that dispatches like a call.
+Val Compiler::boundMethod(Val receiver, const std::string &method) {
+    auto key = resolveMethod(receiver.t.name, method);
+    auto &sig = signature(key);
+    std::string t = "function<" + sig.result.name;
+    for (auto &param : sig.ast->params)
+        t += "," + type(param.type).name;
+    Ty function{t + ">"};
+    auto className = receiver.t.name;
+    auto code = closureCode("method." + className + "." + method, function,
+                            [&](llvm::Value *env, Expr &call) {
+                                bind("$self", get({env, Ty{"Error"}}, i64(0), Ty{className}));
+                                auto callee = std::make_unique<Expr>();
+                                callee->kind = "member";
+                                callee->text = method;
+                                callee->loc = location;
+                                callee->args.push_back(syntheticName("$self", location));
+                                call.args[0] = std::move(callee);
+                                return invoke(call);
+                            });
+    Val closure{objectCall("fw_closure_new", {frame, code, i64(1)}), function};
+    set(closure, i64(0), receiver);
+    return closure;
+}
+Val Compiler::typeTest(Expr &e) {
+    auto x = value(*e.args[0]);
+    auto t = type(e.text);
+    auto base = nonNull(x.t);
+    auto target = nonNull(t);
+    bool classValue = classes.count(base.name) > 0, classTarget = classes.count(target.name) > 0;
+    if (e.kind == "is") {
+        if (!classTarget) {
+            // Non-class types are known statically; for nullable values `x is T` tests presence.
+            if (x.t.nullable() && base == t)
+                return {b.CreateICmpNE(x.v, llvm::ConstantPointerNull::get(b.getPtrTy())),
+                        Ty{"bool"}};
+            return {b.getInt1(x.t == t), Ty{"bool"}};
+        }
+        if (!classValue)
+            return {b.getFalse(), Ty{"bool"}};
+        if (derives(base.name, target.name) && !x.t.nullable())
+            return {b.getTrue(), Ty{"bool"}};
+        return {isInstance(x.v, target.name), Ty{"bool"}};
+    }
+    if (!classTarget || !classValue)
+        error("'as' casts between classes and interfaces; use " + displayName(target.name) +
+              "(value) for other conversions");
+    if (derives(base.name, target.name))
+        return convert(x, t);
+    if (!derives(target.name, base.name))
+        error("cannot cast " + displayName(x.t.name) + " to unrelated type " +
+              displayName(t.name));
+    auto ok = isInstance(x.v, target.name);
+    if (t.nullable())
+        return {b.CreateSelect(ok, x.v, llvm::ConstantPointerNull::get(b.getPtrTy())), t};
+    guard(ok, "cannot cast " + displayName(x.t.name) + " to " + displayName(t.name), "CastError");
+    return {x.v, t};
+}
+// Calls `method` on a receiver of static class/interface type. Unless `direct`, calls dispatch
+// on the receiver's runtime class when subclasses or implementations differ.
+Val Compiler::callMethod(Val receiver, const std::string &staticType, const std::string &method,
+                         Expr &e, bool direct) {
+    auto key = resolveMethod(staticType, method);
+    if (key.empty())
+        error("type " + displayName(staticType) + " has no method '" + method + "'");
+    auto &sig = signature(key);
+    size_t supplied = e.args.size() - 1;
+    if (supplied > sig.ast->params.size())
+        error("too many arguments to " + displayName(key));
+    std::vector<llvm::Value *> actual{receiver.v};
+    for (size_t i = 0; i < sig.ast->params.size(); ++i) {
+        auto &param = sig.ast->params[i];
+        Ty t = type(param.type);
+        Val v;
+        if (i < supplied)
+            v = value(*e.args[i + 1], t);
+        else if (param.value)
+            v = defaultValue(*param.value, t);
+        else
+            error("missing argument '" + param.name + "'");
+        actual.push_back(convert(v, t).v);
+    }
+    std::vector<std::pair<std::string, std::vector<std::string>>> impls;
+    if (direct)
+        impls.push_back({key, {}});
+    else
+        for (auto &c : concreteClasses(staticType)) {
+            auto impl = resolveMethod(c, method);
+            auto found = std::find_if(impls.begin(), impls.end(),
+                                      [&](auto &entry) { return entry.first == impl; });
+            if (found == impls.end())
+                impls.push_back({impl, {c}});
+            else
+                found->second.push_back(c);
+        }
+    auto invokeImpl = [&](const std::string &impl) -> llvm::Value * {
+        auto &target = signature(impl);
+        auto result = b.CreateCall(target.function, actual);
+        checkError();
+        return result;
+    };
+    llvm::Value *result = nullptr;
+    if (impls.empty()) {
+        // No class implements the interface method, so no receiver can reach this call.
+        call("fw_panic", b.getVoidTy(),
+             {b.CreateGlobalString("no implementation of " + displayName(key)),
+              b.CreateGlobalString("RuntimeError")});
+        result = sig.result.name == "void" ? nullptr : llvm::Constant::getNullValue(ll(sig.result));
+    } else if (impls.size() == 1)
+        result = invokeImpl(impls[0].first);
+    else {
+        auto id = call("fw_class_id", b.getPtrTy(), {receiver.v});
+        auto merge = llvm::BasicBlock::Create(ctx, "dispatch.end", current);
+        std::vector<std::pair<llvm::BasicBlock *, llvm::Value *>> results;
+        for (size_t i = 0; i < impls.size(); ++i) {
+            auto body = llvm::BasicBlock::Create(ctx, "dispatch.call", current);
+            auto next = llvm::BasicBlock::Create(ctx, "dispatch.next", current);
+            if (i + 1 == impls.size())
+                b.CreateBr(body);
+            else {
+                llvm::Value *match = b.getFalse();
+                for (auto &c : impls[i].second)
+                    match = b.CreateOr(match, b.CreateICmpEQ(id, classId(c)));
+                b.CreateCondBr(match, body, next);
+            }
+            b.SetInsertPoint(body);
+            auto value = invokeImpl(impls[i].first);
+            results.emplace_back(b.GetInsertBlock(), value);
+            b.CreateBr(merge);
+            b.SetInsertPoint(next);
+        }
+        b.CreateUnreachable();
+        b.SetInsertPoint(merge);
+        if (sig.result.name != "void") {
+            auto phi = b.CreatePHI(ll(sig.result), static_cast<unsigned>(results.size()));
+            for (auto &[block, value] : results)
+                phi->addIncoming(value, block);
+            result = phi;
+        }
+    }
+    if (sig.result.name == "void")
+        return {};
+    if (sig.result.object())
+        objectCall("fw_adopt", {frame, result});
+    return {result, sig.result};
+}
+// Checks overrides and interface conformance, and definite initialization in init methods.
+void Compiler::validateClasses() {
+    auto same = [&](const std::string &a, const std::string &b) {
+        auto &x = signature(a);
+        auto &y = signature(b);
+        if (x.result != y.result || x.ast->params.size() != y.ast->params.size())
+            return false;
+        for (size_t i = 0; i < x.ast->params.size(); ++i)
+            if (type(x.ast->params[i].type) != type(y.ast->params[i].type))
+                return false;
+        return true;
+    };
+    std::vector<std::pair<std::string, Class *>> all(classes.begin(), classes.end());
+    for (auto &[name, c] : all) {
+        location = c->loc;
+        for (auto &m : c->methods) {
+            if (m.name == "init" || c->base.empty())
+                continue;
+            auto inherited = resolveMethod(c->base, m.name);
+            location = m.loc;
+            if (!inherited.empty() && !same(name + "." + m.name, inherited))
+                error("method '" + m.name + "' overrides " + displayName(inherited) +
+                      " with a different signature");
+        }
+        if (c->isInterface)
+            continue;
+        for (auto &[other, i] : all) {
+            if (!i->isInterface || !derives(name, other))
+                continue;
+            for (auto &m : i->methods) {
+                auto impl = resolveMethod(name, m.name);
+                location = c->loc;
+                if (impl.empty() || signature(impl).ast->abstract)
+                    error("class " + displayName(name) + " must implement " +
+                          displayName(other) + "." + m.name);
+                if (!same(impl, other + "." + m.name))
+                    error(displayName(impl) + " does not match the signature of " +
+                          displayName(other) + "." + m.name);
+            }
+        }
+        if (functions.count(name + ".init"))
+            checkInit(*c, *functions.at(name + ".init").ast);
+        else if (!c->base.empty() && !resolveMethod(c->base, "init").empty()) {
+            auto &base = *classes.at(c->base);
+            for (size_t i = base.fields.size(); i < c->fields.size(); ++i)
+                if (!c->fields[i].value)
+                    error("class " + displayName(name) + " adds required field '" +
+                          c->fields[i].name + "', so it must define init");
+        }
+    }
+}
+// Required fields (no default) must be assigned by top-level statements of init, or by a
+// top-level super.init(...), before init reads `inst` or can return.
+void Compiler::checkInit(Class &c, Function &init) {
+    location = init.loc;
+    std::vector<std::string> required;
+    for (auto &f : c.fields)
+        if (!f.value)
+            required.push_back(f.name);
+    std::set<std::string> assigned;
+    std::function<bool(Expr &)> usesInst = [&](Expr &e) {
+        if (e.kind == "inst" || e.kind == "super")
+            return true;
+        for (auto &a : e.args)
+            if (a && usesInst(*a))
+                return true;
+        if (e.lambda)
+            for (auto &st : e.lambda->body)
+                if (st->expr && usesInst(*st->expr))
+                    return true;
+        return false;
+    };
+    std::function<bool(Stmt &, bool)> scan = [&](Stmt &st, bool returns) {
+        if (returns && st.kind == "return")
+            return true;
+        if ((st.expr && usesInst(*st.expr)) || (st.target && usesInst(*st.target)))
+            return true;
+        for (auto *body : {&st.body, &st.other, &st.finalizer})
+            for (auto &inner : *body)
+                if (scan(*inner, returns))
+                    return true;
+        for (auto &body : st.catches)
+            for (auto &inner : body)
+                if (scan(*inner, returns))
+                    return true;
+        return false;
+    };
+    auto missing = [&]() -> std::string {
+        for (auto &f : required)
+            if (!assigned.count(f))
+                return f;
+        return "";
+    };
+    for (auto &st : init.body) {
+        location = st->loc;
+        auto pending = missing();
+        if (pending.empty())
+            break;
+        if (st->kind == "assign" && st->op == "=" && st->target->kind == "inst") {
+            if (usesInst(*st->expr))
+                error("init reads 'inst' before assigning required field '" + pending + "'");
+            assigned.insert(st->target->text);
+            continue;
+        }
+        auto superInit = [&](Expr &target) {
+            Expr *callee = target.kind == "call" ? target.args[0].get() : &target;
+            return callee->kind == "member" && callee->text == "init" &&
+                   callee->args[0]->kind == "super";
+        };
+        if (st->kind == "expr" && superInit(*st->target)) {
+            for (size_t i = 1; i < st->target->args.size(); ++i)
+                if (usesInst(*st->target->args[i]))
+                    error("super.init arguments cannot read 'inst'");
+            for (auto &f : classes.at(c.base)->fields)
+                assigned.insert(f.name);
+            continue;
+        }
+        if (scan(*st, false))
+            error("init uses 'inst' before assigning required field '" + pending + "'");
+        if (scan(*st, true))
+            error("init can return before assigning required field '" + pending + "'");
+    }
+    location = init.loc;
+    if (auto pending = missing(); !pending.empty())
+        error("init must assign required field '" + pending + "'");
+}
+// for x in object: object.iterator() (or the object itself) provides next() returning T?;
+// the loop ends when next() returns null.
+void Compiler::iterate(Stmt &s, Val source) {
+    if (!s.op.empty())
+        error("iterator loops bind one name");
+    auto iterator = resolveMethod(source.t.name, "iterator").empty()
+                        ? source
+                        : callNamedMethod(source, "iterator", {});
+    if (!classes.count(iterator.t.name) || resolveMethod(iterator.t.name, "next").empty())
+        error("for over " + displayName(source.t.name) +
+              " requires iterator() or next() returning a nullable value");
+    scopes.emplace_back();
+    bind("$iterator", iterator, true);
+    auto cond = llvm::BasicBlock::Create(ctx, "iterate.next", current);
+    auto body = llvm::BasicBlock::Create(ctx, "iterate.body", current);
+    auto end = llvm::BasicBlock::Create(ctx, "iterate.end", current);
+    b.CreateBr(cond);
+    b.SetInsertPoint(cond);
+    call("fw_sweep", b.getVoidTy(), {frame});
+    auto item = callNamedMethod(load(*lookup("$iterator")), "next", {});
+    if (!item.t.nullable() || item.t.name == "null")
+        error("next() must return a nullable value such as T?; null ends the loop");
+    b.CreateCondBr(b.CreateICmpNE(item.v, llvm::ConstantPointerNull::get(b.getPtrTy())), body,
+                   end);
+    b.SetInsertPoint(body);
+    auto loopDepth = scopes.size();
+    scopes.emplace_back();
+    bind(s.name, unboxChecked(item));
+    loops.emplace_back(end, cond);
+    loopScopes.push_back(loopDepth);
+    block(s.body, false);
+    loops.pop_back();
+    loopScopes.pop_back();
+    if (!terminated()) {
+        releaseScopes(loopDepth);
+        b.CreateBr(cond);
+    }
+    scopes.pop_back();
+    b.SetInsertPoint(end);
+    releaseScopes(scopes.size() - 1);
+    scopes.pop_back();
+}
+void Compiler::match(Stmt &s) {
+    auto subject = value(*s.expr);
+    if (subject.t.name == "void" || subject.t.name == "null" ||
+        subject.t.name.rfind("module:", 0) == 0)
+        error("match requires a value");
+    auto base = nonNull(subject.t);
+    size_t outer = scopes.size();
+    scopes.emplace_back();
+    bind("$match" + std::to_string(outer), subject, true);
+    auto end = llvm::BasicBlock::Create(ctx, "match.end", current);
+    bool reachesEnd = false;
+    std::set<std::string> covered;
+    auto enumMember = [&](Expr &v) -> std::string {
+        if (!base.enumeration())
+            return "";
+        auto &members = enums.at(base.name)->members;
+        if (v.kind == "member" && v.args[0]->kind == "name" && v.args[0]->text == base.name)
+            return v.text;
+        if (v.kind == "name" && !lookup(v.text) &&
+            std::find(members.begin(), members.end(), v.text) != members.end())
+            return v.text;
+        return "";
+    };
+    for (size_t i = 0; i < s.catches.size(); ++i) {
+        location = s.loc;
+        auto matched = llvm::BasicBlock::Create(ctx, "match.case", current);
+        auto next = llvm::BasicBlock::Create(ctx, "match.next", current);
+        auto typeName = s.catchTypes[i];
+        auto &values = s.patterns[i];
+        bool unguarded = !s.guards[i];
+        if (typeName.empty() && values.size() == 1 &&
+            (values[0]->kind == "name" || values[0]->kind == "member")) {
+            auto name = values[0]->kind == "name" ? values[0]->text : callable(*values[0]);
+            if (classes.count(name) && !lookup(name))
+                typeName = name;
+        }
+        Val binding;
+        if (!typeName.empty()) {
+            llvm::Value *condition = nullptr;
+            if ((typeName == "ok" || typeName == "error") && subject.t.result()) {
+                auto ok = get(subject, i64(0), Ty{"bool"});
+                condition = typeName == "ok" ? ok.v : b.CreateNot(ok.v);
+                b.CreateCondBr(condition, matched, next);
+                b.SetInsertPoint(matched);
+                binding = get(subject, i64(1), subject.t.parts()[typeName == "ok" ? 0 : 1]);
+                if (unguarded)
+                    covered.insert(typeName);
+            } else {
+                auto t = type(typeName);
+                if (classes.count(t.name)) {
+                    if (!classes.count(base.name))
+                        error("type pattern " + displayName(t.name) +
+                              " requires a class or interface value");
+                    if (!derives(t.name, base.name) && !derives(base.name, t.name))
+                        error(displayName(t.name) + " can never match " +
+                              displayName(subject.t.name));
+                    b.CreateCondBr(isInstance(subject.v, t.name), matched, next);
+                    b.SetInsertPoint(matched);
+                    binding = {subject.v, t};
+                    if (unguarded)
+                        for (auto &c : concreteClasses(t.name))
+                            covered.insert("class:" + c);
+                } else if (subject.t.nullable() && t == base) {
+                    b.CreateCondBr(
+                        b.CreateICmpNE(subject.v, llvm::ConstantPointerNull::get(b.getPtrTy())),
+                        matched, next);
+                    b.SetInsertPoint(matched);
+                    binding = unboxChecked(subject);
+                    if (unguarded)
+                        covered.insert("present");
+                } else if (t == subject.t) {
+                    b.CreateBr(matched);
+                    b.SetInsertPoint(matched);
+                    binding = subject;
+                    if (unguarded)
+                        covered.insert("all");
+                } else
+                    error("pattern type " + displayName(t.name) + " does not match " +
+                          displayName(subject.t.name));
+            }
+        } else {
+            for (size_t k = 0; k < values.size(); ++k) {
+                auto &v = *values[k];
+                location = v.loc;
+                llvm::Value *condition;
+                if (v.kind == "null") {
+                    if (!subject.t.nullable())
+                        error("null pattern requires a nullable value");
+                    condition =
+                        b.CreateICmpEQ(subject.v, llvm::ConstantPointerNull::get(b.getPtrTy()));
+                    if (unguarded)
+                        covered.insert("null");
+                } else if (v.kind == "binary" && !v.grouped && (v.text == ".." || v.text == "..<") &&
+                           (base.numeric() || base.name == "char")) {
+                    auto x = subject.t.nullable() ? unboxChecked(subject) : subject;
+                    auto low = binary("<=", value(*v.args[0], base), x);
+                    auto high = binary(v.text == ".." ? "<=" : "<", x, value(*v.args[1], base));
+                    condition = b.CreateAnd(low.v, high.v);
+                } else if (auto member = enumMember(v); !member.empty()) {
+                    auto &members = enums.at(base.name)->members;
+                    auto index = std::find(members.begin(), members.end(), member) - members.begin();
+                    condition = binary("==", subject, {i64(index), base}).v;
+                    if (unguarded)
+                        covered.insert(member);
+                } else {
+                    auto pattern = value(v, base);
+                    condition = binary("==", subject, pattern).v;
+                    if (unguarded && v.kind == "bool")
+                        covered.insert(v.text);
+                }
+                auto alternative = k + 1 == values.size()
+                                       ? next
+                                       : llvm::BasicBlock::Create(ctx, "match.value", current);
+                b.CreateCondBr(condition, matched, alternative);
+                b.SetInsertPoint(alternative);
+            }
+            b.SetInsertPoint(matched);
+        }
+        size_t depth = scopes.size();
+        scopes.emplace_back();
+        if (!s.catchNames[i].empty())
+            bind(s.catchNames[i], binding);
+        if (s.guards[i]) {
+            auto guardValue = value(*s.guards[i]);
+            if (guardValue.t.name != "bool")
+                error("case guard must be bool");
+            auto body = llvm::BasicBlock::Create(ctx, "match.guarded", current);
+            auto rejected = llvm::BasicBlock::Create(ctx, "match.rejected", current);
+            b.CreateCondBr(guardValue.v, body, rejected);
+            b.SetInsertPoint(rejected);
+            releaseScopes(depth);
+            b.CreateBr(next);
+            b.SetInsertPoint(body);
+        }
+        block(s.catches[i], false);
+        if (!terminated()) {
+            releaseScopes(depth);
+            b.CreateBr(end);
+            reachesEnd = true;
+        }
+        scopes.pop_back();
+        b.SetInsertPoint(next);
+    }
+    location = s.loc;
+    if (s.op == "else") {
+        block(s.other);
+        if (!terminated()) {
+            b.CreateBr(end);
+            reachesEnd = true;
+        }
+    } else {
+        std::vector<std::string> missing;
+        bool exhaustive = covered.count("all") > 0;
+        if (!exhaustive && subject.t.nullable() && !covered.count("null"))
+            missing.push_back("null");
+        if (!exhaustive && subject.t.nullable() && covered.count("present"))
+            exhaustive = missing.empty();
+        if (!exhaustive) {
+            if (base.enumeration()) {
+                for (auto &m : enums.at(base.name)->members)
+                    if (!covered.count(m))
+                        missing.push_back(m);
+            } else if (base.name == "bool") {
+                for (auto v : {"true", "false"})
+                    if (!covered.count(v))
+                        missing.push_back(v);
+            } else if (base.result()) {
+                for (auto v : {"ok", "error"})
+                    if (!covered.count(v))
+                        missing.push_back(v);
+            } else if (classes.count(base.name)) {
+                for (auto &c : concreteClasses(base.name))
+                    if (!covered.count("class:" + c))
+                        missing.push_back(displayName(c));
+            } else
+                missing.push_back("other values");
+        }
+        if (!exhaustive && !missing.empty()) {
+            std::string list;
+            for (auto &m : missing)
+                list += (list.empty() ? "" : ", ") + m;
+            error("match is not exhaustive (missing " + list + "); add an else branch");
+        }
+        b.CreateUnreachable();
+    }
+    b.SetInsertPoint(end);
+    if (reachesEnd)
+        releaseScopes(outer);
+    else
+        b.CreateUnreachable();
+    scopes.pop_back();
+}
 Val Compiler::lambda(Expr &e, Ty expected) {
     auto &f = *e.lambda;
     location = e.loc;
@@ -3081,8 +6342,12 @@ Val Compiler::lambda(Expr &e, Ty expected) {
     Val closure{objectCall("fw_closure_new", {frame, context.function,
                                               i64(static_cast<int64_t>(context.captures.size()))}),
                 Ty{name + ">"}};
-    for (size_t i = 0; i < context.captures.size(); ++i)
-        set(closure, i64(static_cast<int64_t>(i)), load(context.captures[i].second));
+    for (size_t i = 0; i < context.captures.size(); ++i) {
+        auto &captured = context.captures[i].second;
+        set(closure, i64(static_cast<int64_t>(i)),
+            captured.cell ? Val{b.CreateLoad(b.getPtrTy(), captured.address), Ty{"Error"}}
+                          : load(captured));
+    }
     return closure;
 }
 Ty Compiler::lambdaBody(Function &f, const std::vector<Ty> &params, Ty result, bool inference,
@@ -3102,6 +6367,9 @@ Ty Compiler::lambdaBody(Function &f, const std::vector<Ty> &params, Ty result, b
         llvm::FunctionType::get(inference ? b.getVoidTy() : ll(result), types, false),
         llvm::GlobalValue::InternalLinkage, "fly.lambda." + std::to_string(lambdaCount++), module);
     b.SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", current));
+    location = f.loc;
+    if (!inference)
+        debugFunction(current, "lambda", f.loc);
     frame = objectCall("fw_frame", {});
     auto body = llvm::BasicBlock::Create(ctx, "body", current);
     context.initPoint = b.CreateBr(body);
@@ -3110,6 +6378,7 @@ Ty Compiler::lambdaBody(Function &f, const std::vector<Ty> &params, Ty result, b
     context.env = current->getArg(0);
     b.SetInsertPoint(body);
     failure = llvm::BasicBlock::Create(ctx, "propagate.error", current);
+    cells = cellNames(f.body);
     for (size_t i = 0; i < params.size(); ++i) {
         location = f.params[i].loc;
         bind(f.params[i].name, {current->getArg(static_cast<unsigned>(i + 1)), params[i]});
