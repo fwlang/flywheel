@@ -1,0 +1,44 @@
+# A tour of the data libraries: hashing, encodings, compression, CSV, TOML, decimals, and
+# an in-memory SQLite database.
+import crypto
+import encoding
+import compress
+import csv
+import toml
+import json
+import decimal
+import sqlite
+import uuid
+
+print "sha256:", crypto.sha256("flywheel").slice(0, 16) + "..."
+print "base64:", encoding.base64_encode("hello, world")
+var text = "the quick brown fox " * 50
+var packed = compress.gzip(text)
+print "gzip: {text.length} -> {packed.length} bytes, round trip {compress.gunzip(packed) == text}"
+print "uuid v4 valid:", uuid.is_valid(uuid.v4())
+
+class Item
+    string name
+    int quantity
+    string price
+end
+
+var config = toml.parse("currency = \"EUR\"\n[[items]]\nname = \"pen\"\nquantity = 3\nprice = \"1.20\"\n[[items]]\nname = \"book\"\nquantity = 1\nprice = \"12.95\"\n")
+Item[] items = json.decode(config["items"])
+
+var db = sqlite.open(":memory:")
+db.execute("create table items (name text, quantity integer, price text)")
+for item in items do
+    db.execute("insert into items values (?, ?, ?)", item.name, item.quantity, item.price)
+end
+
+var total = decimal.of(0)
+string[][] rows = [["name", "quantity", "line total"]]
+for item in items do
+    var line = decimal.parse(item.price) * decimal.of(item.quantity)
+    total = total + line
+    rows.push([item.name, string(item.quantity), line.to_string()])
+end
+print csv.format(rows).trim()
+print "total {total} {json.as_string(config["currency"])}"
+print db.query("select name from items where quantity > ?", 1)

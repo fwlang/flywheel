@@ -822,7 +822,9 @@ struct Server {
         };
         try {
             auto program = loadProgram(path, overlay);
-            compile(program, path, Options{});
+            Options options;
+            options.entry = "check"; // like `flywheel check`: markup may be returned at top level
+            compile(program, path, options);
         } catch (const Error &e) {
             if (e.loc.file.empty() || canonical(e.loc.file) == canonical(path))
                 add(e.loc.line, e.loc.column, e.what());

@@ -144,22 +144,28 @@ std::optional<int> runInProcess(const std::string &object, std::vector<std::stri
     return 128 + signal;
 }
 #endif
-// Compiles `load()` and runs it (run), links it (build), or only checks it (check). `load` is
-// called again when the in-process JIT is unavailable, because compilation consumes a program.
+// Compiles `load()` and runs it (run, desktop, serve), links it (build), or only checks it
+// (check). `load` is called again when the in-process JIT is unavailable, because compilation
+// consumes a program.
 int compileProgram(const std::string &command, const std::string &filename,
                    const std::function<fw::Program()> &load, const fw::Options &base,
                    const std::string &output, const std::vector<std::string> &programArguments,
                    const char *argv0) {
     auto program = load();
     if (command == "check") {
-        fw::compile(program, filename, base);
+        auto options = base;
+        options.entry = "check";
+        fw::compile(program, filename, options);
         return 0;
     }
     auto runtime = runtimePath(argv0);
     auto options = base;
     options.desktopBackend = desktopPath(runtime);
+    if (command == "desktop" || command == "serve")
+        options.entry = command;
+    bool runs = command != "build";
 #ifdef FW_JIT
-    if (command == "run") {
+    if (runs) {
         std::string object;
         auto jit = options;
         jit.objectData = &object;
@@ -184,10 +190,9 @@ int compileProgram(const std::string &command, const std::string &filename,
 #else
     std::string suffix;
 #endif
-    auto binary = command == "run"
-                      ? temp.path / ("program" + suffix)
-                      : fs::absolute(output.empty() ? fs::path(filename).stem().string() + suffix
-                                                    : output);
+    auto binary =
+        runs ? temp.path / ("program" + suffix)
+             : fs::absolute(output.empty() ? fs::path(filename).stem().string() + suffix : output);
     std::vector<std::string> link;
 #ifdef _MSC_VER
     link = {"/nologo", "/MD", object.string(), runtime.string(), "/Fe:" + binary.string(), "/link",
@@ -210,7 +215,7 @@ int compileProgram(const std::string &command, const std::string &filename,
     int linked = execute(FW_CXX, link);
     if (linked)
         return linked;
-    if (command == "run")
+    if (runs)
         return execute(binary.string(), programArguments);
     return 0;
 }
@@ -520,6 +525,8 @@ int main(int argc, char **argv) {
     std::string usage =
         "Usage: flywheel {build|run|check} source.fw [-O0..3] [-g] [--race] [-o output] "
         "[--emit-ir file.ll] [-- program arguments]\n"
+        "       flywheel desktop source.fw [options] [-- program arguments]\n"
+        "       flywheel serve source.fw [--port N] [--host H] [options] [-- program arguments]\n"
         "       flywheel test [files or directories] [-O0..3] [--coverage] [--race]\n"
         "       flywheel fmt [--check] files...\n"
         "       flywheel doc module.fw [-o output.html]\n"
@@ -598,7 +605,8 @@ int main(int argc, char **argv) {
         }
         return status;
     }
-    if (command != "build" && command != "run" && command != "check" && command != "test") {
+    if (command != "build" && command != "run" && command != "check" && command != "test" &&
+        command != "desktop" && command != "serve") {
         std::cerr << (command.rfind("-", 0) == 0 ? usage : "unknown command: " + command + "\n");
         return 2;
     }
@@ -620,7 +628,17 @@ int main(int argc, char **argv) {
                 options.coverage = true;
             else if (arg == "--race")
                 options.race = true;
-            else if ((arg == "-o" || arg == "--emit-ir") && i + 1 < argc) {
+            else if ((arg == "--port" || arg == "--host") && command == "serve" && i + 1 < argc) {
+                std::string value = argv[++i];
+                if (arg == "--host")
+                    options.serveHost = value;
+                else if (value.empty() ||
+                         value.find_first_not_of("0123456789") != std::string::npos ||
+                         value.size() > 5 || std::stoi(value) > 65535)
+                    throw std::runtime_error("--port expects a number in 0..65535");
+                else
+                    options.servePort = std::stoi(value);
+            } else if ((arg == "-o" || arg == "--emit-ir") && i + 1 < argc) {
                 if (arg == "-o")
                     output = argv[++i];
                 else

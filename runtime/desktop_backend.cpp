@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
@@ -44,6 +45,25 @@ void sizeWindow(webview::webview &window, int width, int height) {
     size.ensure_ok();
 #endif
 }
+// Loads the page with the working directory as its base URL, so relative resources such as
+// <img src="image.jpg"> resolve as they do for the program's own file paths.
+void loadPage(webview::webview &window, const char *html) {
+#ifdef WEBVIEW_GTK
+    std::error_code ec;
+    auto directory = std::filesystem::current_path(ec);
+    if (!ec) {
+        auto view = window.browser_controller();
+        view.ensure_ok();
+        gchar *base = g_filename_to_uri((directory / "").c_str(), nullptr, nullptr);
+        if (base) {
+            webkit_web_view_load_html(WEBKIT_WEB_VIEW(view.value()), html, base);
+            g_free(base);
+            return;
+        }
+    }
+#endif
+    window.set_html(html).ensure_ok();
+}
 } // namespace
 
 // Shows every window and runs one event loop until all are closed or the host asks to quit.
@@ -84,7 +104,7 @@ extern "C" FW_DESKTOP_EXPORT int fw_desktop_run_v2(const fw_desktop_window_v2 *w
                     nullptr)
                     .ensure_ok();
             }
-            view.set_html(spec.html).ensure_ok();
+            loadPage(view, spec.html);
         }
         if (!views.empty())
             views.front()->run().ensure_ok();

@@ -24,6 +24,8 @@ build/flywheel run examples/hello.fly
 build/flywheel run app.fw -- arguments for the program
 build/flywheel build examples/core.fly -O3 -o core
 build/flywheel check examples/demo.fly --emit-ir demo.ll
+build/flywheel desktop my_app.fw           # show the element the file returns in a window
+build/flywheel serve my_app.fw --port 8080 # serve it at http://127.0.0.1:8080/
 build/flywheel build -g app.fw -o app      # DWARF lines and locals for gdb/lldb
 build/flywheel run --race app.fw           # stop on data races between threads
 build/flywheel test --coverage             # run test_*.fw / *_test.fw files, report lines
@@ -33,7 +35,7 @@ build/flywheel repl                        # interactive session
 build/flywheel lsp                         # language server for editors
 ```
 
-`run` compiles and executes the program, returning its exit status. `check` runs the front end and verifies generated LLVM IR without linking. Optimization levels `-O0` through `-O3` are accepted. `flywheel selftest` runs the compiler's own regression suite. See [tooling](docs/tooling.md).
+`run` compiles and executes the program, returning its exit status; a top-level `return 3` ends the program with status 3. `desktop` and `serve` run a program whose top level returns an element or fragment, and show it in a native window or serve it over HTTP ([details](docs/tooling.md#pages-desktop-and-serve)). `check` runs the front end and verifies generated LLVM IR without linking. Optimization levels `-O0` through `-O3` are accepted. `flywheel selftest` runs the compiler's own regression suite. See [tooling](docs/tooling.md).
 
 ## A tour
 

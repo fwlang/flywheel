@@ -125,6 +125,10 @@ end
 
 The block is the enclosing `if`, loop, `try`, or function body, so a `defer` inside a loop runs at the end of each iteration. `defer` is not allowed at the top level of a file.
 
+## Top-level return
+
+`return` outside functions ends the program after running pending `finally` blocks. `return` alone exits with status 0 and `return n` with integer status `n`. Under `flywheel desktop` and `flywheel serve`, the main file returns an `element` or `fragment` to display; see [pages](tooling.md#pages-desktop-and-serve). Only the main file may return at top level, not imported modules.
+
 ## Collections and control flow
 
 Arrays infer a homogeneous common type, or use the declared element type. Empty arrays require context. Heterogeneous literals infer tuples, with compile-time integer indices. Maps use `{key: value}` literals and sets `{a, b}`; `{}` is an empty map or set, depending on the expected type. See [collections](collections.md). Arrays use shared mutable identity and checked indices; `s[a..b]` and `s[a..<b]` slice strings and sequences.

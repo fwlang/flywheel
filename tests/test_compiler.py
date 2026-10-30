@@ -3264,6 +3264,86 @@ print web.static("/assets", "public", {port})
         self.assertEqual(symbols, ["total", "p", "twice"])
         request(8, "shutdown", None)
 
+    def test_top_level_return(self):
+        source = 'print "start"\nint code = 3\ntry\n    for i in [1, 2] do\n        if i == 2 then\n            return code + i\n        end\n    end\nfinally\n    print "finally"\nend\nprint "unreachable"\n'
+        self.source.write_text(source, encoding="utf-8")
+        result = self.command("run", self.source)
+        self.assertEqual((result.returncode, result.stdout), (5, "start\nfinally\n"), result.stderr)
+        exe = self.root / ("exit.exe" if os.name == "nt" else "exit")
+        result = self.command("build", self.source, "-O3", "-o", exe)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=15)
+        self.assertEqual((result.returncode, result.stdout), (5, "start\nfinally\n"))
+        self.source.write_text('print "x"\nreturn\n', encoding="utf-8")
+        result = self.command("run", self.source)
+        self.assertEqual((result.returncode, result.stdout), (0, "x\n"), result.stderr)
+        markup = "import html.*\nreturn <p>hi</p>\n"
+        for command, source, message in [
+            ("run", 'return "hi"\n', "top-level return expects an int exit status"),
+            ("run", markup, "needs `flywheel desktop` or `flywheel serve`"),
+            ("serve", 'print "x"\n', "expects the program to `return` an element"),
+            ("desktop", 'return true\n', "int exit status, element, or fragment"),
+        ]:
+            with self.subTest(command=command, source=source):
+                self.source.write_text(source, encoding="utf-8")
+                result = self.command(command, self.source)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(message, result.stderr)
+        self.source.write_text(markup, encoding="utf-8")
+        self.assertEqual(self.command("check", self.source).returncode, 0)
+        # desktop and serve may still exit early with a status instead of showing a page.
+        self.source.write_text('import html.*\nif true then\n    return 4\nend\nreturn <p>x</p>\n', encoding="utf-8")
+        self.assertEqual(self.command("desktop", self.source).returncode, 4)
+        self.source.write_text('import html.*\nif false then\n    return <p>x</p>\nend\n', encoding="utf-8")
+        result = self.command("serve", self.source)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("ended without returning an element or fragment", result.stderr)
+        (self.root / "helper.fw").write_text("return 1\n", encoding="utf-8")
+        self.source.write_text("import helper\n", encoding="utf-8")
+        result = self.command("run", self.source)
+        self.assertIn("at the top level of the main file", result.stderr)
+        self.source.write_text(markup, encoding="utf-8")
+        result = subprocess.run(
+            [COMPILER, "desktop", str(self.source)],
+            cwd=self.root, capture_output=True, text=True, timeout=45,
+            env={**os.environ, "FLYWHEEL_DESKTOP_BACKEND": str(self.root / "missing-backend")},
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("DesktopError", result.stderr)
+
+    def test_serve_command(self):
+        import queue
+        import threading
+        import urllib.request
+
+        self.source.write_text(
+            'import html.*\nstring name = "Ann"\nreturn <html><body><h1>Hi {name}</h1></body></html>\n',
+            encoding="utf-8",
+        )
+        process = subprocess.Popen(
+            [COMPILER, "serve", str(self.source), "--port", "0"],
+            cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+
+        def stop():
+            if process.poll() is None:
+                process.terminate()
+            process.communicate(timeout=10)
+
+        self.addCleanup(stop)
+        lines = queue.Queue()
+        threading.Thread(target=lambda: lines.put(process.stdout.readline()), daemon=True).start()
+        line = lines.get(timeout=30)
+        self.assertTrue(line.startswith("Serving at http://127.0.0.1:"), line)
+        url = line.split()[-1]
+        with urllib.request.urlopen(url, timeout=5) as response:
+            self.assertEqual(response.headers["Content-Type"], "text/html; charset=utf-8")
+            self.assertEqual(response.read(), b"<html><body><h1>Hi Ann</h1></body></html>")
+        with self.assertRaises(urllib.error.HTTPError) as missing:
+            urllib.request.urlopen(url + "other", timeout=5)
+        self.assertEqual(missing.exception.code, 404)
+        missing.exception.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

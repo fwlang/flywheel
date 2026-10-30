@@ -279,6 +279,70 @@ print "closed", count
         assert sorted(lines[:3]) == ["report 2", "report Side window", "typed hey"], lines
         assert lines[3:] == ["closed 2"], lines
     print("desktop events, live updates, bindings, and multiple windows OK")
+    resources(compiler)
+
+
+def png(width, height):
+    """A minimal opaque RGB PNG."""
+    import struct
+    import zlib
+
+    def chunk(kind, data):
+        return (
+            struct.pack(">I", len(data))
+            + kind
+            + data
+            + struct.pack(">I", zlib.crc32(kind + data))
+        )
+
+    rows = b"".join(b"\0" + b"\x80" * 3 * width for _ in range(height))
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(rows))
+        + chunk(b"IEND", b"")
+    )
+
+
+def resources(compiler):
+    """Relative resource URLs resolve against the working directory; void tags need no close."""
+    with tempfile.TemporaryDirectory(prefix="fw-desktop-resources-") as temporary:
+        root = Path(temporary)
+        (root / "pixel.png").write_bytes(png(3, 2))
+        source = root / "resources.fw"
+        source.write_text(
+            """import desktop
+import html.*
+var window = desktop.window("Resources", 300, 200)
+window.load(<html><body><img src="pixel.png" alt="missing"><p id="after">after</p></body></html>)
+window.bind("report", function(string text) returns string
+    print text
+    desktop.quit()
+    return ""
+end)
+window.eval("window.addEventListener('load', function () {{ var i = document.querySelector('img'); report(i.naturalWidth + 'x' + i.naturalHeight + ' ' + i.childNodes.length + ' ' + document.getElementById('after').parentNode.tagName); }})")
+window.run()
+""",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [str(compiler), "run", str(source)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=root,
+            env={
+                **os.environ,
+                "GDK_BACKEND": "x11",
+                "WAYLAND_DISPLAY": "",
+                "WEBKIT_DISABLE_DMABUF_RENDERER": "1",
+                "LIBGL_ALWAYS_SOFTWARE": "1",
+            },
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "3x2 0 BODY\n", (result.stdout, result.stderr)
+    print("desktop relative resources and void elements OK")
 
 
 if __name__ == "__main__":

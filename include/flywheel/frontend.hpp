@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <set>
@@ -148,6 +149,11 @@ struct Options {
     bool coverage = false; // count executions of each source line (flywheel test --coverage)
     bool race = false;     // detect data races at run time (--race)
     std::string ir, object, desktopBackend;
+    // What a top-level `return` of an element or fragment does: "desktop" shows it in a window,
+    // "serve" serves it over HTTP at serveHost:servePort, "check" only type-checks it. Empty
+    // (run and build) rejects markup; a top-level `return` of an int exits with that status.
+    std::string entry, serveHost = "127.0.0.1";
+    int64_t servePort = 8000;
     std::string *objectData = nullptr; // receives the object file in memory when set
 };
 void compile(Program &program, const std::string &filename, const Options &options);

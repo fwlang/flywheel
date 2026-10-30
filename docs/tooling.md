@@ -106,6 +106,27 @@ flywheel: data race on global variable 'counter': a read by thread 2 conflicts w
 
 The detector reports races that happen in the run being checked, without false positives from these synchronizations. It slows programs down and is meant for testing. Without `--race`, collection operations are still atomic and memory-safe; see [concurrency](concurrency.md#shared-state).
 
+## Pages: desktop and serve
+
+`return` outside functions ends the program. Under `run` and `build`, it takes an optional integer exit status (`return 2`; a bare `return` is status 0). Pending `finally` blocks run first. Imported modules cannot return at top level.
+
+`flywheel desktop file.fw` and `flywheel serve file.fw` run a program that returns an `element` or `fragment` at top level:
+
+```flywheel
+import html.*
+
+string name = "Ann"
+return <html>
+    <head><title>My App</title></head>
+    <body><h1>Hello, {name}</h1></body>
+</html>
+```
+
+- `desktop` shows the returned markup in a `desktop.window` (960×640) titled by the page's `<title>`, or `Flywheel` without one, and exits with status 0 when the window closes. Event handlers in the markup work as in [desktop windows](desktop.md#events-and-live-updates). The [desktop backend](desktop.md#build-and-run) must be built.
+- `serve` answers `GET /` with the rendered markup, prints `Serving at http://127.0.0.1:8000/`, and serves until interrupted. Other paths answer 404, and Flywheel event handlers in the markup do not run in the browser. `--port N` picks the port (`0` chooses a free one) and `--host H` the address to listen on (default `127.0.0.1`).
+
+Both commands accept the options of `run` and pass arguments after `--` to the program. A top-level `return` of an integer still exits with that status, so a program can stop before showing a page. A program that ends without returning markup is an error: at compile time if it has no such `return`, otherwise at run time. `run` and `build` reject a top-level return of markup; `check` and the language server accept it.
+
 ## Interactive sessions
 
 `flywheel repl` reads statements, expressions, and declarations. An expression on its own is printed. Multi-line input (such as a function) continues until the block is complete. Each input is added to a session program that is compiled and run again from the start; only output produced by the new input is shown, and inputs that fail are dropped. Because earlier statements run again, side effects such as writing files or reading input repeat. `:show` lists the session, `:reset` clears it, and `:quit` ends it.

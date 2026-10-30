@@ -1,49 +1,20 @@
 import desktop
 import html.*
 
-var window = desktop.window("test window", 420, 69)
-element pageStyling = <style>
+int value1 = int input("Enter value 1: ")
+int value2 = int input("Enter value 2: ")
+element styling = <style>
 body {
-    font-family: Arial, sans-serif;
-    background-color: #f0f0f0;
+    background-color: #0a0909;
+    color: #ffffff;
 }
-UserCard {
-    border: 1px solid #ccc;
-    padding: 10px;
-    margin: 10px 0;
-    background-color: #fff;
-}
-/* 
-test comment
-*/
 </style>
 
-element pageScripting = <script>
-/* test test */
-// test test
-onPageLoad = () => {
-    console.log("Page loaded");
-    // test
-    /* test */
-}
-onPageLoad();
-</script>
-
-component UserCard = <div class="UserCard">
-    <h2 style="color: blue; font-size: 18px;">{attr username}</h2>
-    <p>{attr email}</p>
-    <!-- -->
-</div>
-
-function page() returns element
-    return <html>
-        {pageStyling}
-        <body>
-            <UserCard username="adminUser" email="admin@example.com" />
-            <UserCard username="danny" email="danny@woofmail.com" />
-        </body>
-    </html>
-end
-
-window.load(page())
-window.run()
+return <html>{styling}<body>
+    <h1>Hello, World!</h1>
+    <p>Value 1: {value1}</p>
+    <p>Value 2: {value2}</p>
+    <p>Sum: {value1 + value2}</p>
+    <img src="image.png" alt="Image" style="max-width: 50px; height: auto;">
+    <p>test</p>
+</body></html>

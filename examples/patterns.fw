@@ -1,0 +1,88 @@
+# Enums with data, destructuring, operator methods, defer, and format specs.
+
+# An arithmetic expression tree.
+enum Expr
+    Number(double value)
+    Add(Expr left, Expr right)
+    Multiply(Expr left, Expr right)
+    Negate(Expr inner)
+end
+
+function evaluate(Expr e) returns double
+    match e
+        case Expr.Number(v) then
+            return v
+        case Expr.Add(a, b) then
+            return evaluate(a) + evaluate(b)
+        case Expr.Multiply(a, b) then
+            return evaluate(a) * evaluate(b)
+        case Expr.Negate(inner) then
+            return -evaluate(inner)
+    end
+end
+
+function show(Expr e) returns string
+    match e
+        case Expr.Number(v) then
+            return "{v:g}"
+        case Expr.Add(a, b) then
+            return "(" + show(a) + " + " + show(b) + ")"
+        case Expr.Multiply(a, b) then
+            return show(a) + " * " + show(b)
+        case Expr.Negate(inner) then
+            return "-" + show(inner)
+    end
+end
+
+# A two-dimensional vector with operators.
+class Vec2
+    readonly double x
+    readonly double y
+
+    function operator +(Vec2 other) returns Vec2
+        return Vec2(inst x + other.x, inst y + other.y)
+    end
+
+    function operator *(double k) returns Vec2
+        return Vec2(inst x * k, inst y * k)
+    end
+
+    function operator ==(Vec2 other) returns bool
+        return inst x == other.x and inst y == other.y
+    end
+
+    function to_string returns string
+        return "({inst x:.1f}, {inst y:.1f})"
+    end
+end
+
+function bounds(double[] values) returns [double, double]
+    var low = values[0]
+    var high = values[0]
+    for v in values do
+        if v < low then
+            low = v
+        end
+        if v > high then
+            high = v
+        end
+    end
+    return [low, high]
+end
+
+function report(string title, double[] values)
+    print "== " + title
+    defer print "== end of " + title
+    var (low, high) = bounds(values)
+    print "{"low":<6}{low:>10.3f}"
+    print "{"high":<6}{high:>10.3f}"
+end
+
+var tree = Expr.Add(Expr.Number(2.0), Expr.Multiply(Expr.Number(3.0), Expr.Negate(Expr.Number(4.0))))
+print show(tree), "=", evaluate(tree)
+print Expr.Number(1.0) == Expr.Number(1.0)
+
+var v = Vec2(1.0, 2.0) + Vec2(0.5, 0.5) * 2.0
+print v, v == Vec2(2.0, 3.0)
+
+report("samples", [3.25, -1.5, 12.125])

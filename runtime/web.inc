@@ -46,10 +46,12 @@ struct HttpRoute {
     Object *handler = nullptr;
     int arity = 0;
     std::filesystem::path directory; // non-empty for static file routes
+    Object *page = nullptr;          // a fixed element or fragment (flywheel serve)
     HttpRoute() = default;
     HttpRoute(const HttpRoute &) = delete;
     ~HttpRoute() {
         release(handler);
+        release(page);
     }
 };
 // TLS uses the system OpenSSL 3 library, loaded on first use so programs without TLS have
@@ -625,6 +627,10 @@ bool handleRequest(HttpServer &server, ParsedRequest &request, HttpResponse &res
         response = staticFile(*selected, params.empty() ? "" : params.back().second);
         return true;
     }
+    if (selected->page) {
+        response = responseFrom(selected->page);
+        return true;
+    }
     Object *result = nullptr;
     if (selected->arity == 0)
         result = reinterpret_cast<Handler0>(selected->handler->code)(selected->handler);
@@ -1035,6 +1041,15 @@ extern "C" Object *fw_serve_static(Frame *frame, Object *route, Object *director
         auto url = addRoute(frame, "GET", prefix + "*", std::move(entry), port, host->text);
         url->text.resize(url->text.size() - 1);
         return url;
+    });
+}
+// flywheel serve: answers GET / with the markup a program returned at top level.
+extern "C" Object *fw_serve_page(Frame *frame, Object *tree, int64_t port, Object *host) {
+    return nativeBoundary([&] {
+        auto entry = std::make_unique<HttpRoute>();
+        retain(tree);
+        entry->page = tree;
+        return addRoute(frame, "GET", "/", std::move(entry), port, host->text);
     });
 }
 extern "C" void fw_web_wait() {

@@ -283,6 +283,24 @@ class Loader {
             throw;
         }
         units[canonical] = std::move(owned);
+        // Imported modules' top-level statements run before the main file's, so a top-level
+        // `return` there would end the whole program.
+        if (!stack.empty()) {
+            std::function<void(const std::vector<SP> &)> noReturn = [&](const auto &body) {
+                for (auto &s : body) {
+                    if (s->kind == "return")
+                        throw Error({s->loc.line, s->loc.column, canonical},
+                                    "return is only valid inside a function or at the top level "
+                                    "of the main file");
+                    noReturn(s->body);
+                    noReturn(s->other);
+                    noReturn(s->finalizer);
+                    for (auto &c : s->catches)
+                        noReturn(c);
+                }
+            };
+            noReturn(u.program.body);
+        }
         stack.push_back(canonical);
         auto add = [&](const std::string &name, Location loc) {
             if (u.own.count(name) || u.program.imports.count(name))

@@ -36,6 +36,8 @@ window.run()
 
 `desktop.window` without parentheses is the class itself (`var Window = desktop.window`, then `Window("Title")`); see [classes and constructors](types.md#classes-and-constructors). `desktop.Window` is an alias. Windows are reference-managed objects: assignments alias the same window.
 
+For a single page, `flywheel desktop app.fw` shows the `element` or `fragment` the file returns at top level, without creating the window in code; see [pages](tooling.md#pages-desktop-and-serve).
+
 ## Events and live updates
 
 Markup event attributes can hold Flywheel functions: `function() returns void`, or `function(string value) returns void`, which receives the event target's `value` (for example the text of an `<input>`). Inline JavaScript strings (`onclick="..."`) still work too.
@@ -59,7 +61,7 @@ Handlers and bindings run on the thread that called `run`, one at a time. An unc
 
 ## Errors and lifetime
 
-Dimensions must be positive signed 32-bit values. Titles and rendered HTML cannot contain NUL bytes. Invalid values, a missing backend, a missing display/WebView2 runtime, or native webview failures raise `DesktopError`. Backend modules stay loaded until process exit because GUI frameworks register process-wide types. Relative resource URLs have no application filesystem base; use absolute resource URLs when needed.
+Dimensions must be positive signed 32-bit values. Titles and rendered HTML cannot contain NUL bytes. Invalid values, a missing backend, a missing display/WebView2 runtime, or native webview failures raise `DesktopError`. Backend modules stay loaded until process exit because GUI frameworks register process-wide types. On Linux, relative resource URLs such as `<img src="image.jpg">` resolve against the working directory, as the program's own file paths do; on Windows they have no filesystem base, so use absolute URLs there.
 
 ## Build and run
 

@@ -422,6 +422,36 @@ extern "C" void fw_desktop_quit() {
 extern "C" void fw_desktop_run(Object *window, const char *backendPath) {
     nativeBoundary([&] { runWindows({window}, backendPath); });
 }
+// flywheel desktop: shows the markup a program returned at top level in a window titled by
+// its <title> element.
+extern "C" void fw_desktop_page(Frame *frame, Object *tree, const char *backendPath) {
+    nativeBoundary([&] {
+        std::string title = "Flywheel";
+        bool found = false;
+        auto pick = [&](Object *node) {
+            if (found || lowerAscii(node->text) != "title")
+                return;
+            found = true;
+            title.clear();
+            textOf(node, title);
+            auto first = title.find_first_not_of(" \t\r\n\f");
+            title = first == std::string::npos
+                        ? ""
+                        : title.substr(first, title.find_last_not_of(" \t\r\n\f") - first + 1);
+        };
+        pick(tree);
+        walkDom(tree, [&](Object *node, const std::vector<Object *> &) { pick(node); });
+        if (title.empty())
+            title = "Flywheel";
+        auto window = fw_desktop_window(frame, string(frame, title), 960, 640);
+        if (pendingError.value)
+            return;
+        fw_desktop_load(window, tree);
+        if (pendingError.value)
+            return;
+        runWindows({window}, backendPath);
+    });
+}
 extern "C" void fw_desktop_run_all(Object *windows, const char *backendPath) {
     nativeBoundary([&] {
         std::vector<Object *> list;

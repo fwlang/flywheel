@@ -263,6 +263,10 @@ class Compiler {
     Ty returnType;
     bool infer = false, top = false;
     std::string owner, desktopBackend;
+    // Top-level return handling (Options::entry); pageReturned records a markup return.
+    std::string pageEntry, serveHost;
+    int64_t servePort = 0;
+    bool pageReturned = false;
     std::string method; // name of the function or method being emitted
     // Coverage: one counter per executed source line, keyed (file, line).
     bool coverage = false, race = false;
@@ -753,7 +757,7 @@ end
     void emitFailure() {
         auto saved = b.saveIP();
         b.SetInsertPoint(failure);
-        if (top && usesWeb())
+        if (top && (usesWeb() || pageEntry == "serve"))
             call("fw_web_shutdown", b.getVoidTy(), {});
         if (top)
             call("fw_error_report", b.getVoidTy(), {});
@@ -1890,6 +1894,55 @@ end
         scopes = std::move(savedScopes);
     }
     void statement(Stmt &s);
+    // `return` outside functions ends the program: an int (or nothing) is its exit status, and
+    // an element or fragment is shown by `flywheel desktop` or served by `flywheel serve`.
+    void topLevelReturn(Stmt &s) {
+        Val x = s.expr ? value(*s.expr) : Val{};
+        bool page = x.t.name == "element" || x.t.name == "fragment";
+        if (page && pageEntry.empty())
+            error("a top-level return of " + x.t.name +
+                  " needs `flywheel desktop` or `flywheel serve`; `run` and `build` expect an "
+                  "int exit status");
+        if (!page && s.expr && !x.t.integer())
+            error("top-level return expects an int exit status" +
+                  std::string(pageEntry.empty() ? "" : ", element, or fragment"));
+        llvm::Value *status = b.getInt32(0);
+        if (s.expr && !page)
+            status = b.CreateIntCast(x.v, b.getInt32Ty(), !x.t.unsigned_());
+        pageReturned = pageReturned || page;
+        if (!finalizers.empty() && page) {
+            auto anchor = allocate(x.t, "return.root");
+            store(anchor, x);
+            protectedValues.push_back({anchor, finalizers.front().depth});
+        }
+        runFinalizers();
+        if (terminated()) {
+            if (!finalizers.empty() && page)
+                protectedValues.pop_back();
+            return;
+        }
+        // The host runs outside any enclosing try: its finally blocks have already run.
+        auto savedHandlers = std::move(handlers);
+        handlers.clear();
+        if (page && pageEntry == "desktop")
+            call("fw_desktop_page", b.getVoidTy(),
+                 {frame, x.v, b.CreateGlobalString(desktopBackend)});
+        else if (page && pageEntry == "serve") {
+            auto url =
+                objectCall("fw_serve_page", {frame, x.v, i64(servePort), literal(serveHost).v});
+            auto message = literal("Serving at ");
+            call("fw_print", b.getVoidTy(), {objectCall("fw_concat", {frame, message.v, url})});
+            call("fw_web_wait", b.getVoidTy(), {});
+        }
+        handlers = std::move(savedHandlers);
+        if (!finalizers.empty() && page)
+            protectedValues.pop_back();
+        if (usesWeb() || pageEntry == "serve")
+            call("fw_web_shutdown", b.getVoidTy(), {});
+        call("fw_drop", b.getVoidTy(), {frame});
+        call("fw_gc_collect", b.getInt64Ty(), {});
+        b.CreateRet(status);
+    }
     bool terminated() {
         return !b.GetInsertBlock()->empty() && b.GetInsertBlock()->back().isTerminator();
     }
@@ -2278,6 +2331,9 @@ end
     }
     void run(const Options &opts) {
         desktopBackend = opts.desktopBackend;
+        pageEntry = opts.entry;
+        serveHost = opts.serveHost;
+        servePort = opts.servePort;
         coverage = opts.coverage;
         race = opts.race;
         if (opts.debug) {
@@ -2318,6 +2374,16 @@ end
         validateClasses();
         cells = cellNames(p.body);
         block(p.body, false);
+        if ((pageEntry == "desktop" || pageEntry == "serve") && !pageReturned)
+            throw Error({1, 1, module.getModuleIdentifier()},
+                        "flywheel " + pageEntry +
+                            " expects the program to `return` an element or fragment at top level");
+        if (!terminated() && (pageEntry == "desktop" || pageEntry == "serve"))
+            call("fw_panic", b.getVoidTy(),
+                 {b.CreateGlobalString("the program ended without returning an element or "
+                                       "fragment for flywheel " +
+                                       pageEntry),
+                  b.CreateGlobalString("RuntimeError")});
         if (!terminated()) {
             if (usesWeb()) {
                 call("fw_web_wait", b.getVoidTy(), {});
@@ -4540,9 +4606,11 @@ void Compiler::statement(Stmt &s) {
             value(*s.target);
         return;
     }
+    if (s.kind == "return" && top) {
+        topLevelReturn(s);
+        return;
+    }
     if (s.kind == "return") {
-        if (top)
-            error("return is only valid inside a function");
         Val x = s.expr ? value(*s.expr, returnType) : Val{};
         if (!finalizers.empty()) {
             if (x.t.object()) {
