@@ -137,6 +137,10 @@ std::string formatObject(Object *object, bool nested, std::set<Object *> &active
                item(slots.at(1)) + ")";
     }
     if (object->kind == Object::Instance) {
+        // Members of enums with data (Shape.Empty) print without parentheses when fieldless.
+        if (slots.empty() && object->text.find('.') != std::string::npos &&
+            object->text.find('<') == std::string::npos)
+            return object->text;
         out = (object->text.empty() ? "instance" : object->text) + "(";
         for (size_t i = 0; i < slots.size(); ++i) {
             if (i)

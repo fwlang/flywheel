@@ -142,6 +142,7 @@ struct TaskResource : NativeResource {
     std::string errorType;
     std::atomic<bool> done{false};
     bool joined = false;
+    RaceClock raceStart, raceEnd; // --race: the spawner's past and the task's final clock
     ~TaskResource() override {
         if (worker.joinable())
             worker.join();
@@ -152,6 +153,7 @@ struct TaskResource : NativeResource {
 };
 struct MutexResource : NativeResource {
     std::mutex mutex;
+    RaceClock raceClock; // --race: the past of the last unlock
 };
 struct ChannelResource : NativeResource {
     std::mutex mutex;
@@ -159,6 +161,7 @@ struct ChannelResource : NativeResource {
     std::deque<Slot> items;
     size_t capacity = 0; // 0 is unbounded
     bool closed = false;
+    RaceClock raceClock; // --race: the past of every send
 };
 template <class T> T &resourceOf(Object *p, const char *type) {
     auto resource = p && p->kind == Object::Resource ? dynamic_cast<T *>(p->nativeResource())
@@ -198,10 +201,13 @@ Object *fw_thread_spawn(Frame *frame, Object *closure, TaskRunner runner) {
         state->result->slots.resize(1);
         auto object = resourceObject(frame, "thread.task", std::move(task));
         ++activeThreads;
+        raceRelease(state->raceStart);
         try {
             state->worker = std::thread([state, runner] {
                 guardStack();
+                raceAcquire(state->raceStart);
                 runner(state->closure, state->result);
+                raceRelease(state->raceEnd);
                 if (pendingError.value) {
                     state->errorType = pendingError.type;
                     state->error = pendingError.value;
@@ -227,6 +233,7 @@ Object *fw_thread_join(Frame *frame, Object *taskObject) {
                 fail("a task cannot join itself", "RuntimeError");
             task.worker.join();
         }
+        raceAcquire(task.raceEnd);
         if (task.error) {
             pendingError.set(task.errorType, task.error);
             return nullptr;
@@ -249,13 +256,19 @@ Object *fw_thread_mutex(Frame *frame) {
 // 0 lock, 1 unlock, 2 try_lock
 int64_t fw_mutex_operation(Object *mutexObject, int64_t operation) {
     return nativeBoundary([&]() -> int64_t {
-        auto &m = resourceOf<MutexResource>(mutexObject, "thread.mutex").mutex;
-        if (operation == 0)
+        auto &resource = resourceOf<MutexResource>(mutexObject, "thread.mutex");
+        auto &m = resource.mutex;
+        if (operation == 0) {
             m.lock();
-        else if (operation == 1)
+            raceAcquire(resource.raceClock);
+        } else if (operation == 1) {
+            raceRelease(resource.raceClock);
             m.unlock();
-        else
-            return m.try_lock();
+        } else {
+            if (!m.try_lock())
+                return 0;
+            raceAcquire(resource.raceClock);
+        }
         return 1;
     });
 }
@@ -279,6 +292,7 @@ void fw_channel_send(Object *channelObject, Object *box) {
         if (channel.closed)
             fail("send on a closed channel", "RuntimeError");
         channel.items.push_back(box->slots.at(0));
+        raceRelease(channel.raceClock);
         channel.changed.notify_all();
     });
 }
@@ -292,6 +306,7 @@ Object *fw_channel_receive(Frame *frame, Object *channelObject, int64_t wait) {
             channel.changed.wait(lock, [&] { return channel.closed || !channel.items.empty(); });
         if (channel.items.empty())
             return nullptr;
+        raceAcquire(channel.raceClock);
         auto box = managed(frame, Object::Box);
         box->slots.push_back(std::move(channel.items.front()));
         channel.items.pop_front();

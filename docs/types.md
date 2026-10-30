@@ -46,6 +46,58 @@ print Temperature(212.0).celsius   # 100
 
 Definite initialization is checked conservatively at compile time. Required fields must be assigned by **top-level** statements of `init` (or by a top-level `super.init(...)`, which covers the base class's fields) before `init` reads `inst`, calls a method, or can return. Violations are compile errors such as `init must assign required field 'x'` or `init uses 'inst' before assigning required field 'x'`. `init` cannot return a value. `Class.from_json` builds instances field by field and does not run `init`.
 
+### Member visibility and readonly fields
+
+Fields and methods are public by default. A `private` member is visible only in the methods of its own class (not in subclasses or other code). A `readonly` field can be set by the generated constructor and by assignments in `init` of its own class; any other assignment is a compile error.
+
+```flywheel
+class Account
+    readonly string id
+    private int balance = 0
+    function deposit(int amount)
+        inst balance += amount
+    end
+    function total returns int
+        return inst balance
+    end
+end
+var a = Account("acct-1")
+a.deposit(5)
+print a.id, a.total()    # a.balance and a.id = "x" do not compile
+```
+
+`readonly` makes the field's binding immutable; a collection stored in it can still change unless it is [frozen](collections.md#frozen-collections).
+
+### Operators and text
+
+A class can define operators as methods named `operator` followed by the symbol:
+
+| Method | Used by |
+|---|---|
+| `operator +(T other)`, `-`, `*`, `/`, `//`, `%` | `a + b`, ..., and compound assignment `a += b` |
+| `operator -()` | unary `-a` |
+| `operator ==(T other) returns bool` | `a == b`, and `a != b` as its negation |
+| `operator <(T other) returns bool` | `a < b`; also `>`, `<=`, `>=` unless those are defined |
+| `operator [](K key)` / `operator []=(K key, V value)` | `a[key]` and `a[key] = value` |
+
+```flywheel
+class Money
+    readonly int cents
+    function operator +(Money other) returns Money
+        return Money(inst cents + other.cents)
+    end
+    function operator <(Money other) returns bool
+        return inst cents < other.cents
+    end
+    function to_string returns string
+        return "${inst cents // 100}.{inst cents % 100:02}"
+    end
+end
+print Money(150) + Money(275)    # $4.25
+```
+
+The left operand selects the method, so `money * 2` works with `operator *(int k)` but `2 * money` does not. A class without `operator ==` keeps identity comparison (or `equals`, when it defines one). `function to_string returns string` sets how `print`, `string(x)`, and interpolation show an instance.
+
 ## Inheritance
 
 `class Dog extends Animal` inherits fields and methods. The base class's fields come first in the subclass's field order (and its generated constructor). A subclass may override a method with exactly the same parameter and return types; a different signature is a compile error. `super.method(...)` calls the base class's implementation.
@@ -112,6 +164,34 @@ print Color.from_name("Blue") ?? Color.Red
 
 Members are separated by commas or newlines. Enum values are compact integers (`.value` is the member index), print as their member name, support `==` and `!=`, and can be map keys, set elements, and JSON values (encoded by name). `int(c)` converts explicitly. `Color.from_name(text)` returns `Color?`.
 
+### Enums with data
+
+A member can carry fields, written like a parameter list. Such an enum is a family of immutable values, one shape per member:
+
+```flywheel
+enum Shape
+    Circle(double radius)
+    Rect(double width, double height)
+    Empty
+end
+
+function area(Shape s) returns double
+    match s
+        case Shape.Circle(r) then
+            return 3.14159 * r * r
+        case Shape.Rect(w, h) then
+            return w * h
+        case Shape.Empty then
+            return 0.0
+    end
+end
+
+Shape[] shapes = [Shape.Circle(1.0), Shape.Rect(2.0, 3.0), Shape.Empty]
+print shapes[1], Shape.Circle(2.0).radius   # Shape.Rect(width=2, height=3) 2
+```
+
+`Shape.Circle(1.0)` constructs a member (fields may have defaults); a member without fields is written as a value, `Shape.Empty`. The enum itself cannot be constructed. Fields are `readonly` and readable by name on a value whose static type is the member (`Shape.Circle(2.0).radius`, or after `case Shape.Circle c`). Members print as `Shape.Circle(radius=1)`, and `==` compares the member and its field values (deeply, through nested enum values, arrays, and tuples). A `match` on the enum is exhaustive when every member is covered. Internally the enum is a base class and each member a subclass, so `case Shape.Circle c` and `s is Shape.Circle` also work. Enums with data are not hashable, so they cannot be map keys or set elements.
+
 ## Pattern matching
 
 `match` compares one value against a sequence of cases:
@@ -151,6 +231,23 @@ Case patterns:
 | `case Circle c` / `case Circle` | instances of a class or interface; `c` is bound with that type |
 | `case int n` | the present value of a nullable subject such as `int?` |
 | `case ok v` / `case error e` | the variants of a `Result<T,E>`, binding the payload |
+| `case Shape.Circle(r)` | a member of an enum with data, binding (or comparing) its fields in order |
+| `case [x, y]` | a tuple or array with exactly that many elements, binding (or comparing) them |
+
+In the destructuring patterns, a bare name binds that element, `_` skips it, any other expression is compared with `==`, and patterns nest: `case [Shape.Rect(w, _), 0] then`. A tuple pattern whose parts all bind always matches tuples of that length; an array pattern also checks the length.
+
+### Destructuring declarations
+
+`var (a, b) = pair` and `var [x, y] = items` declare one name per element of a tuple or array (`const` works too, and `_` skips an element). The number of names must equal the number of elements: tuples are checked by the compiler, arrays raise `ValueError` when the lengths differ.
+
+```flywheel
+function min_max(int[] xs) returns [int, int]
+    var sorted = xs.copy()
+    sorted.sort()
+    return [sorted[0], sorted[sorted.length - 1]]
+end
+var (low, high) = min_max([3, 1, 2])
+```
 
 Any case may add a guard: `case Circle c if c.radius > 1.0 then`. The subject is evaluated once. Cases are tried in order, and only the first matching case runs; there is no fallthrough.
 
@@ -179,7 +276,39 @@ var pick = first<string>       # an instantiated generic function as a value
 
 Generics are monomorphized: every distinct set of type arguments compiles a separate copy, so generic code runs as fast as hand-written code. Type arguments are written directly after the name with no space (`Box<int>`); with a space, `a <b` is a comparison or markup. Arguments are inferred from call arguments (unifying parameter types such as `T[]`, `map<K, V>`, `T?`, and function types) and, for constructors, from the expected type. If a parameter cannot be inferred, write the arguments explicitly.
 
-Generic bodies are type-checked when instantiated, like C++ templates; a generic that is never used is not checked. There are no constraints on type parameters and methods cannot declare their own type parameters (make the class generic instead).
+Generic bodies are type-checked when instantiated, like C++ templates; a generic that is never used is not checked.
+
+### Constraints
+
+A type parameter can require an interface or base class (`T implements Named`, `T extends Shape`) or a built-in capability: `T is numeric`, `T is comparable` (numbers, `string`, `char`, or classes with `operator <`), or `T is hashable` (valid map keys). A type argument that does not satisfy the constraint is reported at the call or type, with the constraint, instead of somewhere inside the generic body:
+
+```flywheel
+function largest<T is comparable>(T[] items) returns T
+    var best = items[0]
+    for x in items do
+        if x > best then
+            best = x
+        end
+    end
+    return best
+end
+```
+
+### Generic methods
+
+Methods can declare their own type parameters, inferred from the arguments like generic functions:
+
+```flywheel
+class Box<T>
+    T value
+    function map<U>(function(T) returns U f) returns Box<U>
+        return Box<U>(f(inst value))
+    end
+end
+print Box(4).map(function(int x) => "n{x}").value   # n4
+```
+
+Each instantiation is a separate non-virtual method: a subclass cannot override a generic method.
 
 ## Optional values
 

@@ -129,6 +129,8 @@ struct Object {
     std::shared_ptr<Json> json;
     std::vector<Slot> slots, keys;
     bool objectKeys = false;
+    // Set by freeze(): arrays, maps, and sets reject every later change.
+    std::atomic<bool> frozenFlag{false};
     Slot::Kind keyKind = Slot::Integer;
     std::string errorType, typeName;
     std::vector<std::string> fieldNames;
@@ -227,6 +229,137 @@ Stripe &objectStripe(const Object *p) {
     auto h = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p)) * 0x9e3779b97f4a7c15ULL;
     return stripes[h >> 54];
 }
+// Borrowed reads while threads run: recently borrowed values stay retained by this thread.
+struct BorrowedValues {
+    Object *items[256] = {};
+    size_t next = 0;
+    void keep(Object *value) {
+        auto old = std::exchange(items[next], value);
+        next = (next + 1) % 256;
+        release(old);
+    }
+    ~BorrowedValues() {
+        for (auto &item : items)
+            release(std::exchange(item, nullptr));
+    }
+};
+BorrowedValues &borrowedValues() {
+    static thread_local BorrowedValues values;
+    return values;
+}
+// Race detection (`--race`): a happens-before detector over vector clocks. Each thread has a
+// clock; spawn/join, mutexes, and channels order threads. Every collection, field, and global
+// access records its epoch (thread, time) per object; an access that conflicts with an earlier
+// write (or a write with an earlier read) from another thread that is not ordered before it is
+// a data race, reported before the program stops.
+std::atomic<bool> raceMode{false};
+using RaceClock = std::vector<uint32_t>;
+struct RaceThread {
+    int id = -1;
+    RaceClock clock;
+};
+std::atomic<int> raceThreads{0};
+thread_local RaceThread raceSelf;
+RaceThread &raceThread() {
+    if (raceSelf.id < 0) {
+        raceSelf.id = raceThreads++;
+        raceSelf.clock.assign(static_cast<size_t>(raceSelf.id) + 1, 0);
+        raceSelf.clock[static_cast<size_t>(raceSelf.id)] = 1;
+    }
+    return raceSelf;
+}
+void raceJoinClock(RaceClock &into, const RaceClock &from) {
+    if (into.size() < from.size())
+        into.resize(from.size(), 0);
+    for (size_t i = 0; i < from.size(); ++i)
+        into[i] = std::max(into[i], from[i]);
+}
+// A synchronization that publishes this thread's past (unlock, send, spawn, thread end).
+void raceRelease(RaceClock &target) {
+    if (!raceMode.load(std::memory_order_relaxed))
+        return;
+    auto &self = raceThread();
+    raceJoinClock(target, self.clock);
+    ++self.clock[static_cast<size_t>(self.id)];
+}
+// A synchronization that makes another thread's published past happen before (lock, receive,
+// join, thread start).
+void raceAcquire(const RaceClock &source) {
+    if (!raceMode.load(std::memory_order_relaxed))
+        return;
+    raceJoinClock(raceThread().clock, source);
+}
+struct RaceShadow {
+    int writer = -1, reader = -1;
+    uint32_t writeTime = 0, readTime = 0;
+};
+std::mutex raceMutex;
+std::unordered_map<const void *, RaceShadow> &raceShadows() {
+    static auto *shadows = new std::unordered_map<const void *, RaceShadow>;
+    return *shadows;
+}
+const char *raceKind(const Object *p) {
+    switch (p->kind) {
+    case Object::Array: return "array";
+    case Object::Instance: return "object";
+    case Object::Map: return "map";
+    case Object::Tuple: return "tuple";
+    case Object::Set: return "set";
+    case Object::Box: return "global or captured variable";
+    default: return "value";
+    }
+}
+[[noreturn]] void raceReport(const std::string &what, bool write, int other, bool otherWrite) {
+    std::fprintf(stderr,
+                 "flywheel: data race on %s: %s by thread %d conflicts with an earlier %s by "
+                 "thread %d; nothing (a mutex, a channel, or join) orders them\n",
+                 what.c_str(), write ? "a write" : "a read", raceSelf.id,
+                 otherWrite ? "write" : "read", other);
+    std::fflush(stderr);
+    std::_Exit(66);
+}
+std::string raceName(const Object *p) {
+    std::string type = p->kind == Object::Instance ? p->typeName : "";
+    for (size_t at; (at = type.find("$m")) != std::string::npos;) {
+        auto end = type.find('$', at + 2);
+        if (end == std::string::npos)
+            break;
+        type.erase(at, end - at + 1);
+    }
+    return std::string(raceKind(p)) + (type.empty() ? "" : " " + type);
+}
+void raceCheck(const void *key, const std::function<std::string()> &what, bool write) {
+    auto &self = raceThread();
+    auto now = self.clock[static_cast<size_t>(self.id)];
+    auto ordered = [&](int thread, uint32_t time) {
+        return thread < 0 || thread == self.id ||
+               (static_cast<size_t>(thread) < self.clock.size() &&
+                time <= self.clock[static_cast<size_t>(thread)]);
+    };
+    std::lock_guard<std::mutex> lock(raceMutex);
+    auto &shadow = raceShadows()[key];
+    if (!ordered(shadow.writer, shadow.writeTime))
+        raceReport(what(), write, shadow.writer, true);
+    if (write) {
+        if (!ordered(shadow.reader, shadow.readTime))
+            raceReport(what(), true, shadow.reader, false);
+        shadow.writer = self.id;
+        shadow.writeTime = now;
+    } else {
+        shadow.reader = self.id;
+        shadow.readTime = now;
+    }
+}
+void raceAccess(const Object *p, bool write) {
+    if (p && raceMode.load(std::memory_order_relaxed))
+        raceCheck(p, [p] { return raceName(p); }, write);
+}
+void raceForget(const Object *p) {
+    if (!raceMode.load(std::memory_order_relaxed))
+        return;
+    std::lock_guard<std::mutex> lock(raceMutex);
+    raceShadows().erase(p);
+}
 // The stripe this thread holds. Guards are scoped, so one nested inside a guard on the same
 // stripe does nothing; the outer guard keeps the lock until it ends.
 thread_local Stripe *heldStripe = nullptr;
@@ -234,6 +367,7 @@ struct ObjectGuard {
     Stripe *held = nullptr;
     bool outer = false;
     explicit ObjectGuard(const Object *p) {
+        raceAccess(p, false);
         if (!p || activeThreads.load(std::memory_order_acquire) == 0)
             return;
         auto &stripe = objectStripe(p);
@@ -262,6 +396,7 @@ std::mutex &weakMutex() {
     return m;
 }
 Object::~Object() {
+    raceForget(this);
     if (weakCell) {
         SharedLock lock(weakMutex());
         weakCell->target = nullptr;
@@ -487,6 +622,19 @@ std::vector<Slot> keysOf(Object *p) {
     return p->keys;
 }
 } // namespace
+namespace {
+// Records a ValueError and returns true when `p` is a frozen collection.
+bool frozen(Object *p) {
+    raceAccess(p, true);
+    if (!p || !p->frozenFlag.load(std::memory_order_relaxed))
+        return false;
+    recordFailure("ValueError", std::string("cannot modify a frozen ") +
+                                    (p->kind == Object::Map   ? "map"
+                                     : p->kind == Object::Set ? "set"
+                                                              : "array"));
+    return true;
+}
+} // namespace
 extern "C" {
 void *fw_frame() {
     return new Frame;
@@ -667,6 +815,18 @@ double fw_get_real(Object *p, int64_t index) {
 }
 Object *fw_get_object(Object *p, int64_t index) {
     try {
+        if (activeThreads.load(std::memory_order_acquire) != 0) {
+            // Another thread may replace the slot and release its value while the caller
+            // uses this borrowed reference, so keep it alive for the next 256 borrowed reads.
+            Object *value;
+            {
+                ObjectGuard guard(p);
+                value = slot(p, index).object;
+                retain(value);
+            }
+            borrowedValues().keep(value);
+            return value;
+        }
         ObjectGuard guard(p);
         return slot(p, index).object;
     } catch (const NativeFailure &e) {
@@ -678,6 +838,8 @@ Object *fw_get_object(Object *p, int64_t index) {
     }
 }
 void fw_set_int(Object *p, int64_t index, int64_t value, int64_t kind) {
+    if (frozen(p))
+        return;
     try {
         ObjectGuard guard(p);
         auto &target = slot(p, index);
@@ -694,6 +856,8 @@ void fw_set_int(Object *p, int64_t index, int64_t value, int64_t kind) {
     }
 }
 void fw_set_real(Object *p, int64_t index, double value) {
+    if (frozen(p))
+        return;
     try {
         ObjectGuard guard(p);
         auto &target = slot(p, index);
@@ -708,6 +872,8 @@ void fw_set_real(Object *p, int64_t index, double value) {
     }
 }
 void fw_set_object(Object *p, int64_t index, Object *value) {
+    if (frozen(p))
+        return;
     try {
         Object *previous;
         {
@@ -747,6 +913,8 @@ Object *fw_get_kept(Frame *f, Object *p, int64_t index) {
 }
 // push and pop each change an array in one locked step; `kind` is encoded as for fw_set_int.
 void fw_array_push_int(Object *p, int64_t value, int64_t kind) {
+    if (frozen(p))
+        return;
     try {
         Slot s;
         s.integer = value;
@@ -762,6 +930,8 @@ void fw_array_push_int(Object *p, int64_t value, int64_t kind) {
     }
 }
 void fw_array_push_real(Object *p, double value) {
+    if (frozen(p))
+        return;
     try {
         Slot s;
         s.real = value;
@@ -775,6 +945,8 @@ void fw_array_push_real(Object *p, double value) {
     }
 }
 void fw_array_push_object(Object *p, Object *value) {
+    if (frozen(p))
+        return;
     try {
         Slot s;
         s.kind = Slot::Reference;
@@ -801,6 +973,8 @@ Slot popSlot(Object *p) {
 } // namespace
 extern "C" {
 int64_t fw_array_pop_int(Object *p) {
+    if (frozen(p))
+        return {};
     try {
         return popSlot(p).integer;
     } catch (const NativeFailure &e) {
@@ -824,6 +998,8 @@ double fw_array_pop_real(Object *p) {
 }
 // The array's reference to the popped value moves to the frame.
 Object *fw_array_pop_object(Frame *f, Object *p) {
+    if (frozen(p))
+        return nullptr;
     try {
         auto last = popSlot(p);
         return own(f, std::exchange(last.object, nullptr));
@@ -1731,6 +1907,8 @@ Object *fw_map_new(Frame *frame, int64_t objects) {
     }
 }
 int64_t fw_map_index(Object *p, int64_t integer, Object *object, int64_t insert) {
+    if (insert && frozen(p))
+        return {};
     try {
         ObjectGuard guard(p);
         auto index = findKey(p, integer, object);
@@ -1770,6 +1948,8 @@ int64_t fw_map_has(Object *p, int64_t integer, Object *object) {
     }
 }
 int64_t fw_map_remove(Object *p, int64_t integer, Object *object) {
+    if (frozen(p))
+        return {};
     try {
         Slot key, value; // released after unlocking
         ObjectGuard guard(p);
@@ -1812,6 +1992,8 @@ Object *fw_map_keys(Frame *frame, Object *p) {
     }
 }
 int64_t fw_array_append(Object *p) {
+    if (frozen(p))
+        return {};
     try {
         ObjectGuard guard(p);
         p->slots.emplace_back();
@@ -1825,6 +2007,8 @@ int64_t fw_array_append(Object *p) {
     }
 }
 void fw_array_pop(Object *p) {
+    if (frozen(p))
+        return;
     try {
         Slot last; // released after unlocking
         ObjectGuard guard(p);
@@ -1841,6 +2025,8 @@ void fw_array_pop(Object *p) {
     }
 }
 void fw_collection_clear(Object *p) {
+    if (frozen(p))
+        return;
     try {
         std::vector<Slot> slots, keys; // released after unlocking
         ObjectGuard guard(p);
@@ -1995,4 +2181,5 @@ extern "C" Object *fw_try_read(Frame *frame, Object *path) {
 
 #include "web.inc"
 #include "stdlib.inc"
+#include "library.inc"
 #include "concurrency.inc"

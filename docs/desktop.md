@@ -50,10 +50,10 @@ var window = desktop.window()
 window.bind("greet", function(string name) returns string
     return "Hello, " + name
 end)
-window.eval("greet('Ann').then(function (reply) {{ document.title = reply; }})")
+window.eval("greet('Ann').then(function (reply) { document.title = reply; })")
 ```
 
-Page JavaScript calls a binding with one argument and receives a Promise. A single string argument arrives unchanged; other arguments arrive as their JSON text. The returned string resolves the promise. Bindings must be added before `run`. Remember that `{` interpolates in Flywheel strings, so write `{{` and `}}` for JavaScript braces.
+Page JavaScript calls a binding with one argument and receives a Promise. A single string argument arrives unchanged; other arguments arrive as their JSON text. The returned string resolves the promise. Bindings must be added before `run`. Braces with whitespace beside them, like the JavaScript block above, stay literal in Flywheel strings; `{name}` with no space interpolates.
 
 Handlers and bindings run on the thread that called `run`, one at a time. An uncaught Flywheel error in a callback closes the windows and propagates from `run` as an ordinary error.
 

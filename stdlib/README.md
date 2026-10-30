@@ -19,7 +19,14 @@ Libraries are compiler-resolved declarations backed by C++ runtime functions; no
 | `testing` | assertions and lifetime metrics — [tooling](../docs/tooling.md) |
 | `thread` | tasks, channels, mutexes — [concurrency](../docs/concurrency.md) |
 | `time` | clocks, sleeping, calendar dates, formatting |
-| `web` | HTTP and HTTPS servers |
+| `web` | HTTP and HTTPS servers and client |
+| `crypto` | SHA-256, SHA-1, MD5, HMAC, secure random numbers |
+| `encoding` | base64, base64url, hex, URL and form encoding |
+| `uuid` | random (v4) and time-ordered (v7) UUIDs |
+| `compress` | gzip, zlib, deflate, CRC-32, zip archives |
+| `sqlite` | SQLite 3 databases |
+| `toml`, `yaml` | configuration formats, parsed to `json.value` |
+| `csv`, `url`, `log`, `args`, `bigint`, `decimal` | [library modules written in Flywheel](#library-modules) |
 
 ## Strings
 
@@ -145,7 +152,7 @@ Strings carry arbitrary bytes, so binary protocols work, but `length` counts UTF
 
 ## testing
 
-`assert(bool, message = "")`, `assert_equal(actual, expected, message = "")`, `fail(message)`, and `live_objects()`; see [tooling](../docs/tooling.md).
+`assert(bool, message = "")`, `assert_equal(actual, expected, message = "")`, `fail(message)`, `expect_error(ErrorType, function)` (returns the error), and `live_objects()`; see [tooling](../docs/tooling.md).
 
 ## web
 
@@ -175,6 +182,139 @@ The runtime enters its request loop after top-level startup code completes, or e
 
 Handlers run one at a time on the serving thread by default. `web.workers(n)` (called before serving starts) runs them on `n` threads; see [concurrency](../docs/concurrency.md#web-handlers). An uncaught handler error stops the listeners and propagates from the request loop; wrap `web.wait()` in try/catch to handle it.
 
+### HTTP client
+
+| Function | Request |
+|---|---|
+| `web.get(url, headers = {})` | GET |
+| `web.post(url, body, headers = {})`, `put`, `patch` | with a body; a `json.value` body is sent as JSON |
+| `web.delete(url, headers = {})`, `web.head(url, headers = {})` | DELETE, HEAD |
+| `web.fetch(method, url, body = "", headers = {}, timeout = 30.0)` | any method, with a timeout in seconds |
+
+Each returns a `web.response` with `status`, `body`, and `headers` (lower-cased names). Any status, including 404 and 500, is a response; connection, TLS, and protocol failures raise `HttpError`. Redirects are followed (up to 10; 303, and 301/302 after POST, continue as GET; credentials are not sent to another host). Chunked and gzip/deflate-encoded bodies are decoded. `https://` uses the system OpenSSL 3 library with certificate and host-name verification against OpenSSL's default trust store (`SSL_CERT_FILE` / `SSL_CERT_DIR` override it). Headers are `map<string, string>`; `User-Agent: Flywheel` and `Accept-Encoding: gzip, deflate` are sent unless given.
+
+```flywheel
+import web
+import json
+var r = web.get("https://api.example.com/items", {"Authorization": "Bearer token"})
+if r.status == 200 then
+    print json.parse(r.body)
+end
+var created = web.post("https://api.example.com/items", json.parse("{{\"name\": \"x\"}}"))
+print created.status
+```
+
+## crypto
+
+| Function | Result |
+|---|---|
+| `sha256(text)`, `sha1(text)`, `md5(text)` | lower-case hex digest |
+| `sha256_bytes(text)`, `sha1_bytes`, `md5_bytes` | the raw digest bytes |
+| `hmac_sha256(key, text)`, `hmac_sha1`, `hmac_md5` (and `_bytes` forms) | HMAC |
+| `random_bytes(n)`, `random_hex(n)` | `n` bytes from the operating system's secure random source (raw, or as hex) |
+| `token(n = 32)` | `n` secure random bytes as unpadded base64url, for session ids and API keys |
+| `random_int(low, high)` | a secure random integer in the inclusive range |
+| `secure_equal(a, b)` | constant-time comparison for secrets |
+
+SHA-1 and MD5 are for compatibility (checksums, legacy protocols), not for security.
+
+## encoding
+
+`base64_encode`/`base64_decode`, `base64url_encode`/`base64url_decode` (URL-safe, unpadded), `hex_encode`/`hex_decode`, `url_encode`/`url_decode` (percent-encoding of everything except unreserved characters), and `form_encode`/`form_decode` (as `url_*`, with `+` for spaces). Strings hold arbitrary bytes, so binary data round-trips. Malformed input raises `ValueError`.
+
+## uuid
+
+`uuid.v4()` returns a random UUID and `uuid.v7()` one that starts with the Unix time in milliseconds (so v7 ids sort by creation time); both come from the secure random source. `uuid.is_valid(text)` checks the 8-4-4-4-12 hexadecimal form.
+
+## compress
+
+| Function | Result |
+|---|---|
+| `gzip(text, level = 6)`, `gunzip(data)` | gzip format (concatenated members are joined when decompressing) |
+| `zlib(text, level = 6)`, `unzlib(data)` | zlib format |
+| `deflate(text, level = 6)`, `inflate(data)` | raw DEFLATE |
+| `crc32(text)` | CRC-32 checksum |
+| `zip(map<string, string> files)` | a zip archive of file name → contents |
+| `unzip(data)` | `map<string, string>` of the archive's files (directories skipped) |
+
+Levels run from 0 (stored) to 9. The implementation is built in (no zlib dependency) and reads everything standard tools write; compression uses fixed Huffman codes, so archives are somewhat larger than zlib's. Corrupt data or failed checksums raise `ValueError`.
+
+## sqlite
+
+`sqlite.open(path)` opens (or creates) a database and returns a `sqlite.database`; `":memory:"` is a private in-memory database. It uses the system SQLite 3 library (`libsqlite3`), loaded on first use.
+
+| Method | Behavior |
+|---|---|
+| `execute(sql, values...)` | runs statements that return no rows; returns the number of changed rows |
+| `query(sql, values...)` | runs a query; the rows are a `json.value` array of objects keyed by column name |
+| `last_insert_id()` | the rowid of the last insert |
+| `close()` | closes the database (also closed when released) |
+
+`?` parameters take the extra arguments in order: numbers, `bool` (as 0/1), `char`, strings, enums (their index), and null (`int?` and other nullable values bind NULL when null). Integers, reals, text, and NULL come back as JSON numbers, strings, and null, so `json.decode` turns rows into classes. Errors raise `DatabaseError`. A database may be shared between threads; its operations run one at a time.
+
+```flywheel
+import sqlite
+import json
+class User
+    int id
+    string name
+end
+var db = sqlite.open("app.db")
+db.execute("create table if not exists users (id integer primary key, name text)")
+db.execute("insert into users (name) values (?)", "Ann")
+User[] users = json.decode(db.query("select id, name from users where id > ?", 0))
+print users
+```
+
+## toml and yaml
+
+`toml.parse(text)` reads TOML 1.0 and `yaml.parse(text)` reads YAML 1.2 (core schema); both return a `json.value`, so `json.decode` turns a configuration file into classes. Dates and times become strings. Invalid documents raise `ValueError` with the line number.
+
+YAML support covers block mappings and sequences, flow collections, plain, quoted, literal (`|`), and folded (`>`) scalars with chomping, anchors and aliases, merge keys (`<<`), comments, and one document (`---`, `...`). Tags are ignored. `yes`/`no` are strings, as YAML 1.2 specifies.
+
+## Library modules
+
+These modules are written in Flywheel and built into the compiler; import them like any module.
+
+### csv
+
+`csv.parse(text, separator = ',')` returns `string[][]`; `csv.parse_records(text, separator)` uses the first row as column names and returns `map<string, string>[]`. `csv.format(rows, separator)` and `csv.format_row(fields, separator)` write CSV (RFC 4180: fields with separators, quotes, or line breaks are quoted; lines end with CRLF).
+
+### url
+
+`url.parse(text)` returns a `url.Url` with `scheme`, `user`, `host`, `port` (0 when absent), `path`, `query`, and `fragment`, plus `params()` (decoded query), `effective_port()`, and `to_string()`. `url.join(base, reference)` resolves a relative reference (RFC 3986); `url.encode`/`url.decode` percent-encode; `url.parse_query(text)` and `url.query_string(map)` convert query strings.
+
+### log
+
+`log.debug`, `log.info`, `log.warn`, and `log.error` take a message and optional `map<string, string>` fields and write `2026-10-30T12:00:00.000Z INFO  message key=value` lines to standard error. `log.set_level(log.Level.Debug)` or `log.set_level_name("warn")` changes the threshold (default `Info`), `log.use_json(true)` writes JSON lines, and `log.to_file(path)` appends to a file.
+
+### args
+
+```flywheel
+import args
+import os
+var cli = args.Parser("resize", "Resizes images.")
+cli.flag("verbose", "v", "print each file")
+cli.option("width", "w", "target width in pixels", "800")
+cli.positional("files", "images to resize", true)
+var parsed = cli.parse(os.args())
+print parsed.flag("verbose"), parsed.integer("width"), parsed.list("files")
+```
+
+Flags (`--verbose`, `-v`, combined `-vq`), options (`--width 640`, `--width=640`, `-w640`; repeated options collect into `list(name)`), positionals (`many` collects the rest), and `--` for literal arguments. `parse` prints generated help for `-h`/`--help` and exits 0, or prints the problem and usage to standard error and exits 2; `parse_or_throw` raises `args.Usage` instead. `get`, `integer`, `number`, `flag`, `list`, and `has` read the results.
+
+### bigint and decimal
+
+`bigint.of(int)` and `bigint.parse(text)` create arbitrary-precision integers with `+ - * // %`, comparisons, `pow`, `abs`, `divmod`, `to_int`, and `to_string`. Division truncates toward zero like `int`.
+
+`decimal.parse("19.99")` and `decimal.of(n)` create exact decimal numbers for money: `+ - *` are exact, `/` divides to 20 extra places, `divide(other, places, rounding)` and `round(places, rounding)` round with `decimal.Rounding.HalfEven` (the default), `HalfUp`, `Down`, `Up`, `Floor`, or `Ceiling`. `normalized()` removes trailing zeros; text keeps the scale (`"1.50"`).
+
+```flywheel
+import decimal
+var total = decimal.parse("19.99") * decimal.of(3)
+print total, decimal.parse("0.1") + decimal.parse("0.2") == decimal.parse("0.3")   # 59.97 true
+```
+
 ## collections, desktop, html
 
-`collections.range(end)` and `range(start, end)` return `int[]`. The desktop and HTML APIs are documented in [desktop windows](../docs/desktop.md) and [HTML tools](../docs/html-dom.md); collection methods in [collections](../docs/collections.md).
+`collections.range(end)` and `range(start, end)` return `int[]`. The desktop and HTML APIs are documented in [desktop windows](../docs/desktop.md) and [HTML tools](../docs/html-dom.md); collection methods in [collections](../docs/collections.md). `html.parse(text)` reads HTML into a `fragment` that the HTML tools query and change (see [parsing HTML](../docs/html-dom.md#parsing-html)).

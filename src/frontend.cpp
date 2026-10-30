@@ -66,13 +66,35 @@ bool markupArgumentStart(const std::string &source, size_t p) {
         return false;
     if (source[p] == '>' || source.compare(p, 2, "/>") == 0)
         return true;
-    if (!start(source[p]))
-        return false;
-    name();
-    space();
-    return p < source.size() && source[p] == '=';
+    // Attributes: one with a value (`<a href=...`), or valueless ones up to the end of the tag
+    // (`<input disabled>`, `<option selected value=2>`). Operator keywords keep
+    // `print a <b and c> d` a comparison.
+    while (p < source.size() && start(source[p])) {
+        size_t begin = p;
+        name();
+        static const std::set<std::string> operators = {"and", "or", "not", "in", "is", "as"};
+        if (operators.count(source.substr(begin, p - begin)))
+            return false;
+        space();
+        if (p < source.size() &&
+            (source[p] == '=' || source[p] == '>' || source.compare(p, 2, "/>") == 0))
+            return true;
+    }
+    return false;
 }
-size_t quotedEnd(const std::string &s, size_t p);
+size_t quotedEnd(const std::string &s, size_t p, char quote = '"');
+// In string and markup text, a brace beside whitespace is literal so CSS and JavaScript read
+// naturally: `{name}` interpolates, `{ name }` is the text "{ name }". `{` is literal when
+// whitespace follows it; a `}` outside an interpolation is literal when whitespace (or either
+// end of the text) touches it.
+bool literalOpen(const std::string &s, size_t p) {
+    return s[p] == '{' && (p + 1 >= s.size() || std::isspace(static_cast<unsigned char>(s[p + 1])));
+}
+bool literalClose(const std::string &s, size_t p) {
+    return s[p] == '}' && (p == 0 || p + 1 >= s.size() ||
+                           std::isspace(static_cast<unsigned char>(s[p - 1])) ||
+                           std::isspace(static_cast<unsigned char>(s[p + 1])));
+}
 size_t braceEnd(const std::string &s, size_t p) {
     int depth = 1;
     for (++p; p < s.size(); ++p) {
@@ -85,7 +107,7 @@ size_t braceEnd(const std::string &s, size_t p) {
     }
     throw Error({}, "unterminated interpolation");
 }
-size_t quotedEnd(const std::string &s, size_t p) {
+size_t quotedEnd(const std::string &s, size_t p, char quote) {
     for (++p; p < s.size(); ++p) {
         if (s[p] == '\\') {
             ++p;
@@ -95,14 +117,29 @@ size_t quotedEnd(const std::string &s, size_t p) {
             ++p;
             continue;
         }
-        if (s[p] == '{') {
+        if (s[p] == '{' && !literalOpen(s, p)) {
             p = braceEnd(s, p);
             continue;
         }
-        if (s[p] == '"')
+        if (s[p] == quote)
             return p;
     }
     throw Error({}, "unterminated string");
+}
+// HTML void elements: `<br>` and `<input type="text">` need no `/>` or closing tag.
+bool htmlVoidTag(const std::string &tag) {
+    static const std::set<std::string> tags = {"area", "base", "br",    "col",    "embed",
+                                               "hr",   "img",  "input", "link",   "meta",
+                                               "param", "source", "track", "wbr"};
+    return tags.count(tag) > 0;
+}
+// The position after the '-->' closing the '<!--' comment at p. Markup comments are dropped,
+// as html.parse drops them; their contents are never interpolated.
+size_t markupCommentEnd(const std::string &s, size_t p) {
+    auto end = s.find("-->", p + 4);
+    if (end == std::string::npos)
+        throw Error({}, "unterminated markup comment: expected '-->'");
+    return end + 3;
 }
 size_t markupEnd(const std::string &s, size_t p) {
     int depth = 0;
@@ -111,25 +148,32 @@ size_t markupEnd(const std::string &s, size_t p) {
             ++p;
             continue;
         }
-        if (s[p] == '{') {
+        if (s[p] == '{' && !literalOpen(s, p)) {
             p = braceEnd(s, p);
             continue;
         }
         if (s[p] != '<')
             continue;
+        if (s.compare(p, 4, "<!--") == 0) {
+            p = markupCommentEnd(s, p) - 1;
+            continue;
+        }
         bool closing = p + 1 < s.size() && s[p + 1] == '/';
         size_t q = p + 1;
         for (; q < s.size() && s[q] != '>'; ++q) {
-            if (s[q] == '"')
-                q = quotedEnd(s, q);
+            if (s[q] == '"' || (s[q] == '\'' && !closing))
+                q = quotedEnd(s, q, s[q]);
             else if (s[q] == '{')
                 q = braceEnd(s, q);
         }
         if (q == s.size())
             break;
+        size_t nameEnd = p + 1;
+        while (nameEnd < q && (part(s[nameEnd]) || s[nameEnd] == '-' || s[nameEnd] == ':' || s[nameEnd] == '.'))
+            ++nameEnd;
         if (closing)
             --depth;
-        else if (q == 0 || s[q - 1] != '/')
+        else if ((q == 0 || s[q - 1] != '/') && !htmlVoidTag(s.substr(p + 1, nameEnd - p - 1)))
             ++depth;
         if (depth == 0)
             return q;
@@ -462,7 +506,7 @@ Token Parser::identifier() {
         "finally", "throw",   "inst", "attr",  "true",     "false",    "null",
         "public",  "private", "void", "weak",  "and",      "or",       "not",
         "enum",    "interface", "extends", "implements", "match", "case", "super", "is",
-        "elements"};
+        "elements", "defer"};
     if (t.kind != "id" || reserved.count(t.text))
         throw Error(t.loc, "expected identifier");
     return t;
@@ -543,12 +587,19 @@ std::string Parser::markupName() {
     }
     return name;
 }
-std::vector<std::string> Parser::typeParameters() {
+std::vector<std::string> Parser::typeParameters(std::map<std::string, std::string> *bounds) {
     std::vector<std::string> names;
     if (!accept("<"))
         return names;
     do {
         names.push_back(identifier().text);
+        // `T implements Comparable`, `T extends Shape`, or `T is numeric` (also `comparable`,
+        // `hashable`) constrains the type argument.
+        if (accept("implements") || accept("extends") || accept("is")) {
+            auto bound = type();
+            if (bounds)
+                (*bounds)[names.back()] = bound;
+        }
     } while (accept(","));
     expect(">");
     return names;
@@ -626,16 +677,51 @@ EP Parser::stringExpr(const Token &t) {
             ++p;
             continue;
         }
+        if (literalOpen(t.text, p) || literalClose(t.text, p)) {
+            text += c;
+            continue;
+        }
         if (c == '{') {
             flush();
             auto e = braceEnd(t.text, p);
-            Parser sub(lex(t.text.substr(p + 1, e - p - 1)));
-            result->args.push_back(sub.expression());
+            auto inner = t.text.substr(p + 1, e - p - 1);
+            // `{value:spec}` formats with a spec such as `.2f` or `>8`: the first ':' outside
+            // brackets, braces, and quotes starts it.
+            std::string spec;
+            int depth = 0;
+            char quote = 0;
+            for (size_t i = 0; i < inner.size(); ++i) {
+                char d = inner[i];
+                if (quote) {
+                    if (d == '\\')
+                        ++i;
+                    else if (d == quote)
+                        quote = 0;
+                } else if (d == '"' || d == '\'')
+                    quote = d;
+                else if (d == '(' || d == '[' || d == '{')
+                    ++depth;
+                else if (d == ')' || d == ']' || d == '}')
+                    --depth;
+                else if (d == ':' && depth == 0) {
+                    spec = inner.substr(i + 1);
+                    inner.resize(i);
+                    break;
+                }
+            }
+            Parser sub(lex(inner));
+            auto value = sub.expression();
             if (sub.peek().kind != "eof")
                 throw Error(t.loc, "invalid interpolation expression");
+            if (!spec.empty() || inner.size() < e - p - 1) {
+                auto formatted = node("format", spec, t.loc);
+                formatted->args.push_back(std::move(value));
+                value = std::move(formatted);
+            }
+            result->args.push_back(std::move(value));
             p = e;
         } else if (c == '}')
-            throw Error(t.loc, "literal '}' must be doubled");
+            throw Error(t.loc, "literal '}' must be doubled or set off by whitespace");
         else
             text += c;
     }
@@ -684,12 +770,19 @@ EP Parser::markup() {
             if (std::find(e->names.begin(), e->names.end(), a) != e->names.end())
                 throw Error(token.loc, "duplicate attribute '" + a + "'");
             space();
-            if (p == s.size() || s[p++] != '=')
-                throw Error(token.loc, "attributes require '='");
-            space();
             EP value;
-            if (p < s.size() && s[p] == '"') {
-                auto end = quotedEnd(s, p);
+            if (p == s.size() || s[p] != '=') {
+                // A valueless attribute, as in HTML: <input disabled> is disabled="" (a true
+                // boolean attribute). `outer` marks the value as written without one.
+                e->names.push_back(a);
+                e->args.push_back(node("string", "", token.loc));
+                e->args.back()->outer = true;
+                continue;
+            }
+            ++p;
+            space();
+            if (p < s.size() && (s[p] == '"' || s[p] == '\'')) {
+                auto end = quotedEnd(s, p, s[p]);
                 value = stringExpr({s.substr(p + 1, end - p - 1), "string", token.loc});
                 if (value->kind == "string")
                     value->text = entities(value->text, token.loc);
@@ -700,8 +793,21 @@ EP Parser::markup() {
                 p = end + 1;
             } else if (p < s.size() && s[p] == '{')
                 value = embedded();
-            else
-                throw Error(token.loc, "attribute value requires quotes or {expression}");
+            else {
+                // An unquoted value runs to whitespace or the end of the tag, as in HTML.
+                size_t begin = p;
+                while (p < s.size() && !std::isspace(static_cast<unsigned char>(s[p])) &&
+                       s[p] != '>' && s.compare(p, 2, "/>") != 0) {
+                    if (s[p] == '"' || s[p] == '\'' || s[p] == '<' || s[p] == '=' || s[p] == '`' ||
+                        s[p] == '{' || s[p] == '}')
+                        throw Error(token.loc, "unquoted attribute values cannot contain " +
+                                                   std::string(1, s[p]) + "; quote the value");
+                    ++p;
+                }
+                if (begin == p)
+                    throw Error(token.loc, "attribute '" + a + "' needs a value after '='");
+                value = node("string", entities(s.substr(begin, p - begin), token.loc), token.loc);
+            }
             e->names.push_back(a);
             e->args.push_back(std::move(value));
             space();
@@ -714,6 +820,8 @@ EP Parser::markup() {
         }
         if (p == s.size() || s[p++] != '>')
             throw Error(token.loc, "expected '>'");
+        if (htmlVoidTag(tag))
+            return e;
         std::string text;
         auto flush = [&] {
             if (!text.empty()) {
@@ -725,6 +833,11 @@ EP Parser::markup() {
             }
         };
         while (p < s.size()) {
+            if (s.compare(p, 4, "<!--") == 0) {
+                // Text on both sides of a comment joins, so no flush.
+                p = markupCommentEnd(s, p);
+                continue;
+            }
             if (s.compare(p, 2, "</") == 0) {
                 flush();
                 p += 2;
@@ -745,11 +858,13 @@ EP Parser::markup() {
             } else if ((s[p] == '{' || s[p] == '}') && p + 1 < s.size() && s[p + 1] == s[p]) {
                 text += s[p];
                 p += 2;
+            } else if (literalOpen(s, p) || literalClose(s, p)) {
+                text += s[p++];
             } else if (s[p] == '{') {
                 flush();
                 e->args.push_back(embedded());
             } else if (s[p] == '}')
-                throw Error(token.loc, "literal '}' must be doubled");
+                throw Error(token.loc, "literal '}' must be doubled or set off by whitespace");
             else
                 text += s[p++];
         }
@@ -927,8 +1042,14 @@ EP Parser::outer() {
             tokens[i + 1].text == peek().text)
             callable = true;
     EP e;
-    if (callable && (peek(1).text == "-" || peek(1).text == "+" || peek(1).text == "not" ||
-                     peek(1).text == "[")) {
+    // `name[i]` (no space before '[') indexes; `print [1, 2]` passes an array.
+    // A sign starts an argument only when attached to it: `f -7` calls, `n - 7` subtracts.
+    auto attachedSign = [&](size_t n) {
+        return (peek(n).text == "-" || peek(n).text == "+") && peek(n).spaced &&
+               !peek(n + 1).spaced;
+    };
+    if (callable && (attachedSign(1) || peek(1).text == "not" ||
+                     (peek(1).text == "[" && peek(1).spaced))) {
         auto t = take();
         e = node("name", t.text, t.loc);
     } else
@@ -936,7 +1057,7 @@ EP Parser::outer() {
     auto k = peek().kind;
     if ((e->kind == "name" || e->kind == "member") &&
         (k == "id" || k == "int" || k == "real" || k == "string" || k == "char" || k == "markup" ||
-         peek().text == "[" || (callable && (peek().text == "-" || peek().text == "+")))) {
+         peek().text == "[" || (callable && attachedSign(0)))) {
         auto n = node("call", "", e->loc);
         n->args.push_back(std::move(e));
         do {
@@ -956,8 +1077,27 @@ std::vector<SP> Parser::block() {
     std::vector<SP> out;
     newlines();
     while (peek().kind != "eof" && peek().text != "end" && peek().text != "else" &&
-           peek().text != "catch" && peek().text != "finally" && peek().text != "case")
+           peek().text != "catch" && peek().text != "finally" && peek().text != "case") {
         out.push_back(statement());
+        for (auto &extra : pending)
+            out.push_back(std::move(extra));
+        pending.clear();
+    }
+    // `defer` runs its statement when the enclosing block exits: the rest of the block becomes
+    // the body of a try whose finally is the deferred statement. Later defers nest inside
+    // earlier ones, so they run in reverse order.
+    for (size_t i = out.size(); i-- > 0;) {
+        if (out[i]->kind != "defer")
+            continue;
+        auto t = std::make_unique<Stmt>();
+        t->kind = "try";
+        t->loc = out[i]->loc;
+        t->finalizer = std::move(out[i]->body);
+        for (size_t j = i + 1; j < out.size(); ++j)
+            t->body.push_back(std::move(out[j]));
+        out.resize(i);
+        out.push_back(std::move(t));
+    }
     return out;
 }
 SP Parser::statement() {
@@ -1092,6 +1232,23 @@ SP Parser::statement() {
         finish();
         return s;
     }
+    if (accept("defer")) {
+        s->kind = "defer";
+        if (peek().kind == "nl") {
+            finish();
+            s->body = block();
+            expect("end");
+            finish();
+        } else {
+            s->body.push_back(statement());
+            for (auto &extra : pending)
+                s->body.push_back(std::move(extra));
+            pending.clear();
+        }
+        if (s->body.empty())
+            throw Error(s->loc, "defer requires a statement");
+        return s;
+    }
     if (accept("return")) {
         s->kind = "return";
         if (peek().kind != "nl" && peek().kind != "eof")
@@ -1105,6 +1262,45 @@ SP Parser::statement() {
         return s;
     }
     bool isconst = accept("const"), inferred = accept("var");
+    if ((isconst || inferred) && (peek().text == "(" || peek().text == "[")) {
+        // var (a, b) = pair / var [x, y] = items: bind each element of a tuple or array to a
+        // name; `_` skips an element.
+        auto close = take().text == "(" ? ")" : "]";
+        std::vector<Token> names;
+        do {
+            names.push_back(peek().text == "_" ? take() : identifier());
+        } while (accept(","));
+        expect(close);
+        expect("=");
+        auto temporary = "$destructured" + std::to_string(++temporaries);
+        s->kind = "declare";
+        s->op = "const";
+        s->name = temporary;
+        s->expr = outer();
+        finish();
+        for (size_t i = 0; i < names.size(); ++i) {
+            if (names[i].text == "_")
+                continue;
+            auto d = std::make_unique<Stmt>();
+            d->kind = "declare";
+            d->op = isconst ? "const" : "var";
+            d->name = names[i].text;
+            d->loc = names[i].loc;
+            auto index = node("index", "", names[i].loc);
+            index->args.push_back(node("name", temporary, names[i].loc));
+            index->args.push_back(node("int", std::to_string(i), names[i].loc));
+            d->expr = std::move(index);
+            pending.push_back(std::move(d));
+        }
+        // A length check: destructuring needs exactly as many elements as names.
+        auto check = std::make_unique<Stmt>();
+        check->kind = "destructure";
+        check->name = temporary;
+        check->loc = s->loc;
+        check->op = std::to_string(names.size());
+        pending.insert(pending.begin(), std::move(check));
+        return s;
+    }
     if (isconst || inferred || typedDeclaration()) {
         s->kind = "declare";
         s->op = isconst ? "const" : "var";
@@ -1174,8 +1370,28 @@ Function Parser::function(const std::string &owner, bool signatureOnly) {
     Function f;
     f.loc = t.loc;
     f.owner = owner;
-    f.name = identifier().text;
-    f.typeParams = typeParameters();
+    if (!owner.empty() && peek().text == "operator" && peek(1).kind != "nl" &&
+        peek(1).text != "(") {
+        // Operator methods: `function operator +(Vec2 other) returns Vec2`, `operator []`
+        // (index read) and `operator []=` (index write).
+        take();
+        auto op = take();
+        static const std::set<std::string> overloadable = {"+", "-", "*", "/",  "//", "%",
+                                                           "==", "<", "<=", ">", ">=", "["};
+        if (!overloadable.count(op.text))
+            throw Error(op.loc, "operator '" + op.text + "' cannot be overloaded");
+        f.name = "operator" + op.text;
+        if (op.text == "[") {
+            expect("]");
+            f.name += "]";
+            if (peek().text == "=" && !peek().spaced) {
+                take();
+                f.name += "=";
+            }
+        }
+    } else
+        f.name = identifier().text;
+    f.typeParams = typeParameters(&f.typeBounds);
     if (accept("(")) {
         if (!accept(")")) {
             do {
@@ -1191,6 +1407,13 @@ Function Parser::function(const std::string &owner, bool signatureOnly) {
         }
     } else if (peek().text != "returns" && peek().kind != "nl" && peek().kind != "eof") {
         throw Error(peek().loc, "function declarations with parameters require parentheses");
+    }
+    if (f.name == "operator-" && f.params.empty())
+        f.name = "operator-()"; // unary minus
+    if (f.name.rfind("operator", 0) == 0 && f.name != "operator-()") {
+        size_t arity = f.name == "operator[]=" ? 2 : 1;
+        if (f.params.size() != arity)
+            throw Error(f.loc, f.name + " takes " + std::to_string(arity) + " parameter(s)");
     }
     if (accept("returns"))
         f.result = type();
@@ -1256,11 +1479,36 @@ Program Parser::parse() {
             en.loc = peek().loc;
             en.name = identifier().text;
             finish();
+            // Members with fields (`Circle(double radius)`) make an enum with data.
+            std::vector<std::vector<Param>> payloads;
+            std::vector<Location> locations;
+            bool data = false;
             while (peek().text != "end" && peek().kind != "eof") {
                 auto member = identifier();
                 if (std::find(en.members.begin(), en.members.end(), member.text) != en.members.end())
                     throw Error(member.loc, "duplicate enum member '" + member.text + "'");
                 en.members.push_back(member.text);
+                locations.push_back(member.loc);
+                payloads.emplace_back();
+                if (accept("(")) {
+                    data = true;
+                    if (!accept(")")) {
+                        do {
+                            Param field;
+                            field.loc = peek().loc;
+                            field.readonly = true;
+                            field.type = type();
+                            field.name = identifier().text;
+                            if (accept("="))
+                                field.value = expression();
+                            for (auto &other : payloads.back())
+                                if (other.name == field.name)
+                                    throw Error(field.loc, "duplicate field '" + field.name + "'");
+                            payloads.back().push_back(std::move(field));
+                        } while (accept(","));
+                        expect(")");
+                    }
+                }
                 if (!accept(","))
                     finish();
                 newlines();
@@ -1269,7 +1517,26 @@ Program Parser::parse() {
                 throw Error(en.loc, "enum requires at least one member");
             expect("end");
             finish();
-            p.enums.push_back(std::move(en));
+            if (!data)
+                p.enums.push_back(std::move(en));
+            else {
+                // The enum is a base class and each member a final subclass with readonly
+                // fields, named Enum.Member.
+                Class base;
+                base.name = en.name;
+                base.loc = en.loc;
+                for (size_t i = 0; i < en.members.size(); ++i) {
+                    Class variant;
+                    variant.name = en.name + "." + en.members[i];
+                    variant.loc = locations[i];
+                    variant.base = en.name;
+                    variant.variantOf = en.name;
+                    variant.fields = std::move(payloads[i]);
+                    base.variants.push_back(variant.name);
+                    p.classes.push_back(std::move(variant));
+                }
+                p.classes.push_back(std::move(base)); // last: it is the declared name
+            }
         } else if (accept("elements")) {
             ElementFamily family;
             family.loc = peek().loc;
@@ -1301,7 +1568,7 @@ Program Parser::parse() {
             c.isInterface = take().text == "interface";
             c.loc = peek().loc;
             c.name = identifier().text;
-            c.typeParams = typeParameters();
+            c.typeParams = typeParameters(&c.typeBounds);
             if (!c.isInterface && accept("extends"))
                 c.base = type();
             if (accept(c.isInterface ? "extends" : "implements"))
@@ -1310,13 +1577,26 @@ Program Parser::parse() {
                 } while (accept(","));
             finish();
             while (peek().text != "end" && peek().kind != "eof") {
-                if (peek().text == "function" && peek(1).text != "(")
+                // Members are public unless marked `private` (visible only inside the class).
+                auto modifier = peek();
+                bool hiddenMember = accept("private");
+                if (!hiddenMember)
+                    accept("public");
+                bool readonly = peek().text == "readonly" && peek(1).kind == "id" && accept("readonly");
+                if ((hiddenMember || readonly) && c.isInterface)
+                    throw Error(modifier.loc, "interface members cannot have modifiers");
+                if (peek().text == "function" && peek(1).text != "(") {
+                    if (readonly)
+                        throw Error(modifier.loc, "readonly applies to fields");
                     c.methods.push_back(function(c.name, c.isInterface));
-                else if (c.isInterface)
+                    c.methods.back().isPrivate = hiddenMember;
+                } else if (c.isInterface)
                     throw Error(peek().loc, "interfaces declare only function signatures");
                 else {
                     Param field;
                     field.loc = peek().loc;
+                    field.isPrivate = hiddenMember;
+                    field.readonly = readonly;
                     field.type = type();
                     field.name = identifier().text;
                     if (accept("="))
@@ -1335,8 +1615,14 @@ Program Parser::parse() {
                 throw Error(n.loc, "duplicate component");
             p.components[n.text] = expression();
             finish();
-        } else
+        } else {
             p.body.push_back(statement());
+            if (p.body.back()->kind == "defer")
+                throw Error(p.body.back()->loc, "defer must be inside a function or block");
+            for (auto &extra : pending)
+                p.body.push_back(std::move(extra));
+            pending.clear();
+        }
         std::string declared;
         if (p.functions.size() > nf)
             declared = p.functions.back().name;
@@ -1381,7 +1667,8 @@ std::vector<SP> cloneBody(const std::vector<SP> &body) {
 std::vector<Param> cloneParams(const std::vector<Param> &params) {
     std::vector<Param> out;
     for (auto &p : params)
-        out.push_back({p.name, p.type, p.value ? clone(*p.value) : nullptr, p.loc});
+        out.push_back({p.name, p.type, p.value ? clone(*p.value) : nullptr, p.loc, p.isPrivate,
+                       p.readonly});
     return out;
 }
 } // namespace
@@ -1420,7 +1707,9 @@ Function clone(const Function &f) {
     out.params = cloneParams(f.params);
     out.body = cloneBody(f.body);
     out.abstract = f.abstract;
+    out.isPrivate = f.isPrivate;
     out.typeParams = f.typeParams;
+    out.typeBounds = f.typeBounds;
     return out;
 }
 Class clone(const Class &c) {
@@ -1433,7 +1722,10 @@ Class clone(const Class &c) {
         out.methods.push_back(clone(m));
     out.interfaces = c.interfaces;
     out.typeParams = c.typeParams;
+    out.typeBounds = c.typeBounds;
     out.isInterface = c.isInterface;
+    out.variants = c.variants;
+    out.variantOf = c.variantOf;
     return out;
 }
 } // namespace fw

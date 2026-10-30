@@ -11,7 +11,8 @@ namespace fs = std::filesystem;
 const std::set<std::string> native = {"desktop", "core",    "html",        "fs",   "math",
                                       "os",      "time",    "json",        "web",  "testing",
                                       "collections", "io",  "net",         "regex", "thread",
-                                      "gc",      "svg"};
+                                      "gc",      "svg",     "crypto",      "encoding", "uuid",
+                                      "compress", "sqlite", "toml", "yaml"};
 // Types that native modules export, spelled module.type in source.
 const std::map<std::string, std::set<std::string>> nativeTypes = {
     {"json", {"value"}},
@@ -21,7 +22,8 @@ const std::map<std::string, std::set<std::string>> nativeTypes = {
     {"io", {"file"}},
     {"net", {"socket", "listener"}},
     {"thread", {"task", "mutex", "channel"}},
-    {"time", {"datetime"}}};
+    {"time", {"datetime"}},
+    {"sqlite", {"database"}}};
 struct Unit {
     Program program;
     std::string path, prefix;
@@ -31,8 +33,12 @@ struct Unit {
     bool html = false, svg = false;
     std::set<std::string> familyTags; // element family tags visible in this module
 };
+// Embedded library modules load from this virtual directory.
+const fs::path libraryDirectory = fs::path("/") / "<flywheel>" / "lib";
 class Loader {
     fs::path root;
+    std::map<std::string, std::string> packages; // package name -> directory
+    std::set<std::string> variants; // qualified Enum.Member classes of enums with data
     const std::map<std::string, std::string> *overlay = nullptr;
     std::map<std::string, std::unique_ptr<Unit>> units;
     std::vector<std::string> stack;
@@ -129,6 +135,13 @@ class Loader {
         }
         for (auto &a : e.args)
             expression(u, *a, locals);
+        // Enum.Member of an enum with data names the variant class.
+        if (e.kind == "member" && e.args[0]->kind == "name" &&
+            variants.count(e.args[0]->text + "." + e.text)) {
+            e.text = e.args[0]->text + "." + e.text;
+            e.kind = "name";
+            e.args.clear();
+        }
         if (e.lambda) {
             // Parameters and enclosing locals shadow module names inside the body.
             auto inner = locals;
@@ -141,6 +154,37 @@ class Loader {
                 inner.insert(param.name);
             }
             statements(u, f.body, inner);
+        }
+    }
+    // A match pattern. Destructuring patterns (`Shape.Circle(r)`, `[x, y]`) bind their bare
+    // names (other than `_`) instead of reading them.
+    void pattern(Unit &u, Expr &e, const std::set<std::string> &locals,
+                 std::set<std::string> &bound) {
+        size_t first = 0;
+        if (e.kind == "call" && !e.args.empty()) {
+            expression(u, *e.args[0], locals);
+            first = 1;
+            if (e.args[0]->kind != "name" || !variants.count(e.args[0]->text)) {
+                for (size_t i = 1; i < e.args.size(); ++i)
+                    expression(u, *e.args[i], locals);
+                e.loc.file = u.path;
+                return;
+            }
+        } else if (e.kind != "array") {
+            expression(u, e, locals);
+            return;
+        }
+        e.loc.file = u.path;
+        for (size_t i = first; i < e.args.size(); ++i) {
+            auto &a = *e.args[i];
+            if (a.kind == "name" && a.text.find('<') == std::string::npos &&
+                a.text.find('.') == std::string::npos) {
+                a.loc.file = u.path;
+                a.kind = "bind";
+                if (a.text != "_" && !bound.insert(a.text).second)
+                    throw Error(a.loc, "'" + a.text + "' is bound twice in one pattern");
+            } else
+                pattern(u, a, locals, bound);
         }
     }
     void statements(Unit &u, std::vector<SP> &body, std::set<std::string> locals,
@@ -162,13 +206,16 @@ class Loader {
             statements(u, s.body, inner);
             statements(u, s.other, locals);
             statements(u, s.finalizer, locals);
-            for (auto &values : s.patterns)
-                for (auto &v : values)
-                    expression(u, *v, locals);
+            std::vector<std::set<std::string>> bound(s.patterns.size());
+            for (size_t i = 0; i < s.patterns.size(); ++i)
+                for (auto &v : s.patterns[i])
+                    pattern(u, *v, locals, bound[i]);
             for (size_t i = 0; i < s.catches.size(); ++i) {
                 s.catchTypes[i] = type(u, s.catchTypes[i], s.loc);
                 auto catchLocals = locals;
                 catchLocals.insert(s.catchNames[i]);
+                if (i < bound.size())
+                    catchLocals.insert(bound[i].begin(), bound[i].end());
                 if (i < s.guards.size() && s.guards[i])
                     expression(u, *s.guards[i], catchLocals);
                 statements(u, s.catches[i], catchLocals);
@@ -179,12 +226,16 @@ class Loader {
                 else
                     locals.insert(s.name);
             }
+            if (s.kind == "destructure" && global)
+                s.name = u.own.at(s.name);
         }
     }
     void function(Unit &u, Function &f) {
         f.loc.file = u.path;
         std::set<std::string> locals;
         f.result = type(u, f.result, f.loc);
+        for (auto &[name, bound] : f.typeBounds)
+            bound = type(u, bound, f.loc);
         for (auto &param : f.params) {
             param.loc.file = u.path;
             param.type = type(u, param.type, param.loc);
@@ -209,9 +260,12 @@ class Loader {
         if (units.count(canonical))
             return *units.at(canonical);
         std::ostringstream text;
+        bool library = path.parent_path() == libraryDirectory;
         if (auto it = overlay ? overlay->find(canonical) : decltype(overlay->end()){};
             overlay && it != overlay->end())
             text << it->second;
+        else if (library)
+            text << libraryModules().at(path.stem().string());
         else {
             std::ifstream input(canonical, std::ios::binary);
             if (!input)
@@ -237,8 +291,11 @@ class Loader {
         };
         for (auto &f : u.program.functions)
             add(f.name, f.loc);
-        for (auto &c : u.program.classes)
+        for (auto &c : u.program.classes) {
             add(c.name, c.loc);
+            if (!c.variantOf.empty())
+                variants.insert(u.prefix + c.name);
+        }
         for (auto &en : u.program.enums)
             add(en.name, en.loc);
         for (auto &[name, e] : u.program.components)
@@ -259,7 +316,11 @@ class Loader {
             std::replace(relative.begin(), relative.end(), '.',
                          static_cast<char>(fs::path::preferred_separator));
             fs::path found;
-            for (auto base : {path.parent_path(), root}) {
+            // Library modules import only other library and native modules.
+            std::vector<fs::path> bases;
+            if (!library)
+                bases = {path.parent_path(), root};
+            for (auto base : bases) {
                 for (auto extension : {".fw", ".fly"}) {
                     auto candidate = base / (relative + extension);
                     if (fs::is_regular_file(candidate)) {
@@ -277,6 +338,26 @@ class Loader {
                 if (!found.empty())
                     break;
             }
+            // Packages from the project manifest: `import pkg` loads the package's main module,
+            // `import pkg.part` its part.fw.
+            auto head = name.substr(0, name.find('.'));
+            if (found.empty() && !library && packages.count(head)) {
+                fs::path directory = packages.at(head);
+                auto rest = name.find('.') == std::string::npos ? "" : relative.substr(head.size() + 1);
+                for (auto extension : {".fw", ".fly"}) {
+                    auto candidate =
+                        directory / (rest.empty() ? packageMain(directory.string(), head)
+                                                  : rest + extension);
+                    if (fs::is_regular_file(candidate)) {
+                        found = candidate;
+                        break;
+                    }
+                }
+                if (found.empty())
+                    throw Error(importLoc, "package '" + head + "' has no module '" + name + "'");
+            }
+            if (found.empty() && libraryModules().count(name))
+                found = libraryDirectory / (name + ".fw");
             if (!found.empty()) {
                 auto &dependency = load(found);
                 u.modules[alias] = &dependency;
@@ -324,6 +405,12 @@ class Loader {
             c.loc.file = u.path;
             if (!c.base.empty())
                 c.base = type(u, c.base, c.loc);
+            for (auto &[name, bound] : c.typeBounds)
+                bound = type(u, bound, c.loc);
+            for (auto &v : c.variants)
+                v = u.own.at(v);
+            if (!c.variantOf.empty())
+                c.variantOf = u.own.at(c.variantOf);
             for (auto &i : c.interfaces)
                 i = type(u, i, c.loc);
             for (auto &field : c.fields) {
@@ -362,6 +449,7 @@ class Loader {
         : overlay(overlay) {}
     Program run(const std::string &file) {
         root = fs::absolute(file).parent_path();
+        packages = packageRoots(fs::absolute(file).string());
         load(fs::absolute(file));
         return std::move(merged);
     }

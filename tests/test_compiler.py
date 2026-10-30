@@ -215,6 +215,10 @@ POSITIVE.update(
             'class Person\nstring name\nint age = 15\nend\nvar person = Person.from_json("{{\\"name\\": \\"Danny\\"}}")\nprint person.name\nprint person.age\nvar other = Person.from_json("{{\\"name\\": \\"D\\", \\"age\\": 9223372036854775807}}")\nprint other.age',
             "Danny\n15\n9223372036854775807\n",
         ),
+        "markup_comments": (
+            'import html.*\nprint <div><!-- note --><p>hi</p></div>\nprint <p>a <!-- {x} </p> --> b</p>\nprint <ul>\n    <!-- multi\n         line -->\n    <li>one</li>\n</ul>\nprint <><!----><i>x</i></>',
+            "<div><p>hi</p></div>\n<p>a  b</p>\n<ul><li>one</li></ul>\n<i>x</i>\n",
+        ),
         "attribute_entities": (
             'import html.*\nprint html.render(<p title="&quot;&amp;">&#x1F600; # {{ok}}</p>)',
             '<p title="&quot;&amp;">😀 # {ok}</p>\n',
@@ -1126,6 +1130,7 @@ NEGATIVE = {
         "missing required",
     ),
     "mismatch": ("import html.*\nvar t = <p>test</div>", "mismatched"),
+    "markup_comment_unterminated": ("import html.*\nvar t = <p>a <!-- oops </p>", "unterminated markup comment"),
     "fragment_close": ("import html.*\nvar t = <p>test</>", "mismatched"),
     "null": ("string s = null", "cannot convert"),
     "wrong_type": ('int i = "text"', "cannot convert"),
@@ -2110,6 +2115,197 @@ MODULE_CASES.extend(
 MODULE_ERRORS.append(("self_import", {"main.fw": "import main"}, "module 'main' imports itself"))
 
 
+# 2.3 beta-3: language and library additions.
+POSITIVE.update(
+    {
+        "literal_braces": (
+            'import html.*\nvar c = "red"\nvar name = "Ann"\n'
+            'print "body { color: {c}; } {{x}}"\n'
+            'print "function f() {\n  return {name};\n}"\n'
+            'print "{ name }"\n'
+            'print <style>p { color: {c}; }</style>\n',
+            "body { color: red; } {x}\n"
+            "function f() {\n  return Ann;\n}\n"
+            "{ name }\n"
+            "<style>p { color: red; }</style>\n",
+        ),
+        "format_specs": (
+            'var price = 1234.5\nvar n = 42\n'
+            'print "[{price:.2f}] [{n:>6}] [{n:<4}|] [{n:^6}] [{n:05}] [{price:,.1f}] [{1234567:,}]"\n'
+            'print "[{255:x}] [{255:#X}] [{5:b}] [{-3:+}] [{0.256:.1%}] [{"hi":*^6}] [{"abcdef":.3}] [{n:.1f}]"\n'
+            'try\n    print "{n:q}"\ncatch ValueError e\n    print e.message\nend\n',
+            "[1234.50] [    42] [42  |] [  42  ] [00042] [1,234.5] [1,234,567]\n"
+            "[ff] [0XFF] [101] [-3] [25.6%] [**hi**] [abc] [42.0]\n"
+            "unknown integer format type 'q'\n",
+        ),
+        "data_enums_and_destructuring": (
+            "enum Shape\n    Circle(double radius)\n    Rect(double w, double h)\n    Empty\nend\n"
+            "function area(Shape s) returns double\n    match s\n        case Shape.Circle(r) then\n"
+            "            return 3.0 * r * r\n        case Shape.Rect(w, h) if w == h then\n"
+            "            return w * w\n        case Shape.Rect(w, h) then\n            return w * h\n"
+            "        case Shape.Empty then\n            return 0.0\n    end\nend\n"
+            "Shape[] shapes = [Shape.Circle(1.0), Shape.Rect(2.0, 3.0), Shape.Rect(2.0, 2.0), Shape.Empty]\n"
+            "for s in shapes do\n    print s, area(s)\nend\n"
+            "print Shape.Circle(1.0) == Shape.Circle(1.0), Shape.Circle(1.0) != Shape.Circle(2.0), Shape.Empty == Shape.Empty\n"
+            "match [Shape.Rect(1.0, 2.0), Shape.Empty]\n    case [Shape.Rect(w, _), Shape.Empty] then\n"
+            "        print \"nested\", w\n    else\n        print \"no\"\nend\n"
+            "int[] xs = [1, 2]\nmatch xs\n    case [x, y] then\n        print x + y\n    else\n        print 0\nend\n"
+            "var (name, count) = [\"a\", 3]\nvar [p, _, q] = [1, 2, 3]\nprint name, count, p, q\n"
+            "try\n    var [m, k] = [1, 2, 3]\ncatch ValueError e\n    print e.message\nend\n",
+            "Shape.Circle(radius=1) 3\nShape.Rect(w=2, h=3) 6\nShape.Rect(w=2, h=2) 4\nShape.Empty 0\n"
+            "true true true\nnested 1\n3\na 3 1 3\ncannot destructure 3 element(s) into 2 name(s)\n",
+        ),
+        "operators_visibility_defer": (
+            "class Vec\n    readonly int x\n    readonly int y\n    private int secret = 7\n"
+            "    function operator +(Vec o) returns Vec\n        return Vec(inst x + o.x, inst y + o.y)\n    end\n"
+            "    function operator -() returns Vec\n        return Vec(-inst x, -inst y)\n    end\n"
+            "    function operator ==(Vec o) returns bool\n        return inst x == o.x and inst y == o.y\n    end\n"
+            "    function operator <(Vec o) returns bool\n        return inst x < o.x\n    end\n"
+            "    function operator [](int i) returns int\n        if i == 0 then\n            return inst x\n        end\n"
+            "        return inst y\n    end\n    function to_string returns string\n        return \"<{inst x},{inst y}>\"\n    end\n"
+            "    function peek returns int\n        return inst secret\n    end\nend\n"
+            "var a = Vec(1, 2)\nvar b = a + Vec(3, 4)\nprint b, -a, a == Vec(1, 2), a != b, a < b, a >= b, b[1], a.peek()\n"
+            "function work returns int\n    defer print \"first in, last out\"\n    defer\n        print \"second\"\n    end\n"
+            "    print \"body\"\n    return 1\nend\nprint work()\n"
+            "var frozen = [3, 1].freeze()\ntry\n    frozen.push(2)\ncatch ValueError e\n    print e.message, frozen.is_frozen()\nend\n"
+            'print "b" > "a", "abc" < "abd"\n',
+            "<4,6> <-1,-2> true true true false 6 7\nbody\nsecond\nfirst in, last out\n1\n"
+            "cannot modify a frozen array true\ntrue true\n",
+        ),
+        "generic_constraints_and_methods": (
+            "interface Named\n    function label returns string\nend\nclass Dog implements Named\n    string name\n"
+            "    function label returns string\n        return inst name\n    end\nend\n"
+            "function shout<T implements Named>(T item) returns string\n    return item.label().upper()\nend\n"
+            "function biggest<T is comparable>(T[] items) returns T\n    var best = items[0]\n    for x in items do\n"
+            "        if x > best then\n            best = x\n        end\n    end\n    return best\nend\n"
+            "class Box<T>\n    T value\n    function map<U>(function(T) returns U f) returns Box<U>\n"
+            "        return Box<U>(f(inst value))\n    end\nend\n"
+            "print shout(Dog(\"rex\")), biggest([3, 9, 2]), biggest([\"b\", \"c\", \"a\"])\n"
+            "print Box(4).map(function(int x) => \"n{x}\").value\n",
+            "REX 9 c\nn4\n",
+        ),
+        "crypto_encoding_compress": (
+            "import crypto\nimport encoding\nimport compress\nimport uuid\n"
+            'print crypto.sha256("abc")\nprint crypto.sha1("abc"), crypto.md5("")\n'
+            'print crypto.hmac_sha256("key", "The quick brown fox jumps over the lazy dog")\n'
+            'print encoding.base64_encode("hello?"), encoding.base64url_encode("hello?"), encoding.base64_decode("aGk=")\n'
+            'print encoding.hex_encode("hi"), encoding.url_encode("a b&é"), encoding.form_decode("a+b%21")\n'
+            'var text = "abcabcabc-" * 100\nvar z = compress.gzip(text)\n'
+            'print z.length < 100, compress.gunzip(z) == text, compress.unzlib(compress.zlib(text, 9)) == text, compress.crc32("123456789")\n'
+            'var files = compress.unzip(compress.zip({"a.txt": "alpha", "dir/b.txt": text}))\nprint files["a.txt"], files["dir/b.txt"] == text\n'
+            'var id = uuid.v4()\nprint uuid.is_valid(id), id[14], uuid.v7()[14], crypto.random_hex(4).length, crypto.secure_equal("a", "a")\n',
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\n"
+            "a9993e364706816aba3e25717850c26c9cd0d89d d41d8cd98f00b204e9800998ecf8427e\n"
+            "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8\n"
+            "aGVsbG8/ aGVsbG8_ hi\n6869 a%20b%26%C3%A9 a b!\ntrue true true 3421780262\nalpha true\ntrue 4 7 8 true\n",
+        ),
+        "config_formats": (
+            "import toml\nimport yaml\nimport json\nimport csv\n"
+            'var t = toml.parse("title = \\"x\\"\\n[server]\\nports = [80, 443]\\n[[users]]\\nname = \\"a\\"\\n")\n'
+            "print json.stringify(t)\n"
+            'var y = yaml.parse("name: demo\\nbase: &b\\n  retries: 3\\nprod:\\n  <<: *b\\n  debug: false\\nitems:\\n  - 1\\n  - two\\ntext: |\\n  line\\n")\n'
+            "print json.stringify(y)\n"
+            'print csv.parse("a,\\"b,c\\"\\n1,\\"say \\"\\"hi\\"\\"\\"\\n"), csv.format([["x", "y,z"]]).trim()\n',
+            '{"server":{"ports":[80,443]},"title":"x","users":[{"name":"a"}]}\n'
+            '{"base":{"retries":3},"items":[1,"two"],"name":"demo","prod":{"debug":false,"retries":3},"text":"line\\n"}\n'
+            '[["a", "b,c"], ["1", "say \\"hi\\""]] x,"y,z"\n',
+        ),
+        "library_modules": (
+            "import url\nimport bigint\nimport decimal\nimport args\nimport html\n"
+            'var u = url.parse("HTTPS://me@Example.com:8443/a/b?x=1&y=two+words#top")\n'
+            "print u.host, u.port, u.path, u.params(), url.join(\"http://a/b/c/d;p?q\", \"../g\")\n"
+            'var f = bigint.of(1)\nfor n in 1..25 do\n    f = f * bigint.of(n)\nend\nprint f, f // bigint.parse("1000000"), bigint.of(2).pow(70)\n'
+            'print decimal.parse("0.1") + decimal.parse("0.2"), decimal.parse("2.675").round(2), decimal.of(1) / decimal.of(8)\n'
+            'var cli = args.Parser("tool")\ncli.flag("verbose", "v", "more")\ncli.option("width", "w", "w", "80")\ncli.positional("files", "in", true)\n'
+            'var p = cli.parse_or_throw(["-v", "--width=5", "a", "b"])\nprint p.flag("verbose"), p.integer("width"), p.list("files")\n'
+            'var doc = html.parse("<ul><li>one<li class=x>two</ul><p>a &amp; b")\n'
+            'print html.query_all(doc, "li").length, doc\n',
+            'example.com 8443 /a/b {"x": "1", "y": "two words"} http://a/b/g\n'
+            "15511210043330985984000000 15511210043330985984 1180591620717411303424\n"
+            "0.3 2.68 0.125\ntrue 5 [\"a\", \"b\"]\n"
+            '2 <ul><li>one</li><li class="x">two</li></ul><p>a &amp; b</p>\n',
+        ),
+    }
+)
+POSITIVE.update(
+    {
+        "markup_html_attributes": (
+            "import html.*\n"
+            "print <div class=\"a\">x</div>, <div class='b'>y</div>, <div class=c>z</div>\n"
+            "print <span class='it\"s {1 + 1}'>s</span>, <p class=a&amp;b>t</p>\n"
+            "print <input type=checkbox checked class=box>, <input disabled={false}>\n"
+            "print <option selected value=2>x</option>\n"
+            "var items = [<li class=first>1</li>, <li class='second'>2</li>]\nprint items\n"
+            "print <p>a<br>b<img src=x.png alt=pic>c<hr/></p>\n"
+            "var a = 1\nvar b = 2\nvar c = 3\nvar d = 1\nprint a <b and c> d\n",
+            '<div class="a">x</div> <div class="b">y</div> <div class="c">z</div>\n'
+            '<span class="it&quot;s 2">s</span> <p class="a&amp;b">t</p>\n'
+            '<input type="checkbox" checked="" class="box"> <input>\n'
+            '<option selected="" value="2">x</option>\n'
+            '[<li class="first">1</li>, <li class="second">2</li>]\n'
+            '<p>a<br>b<img src="x.png" alt="pic">c<hr></p>\n'
+            "true\n",
+        ),
+    }
+)
+NEGATIVE.update(
+    {
+        "unquoted_attribute_equals": ("import html.*\nprint <a href=/x?a=1>l</a>", "unquoted attribute values cannot contain ="),
+        "attribute_missing_value": ("import html.*\nprint <p class=>x</p>", "attribute 'class' needs a value after '='"),
+        "boolean_attribute_string": ('import html.*\nprint <input disabled="yes">', "boolean attribute 'disabled' requires bool"),
+    }
+)
+NEGATIVE.update(
+    {
+        "private_field": (
+            "class A\n    private int n = 1\nend\nprint A().n",
+            "field 'n' is private to class A",
+        ),
+        "private_method": (
+            "class A\n    private function f returns int\n        return 1\n    end\nend\nprint A().f()",
+            "method 'f' is private to class A",
+        ),
+        "readonly_field": (
+            "class A\n    readonly int n\nend\nvar a = A(1)\na.n = 2",
+            "field 'n' is readonly",
+        ),
+        "data_enum_exhaustive": (
+            "enum S\n    A(int x)\n    B\nend\nfunction f(S s) returns int\n    match s\n"
+            "        case S.A(x) then\n            return x\n    end\nend\nprint f(S.B)",
+            "match is not exhaustive (missing S.B)",
+        ),
+        "data_enum_base": ("enum S\n    A(int x)\nend\nvar s = S()", "enum S is constructed through a member"),
+        "generic_bound": (
+            "interface N\n    function n returns int\nend\nfunction f<T implements N>(T x) returns int\n"
+            "    return x.n()\nend\nprint f(1)",
+            "type argument int for T of f does not satisfy 'T implements N'",
+        ),
+        "missing_operator": ("class A\n    int n\nend\nprint A(1) * A(2)", "class A does not define operator *"),
+        "defer_top_level": ('defer print "x"', "defer must be inside a function or block"),
+        "destructure_tuple_length": ("var (a, b) = [1, \"x\", 2.0]", "cannot destructure a tuple of 3 elements into 2 names"),
+    }
+)
+TRAPS.update(
+    {
+        "frozen_map": ('var m = {"a": 1}.freeze()\nm["b"] = 2', "cannot modify a frozen map"),
+    }
+)
+MODULE_CASES.extend(
+    [
+        (
+            "data_enum_across_modules",
+            {
+                "main.fw": "import shapes\nvar s = shapes.Shape.Circle(2.0)\nmatch s\n"
+                "    case shapes.Shape.Circle(r) then\n        print r\n    else\n        print 0\nend\n"
+                "print shapes.Shape.Square(1.0) == shapes.Shape.Square(1.0)",
+                "shapes.fw": "enum Shape\n    Circle(double r)\n    Square(double side)\nend",
+            },
+            "2\ntrue\n",
+        ),
+    ]
+)
+
+
 class CompilerTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="flywheel-test-")
@@ -2908,6 +3104,165 @@ print web.static("/assets", "public", {port})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("define i32 @main(i32 %0, ptr %1)", ir.read_text())
         self.assertFalse((self.root / "case").exists())
+
+    def test_beta3_tooling(self):
+        # Test fixtures, expected errors, and coverage.
+        suite = self.root / "fixtures"
+        suite.mkdir()
+        (suite / "shapes.fw").write_text(
+            "function area(int w, int h) returns int\n    if w < 0 then\n"
+            "        throw ValueError(\"negative\")\n    end\n    return w * h\nend\n",
+            encoding="utf-8",
+        )
+        (suite / "test_shapes.fw").write_text(
+            "import testing\nimport shapes\nint[] log = []\nfunction setup\n    log.push(1)\nend\n"
+            "function teardown\n    log.push(2)\nend\nfunction test_area\n    testing.assert_equal(shapes.area(2, 3), 6)\nend\n"
+            "function test_error\n    var e = testing.expect_error(ValueError, function() => shapes.area(-1, 1))\n"
+            "    testing.assert_equal(e.message, \"negative\")\nend\n"
+            "function test_missing_error\n    testing.expect_error(ValueError, function() => shapes.area(1, 1))\nend\n"
+            "function teardown_all\n    print \"log\", log\nend\n",
+            encoding="utf-8",
+        )
+        result = self.command("test", suite / "test_shapes.fw", "--coverage")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("  ok   test_area", result.stdout)
+        self.assertIn("  ok   test_error", result.stdout)
+        self.assertIn("  FAIL test_missing_error: expected ValueError, but nothing was raised", result.stdout)
+        self.assertIn("log [1, 2, 1, 2, 1, 2]", result.stdout)
+        self.assertIn("shapes.fw  3/3 lines (100%)", result.stdout)
+        self.assertIn("DA:3,1", (self.root / "coverage.lcov").read_text())
+
+        # The race detector stops on unsynchronized access and accepts synchronized code.
+        self.source.write_text(
+            "import thread\nint counter = 0\nfunction bump\n    for i in 0..<200 do\n        counter += 1\n    end\nend\n"
+            "var a = thread.spawn(bump)\nvar b = thread.spawn(bump)\na.join()\nb.join()\n",
+            encoding="utf-8",
+        )
+        result = self.command("run", "--race", self.source)
+        self.assertEqual(result.returncode, 66)
+        self.assertIn("data race on global variable 'counter'", result.stderr)
+        self.source.write_text(
+            "import thread\nint[] xs = []\nvar lock = thread.mutex()\nfunction add\n    for i in 0..<100 do\n"
+            "        lock.lock()\n        xs.push(i)\n        lock.unlock()\n    end\nend\n"
+            "var a = thread.spawn(add)\nvar b = thread.spawn(add)\na.join()\nb.join()\nxs.push(0)\nprint xs.length\n",
+            encoding="utf-8",
+        )
+        result = self.command("run", "--race", self.source)
+        self.assertEqual((result.returncode, result.stdout), (0, "201\n"), result.stderr)
+
+        # Installed packages: the nearest .flywheel-modules (directories or .link files), then
+        # the installation-wide modules directory. Pulley installs them; flywheel only reads them.
+        app = self.root / "app"
+        (app / "src").mkdir(parents=True)
+        modules = app / ".flywheel-modules"
+        (modules / "geometry").mkdir(parents=True)
+        (modules / "geometry" / "pulley.toml").write_text('[package]\nname = "geometry"\nmain = "geo.fw"\n', encoding="utf-8")
+        (modules / "geometry" / "geo.fw").write_text("function double_it(int n) returns int\n    return n * 2\nend\n", encoding="utf-8")
+        (modules / "geometry" / "extra.fw").write_text("function triple(int n) returns int\n    return n * 3\nend\n", encoding="utf-8")
+        linked = self.root / "linked"
+        linked.mkdir()
+        (linked / "linked.fw").write_text('function hi returns string\n    return "linked"\nend\n', encoding="utf-8")
+        (modules / "linked.link").write_text(str(linked) + "\n", encoding="utf-8")
+        home = self.root / "flywheel-home"
+        (home / "modules" / "shared").mkdir(parents=True)
+        (home / "modules" / "shared" / "shared.fw").write_text("function g returns int\n    return 7\nend\n", encoding="utf-8")
+        (app / "src" / "app.fw").write_text(
+            "import geometry\nimport geometry.extra\nimport linked\nimport shared\n"
+            "print geometry.double_it(4), extra.triple(2), linked.hi(), shared.g()\n", encoding="utf-8")
+        result = subprocess.run([COMPILER, "run", app / "src" / "app.fw"], cwd=self.root, capture_output=True,
+                                text=True, timeout=60, env=dict(os.environ, FLYWHEEL_HOME=str(home)))
+        self.assertEqual((result.returncode, result.stdout), (0, "8 6 linked 7\n"), result.stderr)
+        result = self.command("get")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("managed by Pulley", result.stderr)
+
+        # Documentation from comments.
+        (self.root / "lib.fw").write_text(
+            "# Helpers.\n\n# Adds `n`.\nfunction add(int n) returns int\n    return n + 1\nend\n"
+            "private function hidden\n    print 1\nend\n",
+            encoding="utf-8",
+        )
+        result = self.command("doc", self.root / "lib.fw", "-o", self.root / "lib.html")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        page = (self.root / "lib.html").read_text()
+        self.assertIn("<p>Adds <code>n</code>.</p>", page)
+        self.assertNotIn("hidden", page)
+
+        # The REPL keeps declarations and earlier statements.
+        repl = subprocess.run([COMPILER, "repl"], input="var x = 4\nfunction sq(int n) returns int\n"
+                              "    return n * n\nend\nsq(x)\nx = 5\nsq(x)\n", cwd=self.root,
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(repl.returncode, 0, repl.stderr)
+        self.assertIn("16\n", repl.stdout)
+        self.assertIn("25\n", repl.stdout)
+
+        # Debug builds describe locals.
+        self.source.write_text("function f(int n) returns int\n    var total = n * 2\n    return total\nend\nprint f(1)\n",
+                               encoding="utf-8")
+        result = self.command("check", "-g", self.source, "--emit-ir", self.root / "debug.ll")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('!DILocalVariable(name: "total"', (self.root / "debug.ll").read_text())
+
+    def test_language_server_navigation(self):
+        (self.root / "geo.fw").write_text(
+            "# Area of a rectangle.\nfunction area(int w, int h) returns int\n    return w * h\nend\n"
+            "class Point\n    int x\n    function norm returns int\n        return inst x * inst x\n    end\nend\n",
+            encoding="utf-8",
+        )
+        main = self.root / "main.fw"
+        text = ("import geo\nvar total = geo.area(2, 3)\nvar p = geo.Point(1)\n"
+                "function twice(int value) returns int\n    return value * 2\nend\nprint total, p.norm(), \"{total}\"\n")
+        main.write_text(text, encoding="utf-8")
+        server = subprocess.Popen([COMPILER, "lsp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, cwd=self.root)
+        self.addCleanup(server.kill)
+
+        def send(message):
+            body = json.dumps(message).encode()
+            server.stdin.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+            server.stdin.flush()
+
+        def receive():
+            length = 0
+            while True:
+                line = server.stdout.readline().strip()
+                if not line:
+                    break
+                if line.startswith(b"Content-Length:"):
+                    length = int(line.split(b":")[1])
+            return json.loads(server.stdout.read(length))
+
+        def request(id_, method, params):
+            send({"jsonrpc": "2.0", "id": id_, "method": method, "params": params})
+            while True:
+                message = receive()
+                if message.get("id") == id_:
+                    return message.get("result")
+
+        uri = main.resolve().as_uri()
+        capabilities = request(1, "initialize", {})["capabilities"]
+        for provider in ("hoverProvider", "definitionProvider", "referencesProvider", "renameProvider"):
+            self.assertTrue(capabilities[provider])
+        send({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {"textDocument": {"uri": uri, "text": text}}})
+        self.assertEqual(receive()["params"]["diagnostics"], [])
+
+        def at(line, character):
+            return {"textDocument": {"uri": uri}, "position": {"line": line, "character": character}}
+
+        definition = request(2, "textDocument/definition", at(1, 17))
+        self.assertTrue(definition["uri"].endswith("geo.fw"))
+        self.assertEqual(definition["range"]["start"], {"line": 1, "character": 9})
+        hover = request(3, "textDocument/hover", at(1, 17))["contents"]["value"]
+        self.assertIn("function area(int w, int h) returns int", hover)
+        self.assertIn("Area of a rectangle.", hover)
+        references = request(4, "textDocument/references", at(1, 5))
+        self.assertEqual([r["range"]["start"]["line"] for r in references], [1, 6, 6])
+        edit = request(5, "textDocument/rename", {**at(3, 20), "newName": "amount"})
+        self.assertEqual(len(edit["changes"][uri]), 2)
+        labels = [item["label"] for item in request(6, "textDocument/completion", at(1, 16))["items"]]
+        self.assertEqual(labels, ["area", "Point"])
+        symbols = [s["name"] for s in request(7, "textDocument/documentSymbol", {"textDocument": {"uri": uri}})]
+        self.assertEqual(symbols, ["total", "p", "twice"])
+        request(8, "shutdown", None)
 
 
 if __name__ == "__main__":

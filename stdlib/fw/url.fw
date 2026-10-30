@@ -1,0 +1,267 @@
+# URL parsing, building, and percent-encoding (RFC 3986).
+import encoding
+
+# The parts of a URL. `port` is 0 when the URL names none; `query` and `fragment` exclude
+# their `?` and `#`.
+class Url
+    string scheme = ""
+    string user = ""
+    string host = ""
+    int port = 0
+    string path = ""
+    string query = ""
+    string fragment = ""
+
+    # The decoded query parameters; a repeated name keeps its last value.
+    function params returns map<string, string>
+        return parse_query(inst query)
+    end
+
+    # The port, or the scheme's default (80 for http, 443 for https, 0 if unknown).
+    function effective_port returns int
+        if inst port != 0 then
+            return inst port
+        end
+        if inst scheme == "https" or inst scheme == "wss" then
+            return 443
+        end
+        if inst scheme == "http" or inst scheme == "ws" then
+            return 80
+        end
+        return 0
+    end
+
+    # The URL as text.
+    function to_string returns string
+        var out = ""
+        if inst scheme != "" then
+            out = inst scheme + ":"
+        end
+        if inst host != "" or inst scheme == "file" then
+            out += "//"
+            if inst user != "" then
+                out += inst user + "@"
+            end
+            if inst host.contains(":") then
+                out += "[" + inst host + "]"
+            else
+                out += inst host
+            end
+            if inst port != 0 then
+                out += ":" + string(inst port)
+            end
+        end
+        out += inst path
+        if inst query != "" then
+            out += "?" + inst query
+        end
+        if inst fragment != "" then
+            out += "#" + inst fragment
+        end
+        return out
+    end
+end
+
+# Splits URL text into its parts. Raises ValueError for an invalid port or IPv6 host.
+function parse(string text) returns Url
+    var u = Url()
+    var rest = text.trim()
+    var hash = rest.find("#")
+    if hash >= 0 then
+        u.fragment = rest.slice(hash + 1)
+        rest = rest.slice(0, hash)
+    end
+    var question = rest.find("?")
+    if question >= 0 then
+        u.query = rest.slice(question + 1)
+        rest = rest.slice(0, question)
+    end
+    var colon = rest.find(":")
+    var slash = rest.find("/")
+    if colon > 0 and (slash < 0 or colon < slash) and valid_scheme(rest.slice(0, colon)) then
+        u.scheme = rest.slice(0, colon).lower()
+        rest = rest.slice(colon + 1)
+    end
+    if rest.starts_with("//") then
+        rest = rest.slice(2)
+        var end_ = rest.find("/")
+        var authority = rest
+        if end_ >= 0 then
+            authority = rest.slice(0, end_)
+            rest = rest.slice(end_)
+        else
+            rest = ""
+        end
+        var at = authority.find_last("@")
+        if at >= 0 then
+            u.user = authority.slice(0, at)
+            authority = authority.slice(at + 1)
+        end
+        var port_text = ""
+        if authority.starts_with("[") then
+            var close = authority.find("]")
+            if close < 0 then
+                throw ValueError("invalid IPv6 host in URL '" + text + "'")
+            end
+            u.host = authority.slice(1, close)
+            var after = authority.slice(close + 1)
+            if after.starts_with(":") then
+                port_text = after.slice(1)
+            else if after != "" then
+                throw ValueError("invalid text after IPv6 host in URL '" + text + "'")
+            end
+        else
+            var p = authority.find_last(":")
+            if p >= 0 then
+                u.host = authority.slice(0, p)
+                port_text = authority.slice(p + 1)
+            else
+                u.host = authority
+            end
+            u.host = u.host.lower()
+        end
+        if port_text != "" then
+            for c in port_text do
+                if c < '0' or c > '9' then
+                    throw ValueError("invalid port in URL '" + text + "'")
+                end
+            end
+            if port_text.length > 5 or int(port_text) > 65535 then
+                throw ValueError("invalid port in URL '" + text + "'")
+            end
+            u.port = int(port_text)
+        end
+    end
+    u.path = rest
+    return u
+end
+
+function valid_scheme(string s) returns bool
+    if s.length == 0 then
+        return false
+    end
+    for i, c in s.chars() do
+        var letter = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z')
+        var other = (c >= '0' and c <= '9') or c == '+' or c == '-' or c == '.'
+        if not letter and (i == 0 or not other) then
+            return false
+        end
+    end
+    return true
+end
+
+# Resolves a reference such as "../b?x=1" against a base URL (RFC 3986 section 5).
+function join(string base, string reference) returns string
+    var r = parse(reference)
+    if r.scheme != "" then
+        r.path = remove_dots(r.path)
+        return r.to_string()
+    end
+    var b = parse(base)
+    var out = Url()
+    out.scheme = b.scheme
+    out.fragment = r.fragment
+    if reference.starts_with("//") then
+        out.user = r.user
+        out.host = r.host
+        out.port = r.port
+        out.path = remove_dots(r.path)
+        out.query = r.query
+        return out.to_string()
+    end
+    out.user = b.user
+    out.host = b.host
+    out.port = b.port
+    if r.path == "" then
+        out.path = b.path
+        out.query = b.query
+        if reference.contains("?") then
+            out.query = r.query
+        end
+    else
+        if r.path.starts_with("/") then
+            out.path = remove_dots(r.path)
+        else
+            var directory = ""
+            var last = b.path.find_last("/")
+            if last >= 0 then
+                directory = b.path.slice(0, last + 1)
+            else if b.host != "" then
+                directory = "/"
+            end
+            out.path = remove_dots(directory + r.path)
+        end
+        out.query = r.query
+    end
+    return out.to_string()
+end
+
+# Removes "." and ".." segments from a path.
+function remove_dots(string path) returns string
+    if path == "" then
+        return ""
+    end
+    string[] output = []
+    var segments = path.split("/")
+    for i, segment in segments do
+        var last = i == segments.length - 1
+        if segment == "." then
+            if last then
+                output.push("")
+            end
+        else if segment == ".." then
+            if output.length > 1 or (output.length == 1 and output[0] != "") then
+                output.pop()
+            end
+            if last then
+                output.push("")
+            end
+        else
+            output.push(segment)
+        end
+    end
+    var result = "/".join(output)
+    if path.starts_with("/") and not result.starts_with("/") then
+        result = "/" + result
+    end
+    return result
+end
+
+# Percent-encodes text for use in a URL path segment or query value.
+function encode(string text) returns string
+    return encoding.url_encode(text)
+end
+
+# Decodes percent-escapes. Raises ValueError for a malformed escape.
+function decode(string text) returns string
+    return encoding.url_decode(text)
+end
+
+# Decodes `a=1&b=two+words` into a map (`+` is a space).
+function parse_query(string query) returns map<string, string>
+    map<string, string> params = {}
+    if query == "" then
+        return params
+    end
+    for pair in query.split("&") do
+        if pair == "" then
+            continue
+        end
+        var equals = pair.find("=")
+        if equals < 0 then
+            params[encoding.form_decode(pair)] = ""
+        else
+            params[encoding.form_decode(pair.slice(0, equals))] = encoding.form_decode(pair.slice(equals + 1))
+        end
+    end
+    return params
+end
+
+# Encodes a map as a query string, in the map's order.
+function query_string(map<string, string> params) returns string
+    string[] parts = []
+    for name, value in params do
+        parts.push(encoding.form_encode(name) + "=" + encoding.form_encode(value))
+    end
+    return "&".join(parts)
+end

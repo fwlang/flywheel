@@ -814,8 +814,11 @@ bool serveLoop(HttpRuntime &state) {
         state.workers = std::make_unique<HttpWorkers>();
         for (int i = 0; i < state.workerCount; ++i) {
             ++activeThreads; // also keeps the cycle collector paused while workers exist
-            state.workers->threads.emplace_back([&workers = *state.workers] {
+            RaceClock start;
+            raceRelease(start);
+            state.workers->threads.emplace_back([&workers = *state.workers, start] {
                 guardStack();
+                raceAcquire(start);
                 workerLoop(workers);
                 --activeThreads;
             });

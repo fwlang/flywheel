@@ -2,7 +2,7 @@
 
 A C++20 compiler that turns Flywheel source into LLVM IR, native object files, and executables. Native markup and components become compiled element construction with escaped HTML serialization. Programs require neither Python nor a runtime interpreter.
 
-Flywheel is currently in its **beta** phase.
+Flywheel is currently in its **beta** phase: version **2.3 (beta-3)** (`flywheel --version`).
 
 ## Build
 
@@ -24,9 +24,12 @@ build/flywheel run examples/hello.fly
 build/flywheel run app.fw -- arguments for the program
 build/flywheel build examples/core.fly -O3 -o core
 build/flywheel check examples/demo.fly --emit-ir demo.ll
-build/flywheel build -g app.fw -o app      # DWARF line tables for gdb/lldb
-build/flywheel test                        # run test_*.fw / *_test.fw files
+build/flywheel build -g app.fw -o app      # DWARF lines and locals for gdb/lldb
+build/flywheel run --race app.fw           # stop on data races between threads
+build/flywheel test --coverage             # run test_*.fw / *_test.fw files, report lines
 build/flywheel fmt --check src/*.fw        # indentation formatter
+build/flywheel doc lib.fw -o lib.html      # HTML from documentation comments
+build/flywheel repl                        # interactive session
 build/flywheel lsp                         # language server for editors
 ```
 
@@ -88,7 +91,31 @@ print Box("generic").value
 print <ul>{shapes.map(function(Shape s) => <li>{s.area()}</li>)}</ul>
 ```
 
-The language has classes with custom `init`, single inheritance, interfaces, enums, exhaustive `match`, monomorphized generics, nullable values (including `int?`) with `??` and null-check narrowing, `char`, closures that share captured variables, first-class methods and constructors, sets and custom map keys, and an iterator protocol. See [language decisions](docs/language.md), [types](docs/types.md), and [collections](docs/collections.md).
+The language has classes with custom `init`, `private` and `readonly` members, and operator methods; single inheritance, interfaces, enums (including enums with data), exhaustive `match` with destructuring, monomorphized generics with constraints and generic methods, nullable values (including `int?`) with `??` and null-check narrowing, `char`, closures that share captured variables, first-class methods and constructors, sets and custom map keys, frozen collections, `defer`, format specs in interpolation, and an iterator protocol. See [language decisions](docs/language.md), [types](docs/types.md), and [collections](docs/collections.md).
+
+```flywheel
+enum Token
+    Number(int value)
+    Name(string text)
+    Plus
+end
+
+function describe(Token t) returns string
+    match t
+        case Token.Number(n) if n < 0 then
+            return "negative {n}"
+        case Token.Number(n) then
+            return "number {n:,}"
+        case Token.Name(text) then
+            return "name " + text
+        case Token.Plus then
+            return "plus"
+    end
+end
+
+var (label, count) = ["tokens", 3]
+print describe(Token.Number(1500)), "{label}: {count:>4}"
+```
 
 ## Constructors
 
@@ -104,7 +131,7 @@ var same = desktop.window("my-window")
 
 ## Libraries
 
-Native modules cover strings, math, files and paths, regular expressions, time and dates, JSON (indexing, encoding any value, typed decoding into nested classes), terminal and file streams, child processes with captured output, timeouts, pipes, environment and working directory, TCP sockets, threads with channels and mutexes, cycle collection, HTTP/HTTPS servers with keep-alive, chunked uploads, and optional handler worker threads, and desktop windows with event handlers, JavaScript bindings, live updates, and multiple windows. See the [library reference](stdlib/README.md), [input and processes](docs/input-processes.md), [concurrency](docs/concurrency.md), and [desktop windows](docs/desktop.md).
+Native modules cover strings, math, files and paths, regular expressions, time and dates, JSON (indexing, encoding any value, typed decoding into nested classes), terminal and file streams, child processes with captured output, timeouts, pipes, environment and working directory, TCP sockets, threads with channels and mutexes, cycle collection, HTTP/HTTPS servers with keep-alive, chunked uploads, and optional handler worker threads, an HTTP/HTTPS client, hashing and HMAC, secure random numbers, base64/hex/URL encodings, UUIDs, gzip/zlib/zip compression, SQLite databases, TOML and YAML parsing, HTML parsing, and desktop windows with event handlers, JavaScript bindings, live updates, and multiple windows. Library modules written in Flywheel add CSV, URLs, logging, command-line arguments, big integers, and exact decimals. See the [library reference](stdlib/README.md), [input and processes](docs/input-processes.md), [concurrency](docs/concurrency.md), and [desktop windows](docs/desktop.md).
 
 ```flywheel
 import html.*
@@ -123,7 +150,7 @@ Values are reference counted with atomic counts and freed deterministically; a s
 
 ## Modules and errors
 
-Local `.fw` / `.fly` imports resolve before native modules. Top-level declarations are public by default; `private` hides implementation names. Dependency initialization runs once, and import cycles and wildcard collisions are diagnosed. See [modules](docs/modules.md). Typed `try`/`catch`/`finally`, `Result<T,E>`, and typed library errors are described in [error handling](docs/errors.md).
+Local `.fw` / `.fly` imports resolve first, then installed packages (`.flywheel-modules`, then the installation's `modules` directory), then library and native modules. Packages are installed by [Pulley](../pulley/README.md) (`pulley` / `ppm`) from Distrobase registries; the `flywheel` command has no package commands. Top-level declarations are public by default; `private` hides implementation names. Dependency initialization runs once, and import cycles and wildcard collisions are diagnosed. See [modules](docs/modules.md). Typed `try`/`catch`/`finally`, `Result<T,E>`, and typed library errors are described in [error handling](docs/errors.md).
 
 ## Development and measurements
 
@@ -146,4 +173,4 @@ The installed compiler locates its runtime archive in `../lib`; the C++ linker t
 
 ## VS Code
 
-The [Flywheel VS Code extension](https://github.com/fwlang/vscode-flywheel) supplies syntax highlighting, snippets, and editing support for `.fw` / `.fly` files. `flywheel lsp` provides diagnostics and formatting to editors with a generic LSP client.
+The [Flywheel VS Code extension](https://github.com/fwlang/vscode-flywheel) supplies syntax highlighting and snippets for `.fw` / `.fly` files, and starts `flywheel lsp` for diagnostics, hover, go to definition, references, rename, completion, document symbols, and formatting (set `flywheel.path` if the compiler is not on `PATH`). Other editors can use `flywheel lsp` through a generic LSP client.

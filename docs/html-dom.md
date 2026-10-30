@@ -1,6 +1,6 @@
 # HTML tree queries and mutation
 
-The HTML API operates on a supplied native markup tree. There is no implicit global document, browser DOM, or runtime HTML parser.
+The HTML API operates on a supplied native markup tree: one built from markup literals, or one read from HTML text with `html.parse`. There is no implicit global document or browser DOM.
 
 ```flywheel
 import html.*
@@ -23,6 +23,23 @@ print page
 ```
 
 `html.query(page, selector)`, `html.query_all(page, selector)`, and `html.get_by_id(page, id)` are equivalent to the corresponding tree methods. `import html` (including an alias) is sufficient for qualified library calls; markup tag literals still need `import html.*` in their defining module.
+
+## Parsing HTML
+
+`html.parse(text)` reads HTML (from a file, a request, or `web.get`) into a `fragment` of ordinary elements and text, which the query and mutation tools here work on and which renders back to HTML:
+
+```flywheel
+import html
+var doc = html.parse("<ul><li>one<li class=x>two</ul><p>Fish &amp; chips")
+print html.query_all(doc, "li").length                 # 2
+var item = html.query(doc, "li.x")
+if item != null then
+    print item.text_content                            # two
+end
+print doc   # <ul><li>one</li><li class="x">two</li></ul><p>Fish &amp; chips</p>
+```
+
+The parser is lenient, as browsers are: tag and attribute names are lower-cased; attributes may be unquoted or valueless; void elements (`br`, `img`, ...) and `/>` take no children; `<p>`, `<li>`, `<dt>`/`<dd>`, `<tr>`, `<td>`/`<th>`, and `<option>` close implicitly; unmatched end tags are ignored and unclosed elements end at the end of input. `script`, `style`, `textarea`, and `title` contain raw text. Named entities (common ones such as `&nbsp;`, `&copy;`, `&mdash;`) and numeric entities are decoded; comments, the doctype, and processing instructions are dropped, as is whitespace-only text directly inside `html`, `head`, tables, and lists. It does not build an implicit `<html>`/`<head>`/`<body>` structure or perform the HTML5 adoption-agency repairs for misnested formatting tags.
 
 ## Query behavior
 

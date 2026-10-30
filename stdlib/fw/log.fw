@@ -1,0 +1,93 @@
+# Leveled logging to standard error or a file, as text lines or JSON lines.
+import io
+import fs
+import json
+import time
+
+# Message levels, from most to least verbose.
+enum Level
+    Debug, Info, Warn, Error
+end
+
+Level threshold = Level.Info
+bool json_lines = false
+string destination = ""
+
+# Messages below `level` are dropped. The default is Level.Info.
+function set_level(Level level)
+    threshold = level
+end
+
+# Sets the level by name ("debug", "info", "warn", "error"), as from an environment variable.
+function set_level_name(string name)
+    var found = Level.from_name(name.slice(0, 1).upper() + name.slice(1).lower())
+    if found == null then
+        throw ValueError("unknown log level '" + name + "'")
+    end
+    threshold = found
+end
+
+# true writes one JSON object per line instead of text.
+function use_json(bool enabled)
+    json_lines = enabled
+end
+
+# Appends messages to a file instead of standard error; "" restores standard error.
+function to_file(string path)
+    destination = path
+end
+
+function enabled(Level level) returns bool
+    return level.value >= threshold.value
+end
+
+function timestamp returns string
+    var now = time.now()
+    var millis = int((now - double(int(now // 1))) * 1000.0)
+    return time.format(now, "%Y-%m-%dT%H:%M:%S") + "." + string(millis).pad_start(3, "0") + "Z"
+end
+
+# Writes a message with optional key/value fields when its level is enabled.
+function write(Level level, string message, map<string, string> fields = {})
+    if not enabled(level) then
+        return
+    end
+    var line = ""
+    if json_lines then
+        map<string, string> record = {"time": timestamp(), "level": level.name.lower(), "message": message}
+        for key, value in fields do
+            record[key] = value
+        end
+        line = json.encode(record)
+    else
+        line = timestamp() + " " + level.name.upper().pad_end(5) + " " + message
+        for key, value in fields do
+            var shown = value
+            if value.contains(" ") or value.contains("=") or value.contains("\"") or value == "" then
+                shown = json.encode(value)
+            end
+            line += " " + key + "=" + shown
+        end
+    end
+    if destination == "" then
+        io.write_error(line + "\n")
+    else
+        fs.append(destination, line + "\n")
+    end
+end
+
+function debug(string message, map<string, string> fields = {})
+    write(Level.Debug, message, fields)
+end
+
+function info(string message, map<string, string> fields = {})
+    write(Level.Info, message, fields)
+end
+
+function warn(string message, map<string, string> fields = {})
+    write(Level.Warn, message, fields)
+end
+
+function error(string message, map<string, string> fields = {})
+    write(Level.Error, message, fields)
+end

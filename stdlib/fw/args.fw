@@ -1,0 +1,301 @@
+# Command-line argument parsing: flags, options with values, positional arguments, and
+# generated help text.
+#
+# ```
+# import args
+# import os
+# var cli = args.Parser("resize", "Resizes images.")
+# cli.flag("verbose", "v", "print each file")
+# cli.option("width", "w", "target width in pixels", "800")
+# cli.positional("files", "images to resize", true)
+# var parsed = cli.parse(os.args())
+# print parsed.integer("width"), parsed.list("files")
+# ```
+import io
+import os
+
+class Spec
+    string name
+    string short
+    string help
+    bool takes_value
+    string default_value
+    bool required
+    bool many
+end
+
+# Raised by Parser.parse_or_throw for invalid command lines.
+class Usage
+    string message
+end
+
+# The result of parsing: option values, flags, and positional arguments by name.
+class Parsed
+    map<string, string> values = {}
+    map<string, bool> flags = {}
+    map<string, string[]> lists = {}
+
+    function flag(string name) returns bool
+        if name in inst flags then
+            return inst flags[name]
+        end
+        return false
+    end
+
+    # An option or single positional value ("" when absent without a default).
+    function get(string name) returns string
+        if name in inst values then
+            return inst values[name]
+        end
+        return ""
+    end
+
+    # true when the option or positional was given on the command line or has a default.
+    function has(string name) returns bool
+        return name in inst values or name in inst lists
+    end
+
+    # An option or positional as an int; raises ValueError for non-numeric text.
+    function integer(string name) returns int
+        var text = inst get(name)
+        try
+            return int(text)
+        catch CastError e
+            throw ValueError("--" + name + " expects a whole number, got '" + text + "'")
+        end
+    end
+
+    function number(string name) returns double
+        var text = inst get(name)
+        try
+            return double(text)
+        catch CastError e
+            throw ValueError("--" + name + " expects a number, got '" + text + "'")
+        end
+    end
+
+    # The values of a positional that accepts several (and of repeated options).
+    function list(string name) returns string[]
+        if name in inst lists then
+            return inst lists[name]
+        end
+        return []
+    end
+end
+
+class Parser
+    string program
+    string description = ""
+    Spec[] options = []
+    Spec[] positionals = []
+
+    # A boolean switch: --name or -s.
+    function flag(string name, string short, string help)
+        inst options.push(Spec(name, short, help, false, "", false, false))
+    end
+
+    # An option with a value: --name value, --name=value, or -s value. Use "" for no short
+    # name and no default. Repeating an option keeps every value (see Parsed.list).
+    function option(string name, string short, string help, string default_value = "")
+        inst options.push(Spec(name, short, help, true, default_value, false, false))
+    end
+
+    # A positional argument; `many` collects all remaining positionals (it must come last).
+    function positional(string name, string help, bool many = false, bool required = true)
+        inst positionals.push(Spec(name, "", help, true, "", required, many))
+    end
+
+    function usage returns string
+        var line = "usage: " + inst program
+        if inst options.length > 0 then
+            line += " [options]"
+        end
+        for p in inst positionals do
+            var shown = p.name
+            if p.many then
+                shown += "..."
+            end
+            if p.required then
+                line += " " + shown
+            else
+                line += " [" + shown + "]"
+            end
+        end
+        return line
+    end
+
+    # Usage, description, and a line per option and positional.
+    function help returns string
+        var out = inst usage() + "\n"
+        if inst description != "" then
+            out += "\n" + inst description + "\n"
+        end
+        if inst positionals.length > 0 then
+            out += "\narguments:\n"
+            for p in inst positionals do
+                out += "  " + p.name.pad_end(22) + p.help + "\n"
+            end
+        end
+        out += "\noptions:\n"
+        out += "  " + "-h, --help".pad_end(22) + "show this help and exit\n"
+        for o in inst options do
+            var names = "    --" + o.name
+            if o.short != "" then
+                names = "-" + o.short + ", --" + o.name
+            end
+            if o.takes_value then
+                names += " " + o.name.upper()
+            end
+            var text = o.help
+            if o.default_value != "" then
+                text += " (default: " + o.default_value + ")"
+            end
+            out += "  " + names.pad_end(22) + text + "\n"
+        end
+        return out
+    end
+
+    function find(string name, bool short) returns Spec?
+        for o in inst options do
+            if (short and o.short == name) or (not short and o.name == name) then
+                return o
+            end
+        end
+        return null
+    end
+
+    # Parses arguments, raising Usage for an invalid command line; for -h or --help, the
+    # Usage message is "help".
+    function parse_or_throw(string[] arguments) returns Parsed
+        var parsed = Parsed()
+        for o in inst options do
+            if o.takes_value and o.default_value != "" then
+                parsed.values[o.name] = o.default_value
+            end
+        end
+        string[] loose = []
+        bool literal = false
+        string[] given = []
+        int i = 0
+        while i < arguments.length do
+            var a = arguments[i]
+            i += 1
+            if literal or a == "-" or not a.starts_with("-") then
+                loose.push(a)
+                continue
+            end
+            if a == "--" then
+                literal = true
+                continue
+            end
+            if a == "-h" or a == "--help" then
+                throw Usage("help")
+            end
+            if a.starts_with("--") then
+                var body = a.slice(2)
+                var equals = body.find("=")
+                var name = body
+                if equals >= 0 then
+                    name = body.slice(0, equals)
+                end
+                var spec = inst find(name, false)
+                if spec == null then
+                    throw Usage("unknown option --" + name)
+                end
+                if not spec.takes_value then
+                    if equals >= 0 then
+                        throw Usage("--" + name + " does not take a value")
+                    end
+                    parsed.flags[name] = true
+                    continue
+                end
+                var value = ""
+                if equals >= 0 then
+                    value = body.slice(equals + 1)
+                else
+                    if i >= arguments.length then
+                        throw Usage("--" + name + " needs a value")
+                    end
+                    value = arguments[i]
+                    i += 1
+                end
+                inst store(parsed, name, value, given)
+                continue
+            end
+            # Short options: -v, -vq (several flags), -o value, -ovalue.
+            var letters = a.slice(1).chars()
+            int k = 0
+            while k < letters.length do
+                var letter = string(letters[k])
+                var spec = inst find(letter, true)
+                if spec == null then
+                    throw Usage("unknown option -" + letter)
+                end
+                if not spec.takes_value then
+                    parsed.flags[spec.name] = true
+                    k += 1
+                    continue
+                end
+                var rest = a.slice(k + 2)
+                if rest == "" then
+                    if i >= arguments.length then
+                        throw Usage("-" + letter + " needs a value")
+                    end
+                    rest = arguments[i]
+                    i += 1
+                end
+                inst store(parsed, spec.name, rest, given)
+                k = letters.length
+            end
+        end
+        int next = 0
+        for p in inst positionals do
+            if p.many then
+                string[] rest = []
+                while next < loose.length do
+                    rest.push(loose[next])
+                    next += 1
+                end
+                if rest.length == 0 and p.required then
+                    throw Usage("missing " + p.name)
+                end
+                parsed.lists[p.name] = rest
+            else if next < loose.length then
+                parsed.values[p.name] = loose[next]
+                next += 1
+            else if p.required then
+                throw Usage("missing " + p.name)
+            end
+        end
+        if next < loose.length then
+            throw Usage("unexpected argument '" + loose[next] + "'")
+        end
+        return parsed
+    end
+
+    function store(Parsed parsed, string name, string value, string[] given)
+        if name in given then
+            parsed.lists[name].push(value)
+        else
+            given.push(name)
+            parsed.lists[name] = [value]
+        end
+        parsed.values[name] = value
+    end
+
+    # Parses arguments; prints help and exits 0 for --help, or prints the problem and usage
+    # to standard error and exits 2 for an invalid command line.
+    function parse(string[] arguments) returns Parsed
+        try
+            return inst parse_or_throw(arguments)
+        catch Usage problem
+            if problem.message == "help" then
+                io.write(inst help())
+                os.exit(0)
+            end
+            io.write_error(inst program + ": " + problem.message + "\n" + inst usage() + "\n")
+            os.exit(2)
+        end
+        return Parsed()
+    end
+end

@@ -49,6 +49,7 @@ struct Param {
     std::string name, type;
     EP value;
     Location loc;
+    bool isPrivate = false, readonly = false; // class fields only
 };
 struct Function {
     std::string name, result, owner;
@@ -56,7 +57,10 @@ struct Function {
     std::vector<Param> params;
     std::vector<SP> body;
     bool abstract = false; // interface method signature without a body
+    bool isPrivate = false; // methods only
     std::vector<std::string> typeParams;
+    // Constraints on type parameters (`T implements Comparable`), by parameter name.
+    std::map<std::string, std::string> typeBounds;
 };
 struct Class {
     std::string name, base;
@@ -64,7 +68,12 @@ struct Class {
     std::vector<Param> fields;
     std::vector<Function> methods;
     std::vector<std::string> interfaces, typeParams;
+    std::map<std::string, std::string> typeBounds;
     bool isInterface = false;
+    // Enums with data become a base class whose subclasses are the variants: `variants` on the
+    // base lists them, and each variant class names its enum in `variantOf`.
+    std::vector<std::string> variants;
+    std::string variantOf;
 };
 struct Enum {
     std::string name;
@@ -109,7 +118,7 @@ class Parser {
     void finish();
     bool typedDeclaration();
     std::string type();
-    std::vector<std::string> typeParameters();
+    std::vector<std::string> typeParameters(std::map<std::string, std::string> *bounds = nullptr);
     std::string typeArguments(bool allowSpace = false);
     std::string markupName(); // a tag or attribute name such as my-card or stroke-width
     EP expression(int precedence = 0);
@@ -119,6 +128,8 @@ class Parser {
     EP stringExpr(const Token &t);
     SP statement();
     std::vector<SP> block();
+    std::vector<SP> pending; // extra statements produced by the last statement (destructuring)
+    int temporaries = 0;
     Function function(const std::string &owner = "", bool signatureOnly = false);
     EP lambda();
 
@@ -134,6 +145,8 @@ Class clone(const Class &c);
 struct Options {
     int optimization = 0;
     bool debug = false; // emit DWARF line tables
+    bool coverage = false; // count executions of each source line (flywheel test --coverage)
+    bool race = false;     // detect data races at run time (--race)
     std::string ir, object, desktopBackend;
     std::string *objectData = nullptr; // receives the object file in memory when set
 };
@@ -145,4 +158,18 @@ int languageServer();
 // Loads a program, preferring in-memory `overlay` text for paths it contains.
 Program loadProgram(const std::string &filename,
                     const std::map<std::string, std::string> &overlay);
+// Library modules written in Flywheel and embedded in the compiler, by module name.
+const std::map<std::string, std::string> &libraryModules();
+// Installed packages (see src/package.cpp; Pulley installs them). Flywheel only resolves them.
+// The executable's path locates the installation-wide modules directory.
+void setExecutablePath(const std::string &path);
+std::string globalModulesDirectory();
+// Directories searched for packages: the nearest .flywheel-modules, then the global one.
+std::vector<std::string> moduleDirectories(const std::string &sourceFile);
+// Packages visible to a source file: import name -> package directory.
+std::map<std::string, std::string> packageRoots(const std::string &sourceFile);
+// The main module file of a package: `main` in its pulley.toml, else <name>.fw, main.fw, lib.fw.
+std::string packageMain(const std::string &directory, const std::string &name);
+// `flywheel doc`: renders documentation comments of a module (and its imports) to HTML.
+int docCommand(const std::vector<std::string> &args);
 } // namespace fw

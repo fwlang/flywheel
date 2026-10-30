@@ -1,0 +1,110 @@
+# CSV reading and writing (RFC 4180): quoted fields, doubled quotes, separators and line
+# breaks inside quotes, and CRLF or LF line endings.
+
+# Splits CSV text into rows of fields. A trailing line break does not add an empty row.
+function parse(string text, char separator = ',') returns string[][]
+    string[][] rows = []
+    string[] row = []
+    char[] field = []
+    var chars = text.chars()
+    int i = 0
+    bool quoted = false
+    bool started = false
+    while i < chars.length do
+        var c = chars[i]
+        if quoted then
+            if c == '"' then
+                if i + 1 < chars.length and chars[i + 1] == '"' then
+                    field.push('"')
+                    i += 1
+                else
+                    quoted = false
+                end
+            else
+                field.push(c)
+            end
+        else if c == '"' and field.length == 0 then
+            quoted = true
+            started = true
+        else if c == separator then
+            row.push("".join(field))
+            field = []
+            started = true
+        else if c == '\n' or c == '\r' then
+            if c == '\r' and i + 1 < chars.length and chars[i + 1] == '\n' then
+                i += 1
+            end
+            row.push("".join(field))
+            rows.push(row)
+            row = []
+            field = []
+            started = false
+        else
+            field.push(c)
+            started = true
+        end
+        i += 1
+    end
+    if quoted then
+        throw ValueError("CSV text ends inside a quoted field")
+    end
+    if started or field.length > 0 or row.length > 0 then
+        row.push("".join(field))
+        rows.push(row)
+    end
+    return rows
+end
+
+# Reads CSV text whose first row names the columns: one map per remaining row. Rows with a
+# different number of fields than the header raise ValueError.
+function parse_records(string text, char separator = ',') returns map<string, string>[]
+    var rows = parse(text, separator)
+    map<string, string>[] records = []
+    if rows.length == 0 then
+        return records
+    end
+    var header = rows[0]
+    for index, row in rows do
+        if index == 0 then
+            continue
+        end
+        if row.length != header.length then
+            throw ValueError("CSV row {index + 1} has {row.length} fields; the header has {header.length}")
+        end
+        map<string, string> record = {}
+        for column, name in header do
+            record[name] = row[column]
+        end
+        records.push(record)
+    end
+    return records
+end
+
+# Quotes a field when it contains the separator, a quote, or a line break.
+function quote(string field, char separator = ',') returns string
+    if field.contains(separator) or field.contains('"') or field.contains('\n') or field.contains('\r') then
+        return "\"" + field.replace("\"", "\"\"") + "\""
+    end
+    return field
+end
+
+# One CSV line (without a line break).
+function format_row(string[] fields, char separator = ',') returns string
+    string[] quoted = []
+    for f in fields do
+        quoted.push(quote(f, separator))
+    end
+    return string(separator).join(quoted)
+end
+
+# CSV text with CRLF line endings, as RFC 4180 specifies.
+function format(string[][] rows, char separator = ',') returns string
+    string[] lines = []
+    for row in rows do
+        lines.push(format_row(row, separator))
+    end
+    if lines.length == 0 then
+        return ""
+    end
+    return "\r\n".join(lines) + "\r\n"
+end

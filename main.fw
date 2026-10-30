@@ -1,1 +1,49 @@
-print("test")
+import desktop
+import html.*
+
+var window = desktop.window("test window", 420, 69)
+element pageStyling = <style>
+body {
+    font-family: Arial, sans-serif;
+    background-color: #f0f0f0;
+}
+UserCard {
+    border: 1px solid #ccc;
+    padding: 10px;
+    margin: 10px 0;
+    background-color: #fff;
+}
+/* 
+test comment
+*/
+</style>
+
+element pageScripting = <script>
+/* test test */
+// test test
+onPageLoad = () => {
+    console.log("Page loaded");
+    // test
+    /* test */
+}
+onPageLoad();
+</script>
+
+component UserCard = <div class="UserCard">
+    <h2 style="color: blue; font-size: 18px;">{attr username}</h2>
+    <p>{attr email}</p>
+    <!-- -->
+</div>
+
+function page() returns element
+    return <html>
+        {pageStyling}
+        <body>
+            <UserCard username="adminUser" email="admin@example.com" />
+            <UserCard username="danny" email="danny@woofmail.com" />
+        </body>
+    </html>
+end
+
+window.load(page())
+window.run()

@@ -1,0 +1,376 @@
+# Arbitrary-precision integers. Values are immutable; operators return new values.
+#
+# ```
+# import bigint
+# var f = bigint.of(1)
+# for n in 1..30 do
+#     f = f * bigint.of(n)
+# end
+# print f   # 265252859812191058636308480000000
+# ```
+
+# Limbs hold base-10^9 digits, least significant first; zero has no limbs and sign 0.
+const BASE = 1000000000
+
+class BigInt
+    private readonly int sign
+    private readonly int[] limbs
+
+    function operator +(BigInt other) returns BigInt
+        if inst sign == 0 then
+            return other
+        end
+        if other.sign == 0 then
+            return BigInt(inst sign, inst limbs)
+        end
+        if inst sign == other.sign then
+            return make(inst sign, add_limbs(inst limbs, other.limbs))
+        end
+        var c = compare_limbs(inst limbs, other.limbs)
+        if c == 0 then
+            return zero()
+        end
+        if c > 0 then
+            return make(inst sign, subtract_limbs(inst limbs, other.limbs))
+        end
+        return make(other.sign, subtract_limbs(other.limbs, inst limbs))
+    end
+
+    function operator -() returns BigInt
+        return BigInt(-inst sign, inst limbs)
+    end
+
+    function operator -(BigInt other) returns BigInt
+        return BigInt(inst sign, inst limbs) + (-other)
+    end
+
+    function operator *(BigInt other) returns BigInt
+        if inst sign == 0 or other.sign == 0 then
+            return zero()
+        end
+        return make(inst sign * other.sign, multiply_limbs(inst limbs, other.limbs))
+    end
+
+    # Division truncates toward zero, like `//` on int.
+    function operator //(BigInt other) returns BigInt
+        return inst divmod(other)[0]
+    end
+
+    # The remainder has the sign of the dividend, like `%` on int.
+    function operator %(BigInt other) returns BigInt
+        return inst divmod(other)[1]
+    end
+
+    # Quotient and remainder; raises NumericError for division by zero.
+    function divmod(BigInt other) returns [BigInt, BigInt]
+        if other.sign == 0 then
+            throw NumericError("division by zero")
+        end
+        var (q, r) = divide_limbs(inst limbs, other.limbs)
+        return [make(inst sign * other.sign, q), make(inst sign, r)]
+    end
+
+    function compare(BigInt other) returns int
+        if inst sign != other.sign then
+            if inst sign < other.sign then
+                return -1
+            end
+            return 1
+        end
+        return compare_limbs(inst limbs, other.limbs) * inst sign
+    end
+
+    function operator ==(BigInt other) returns bool
+        return inst compare(other) == 0
+    end
+
+    function operator <(BigInt other) returns bool
+        return inst compare(other) < 0
+    end
+
+    function equals(BigInt other) returns bool
+        return inst compare(other) == 0
+    end
+
+    function hash returns int
+        int h = inst sign + 1
+        for limb in inst limbs do
+            h = (h * 31 + limb) % 1000000007
+        end
+        return h
+    end
+
+    function abs returns BigInt
+        return BigInt(inst sign * inst sign, inst limbs)
+    end
+
+    # -1, 0, or 1.
+    function signum returns int
+        return inst sign
+    end
+
+    function is_zero returns bool
+        return inst sign == 0
+    end
+
+    # This value raised to a non-negative int power.
+    function pow(int exponent) returns BigInt
+        if exponent < 0 then
+            throw ValueError("BigInt.pow needs a non-negative exponent")
+        end
+        var result = of(1)
+        var square = BigInt(inst sign, inst limbs)
+        var e = exponent
+        while e > 0 do
+            if e % 2 == 1 then
+                result = result * square
+            end
+            e = e // 2
+            if e > 0 then
+                square = square * square
+            end
+        end
+        return result
+    end
+
+    # The value as an int; raises NumericError when it does not fit in 64 bits.
+    function to_int returns int
+        if inst compare(parse("9223372036854775807")) > 0 or inst compare(parse("-9223372036854775808")) < 0 then
+            throw NumericError("BigInt " + inst to_string() + " does not fit in int")
+        end
+        if inst sign < 0 and inst compare(parse("-9223372036854775808")) == 0 then
+            return -9223372036854775807 - 1
+        end
+        int value = 0
+        int i = inst limbs.length - 1
+        while i >= 0 do
+            value = value * BASE + inst limbs[i]
+            i -= 1
+        end
+        return value * inst sign
+    end
+
+    # Decimal digits, with a leading '-' for negative values.
+    function to_string returns string
+        if inst sign == 0 then
+            return "0"
+        end
+        var out = string(inst limbs[inst limbs.length - 1])
+        int i = inst limbs.length - 2
+        while i >= 0 do
+            out += string(inst limbs[i]).pad_start(9, "0")
+            i -= 1
+        end
+        if inst sign < 0 then
+            return "-" + out
+        end
+        return out
+    end
+
+    function digits returns int[]
+        return inst limbs.copy()
+    end
+end
+
+function zero returns BigInt
+    int[] none = []
+    return BigInt(0, none)
+end
+
+# Normalizes limbs (drops leading zero limbs) and the sign of zero.
+function make(int sign, int[] limbs) returns BigInt
+    while limbs.length > 0 and limbs[limbs.length - 1] == 0 do
+        limbs.pop()
+    end
+    if limbs.length == 0 then
+        return zero()
+    end
+    return BigInt(sign, limbs)
+end
+
+# A BigInt with the value of an int.
+function of(int value) returns BigInt
+    if value == 0 then
+        return zero()
+    end
+    if value == -9223372036854775807 - 1 then
+        return parse("-9223372036854775808")
+    end
+    int sign = 1
+    var v = value
+    if v < 0 then
+        sign = -1
+        v = -v
+    end
+    int[] limbs = []
+    while v > 0 do
+        limbs.push(v % BASE)
+        v = v // BASE
+    end
+    return BigInt(sign, limbs)
+end
+
+# Parses optional sign and decimal digits (underscores allowed between digits).
+function parse(string text) returns BigInt
+    var t = text.trim().replace("_", "")
+    int sign = 1
+    if t.starts_with("-") then
+        sign = -1
+        t = t.slice(1)
+    else if t.starts_with("+") then
+        t = t.slice(1)
+    end
+    if t.length == 0 then
+        throw ValueError("invalid integer '" + text + "'")
+    end
+    for c in t do
+        if c < '0' or c > '9' then
+            throw ValueError("invalid integer '" + text + "'")
+        end
+    end
+    int[] limbs = []
+    var end_ = t.length
+    while end_ > 0 do
+        var start = end_ - 9
+        if start < 0 then
+            start = 0
+        end
+        limbs.push(int(t.slice(start, end_)))
+        end_ = start
+    end
+    return make(sign, limbs)
+end
+
+function compare_limbs(int[] a, int[] b) returns int
+    if a.length != b.length then
+        if a.length < b.length then
+            return -1
+        end
+        return 1
+    end
+    int i = a.length - 1
+    while i >= 0 do
+        if a[i] != b[i] then
+            if a[i] < b[i] then
+                return -1
+            end
+            return 1
+        end
+        i -= 1
+    end
+    return 0
+end
+
+function add_limbs(int[] a, int[] b) returns int[]
+    int[] out = []
+    int carry = 0
+    int i = 0
+    while i < a.length or i < b.length or carry > 0 do
+        int sum = carry
+        if i < a.length then
+            sum += a[i]
+        end
+        if i < b.length then
+            sum += b[i]
+        end
+        out.push(sum % BASE)
+        carry = sum // BASE
+        i += 1
+    end
+    return out
+end
+
+# a - b for a >= b.
+function subtract_limbs(int[] a, int[] b) returns int[]
+    int[] out = []
+    int borrow = 0
+    for i, limb in a do
+        var d = limb - borrow
+        if i < b.length then
+            d -= b[i]
+        end
+        if d < 0 then
+            d += BASE
+            borrow = 1
+        else
+            borrow = 0
+        end
+        out.push(d)
+    end
+    while out.length > 0 and out[out.length - 1] == 0 do
+        out.pop()
+    end
+    return out
+end
+
+function multiply_limbs(int[] a, int[] b) returns int[]
+    var out = [0] * (a.length + b.length)
+    for i, x in a do
+        int carry = 0
+        int j = 0
+        while j < b.length or carry > 0 do
+            var current = out[i + j] + carry
+            if j < b.length then
+                current += x * b[j]
+            end
+            out[i + j] = current % BASE
+            carry = current // BASE
+            j += 1
+        end
+    end
+    while out.length > 0 and out[out.length - 1] == 0 do
+        out.pop()
+    end
+    return out
+end
+
+function multiply_small(int[] a, int k) returns int[]
+    int[] out = []
+    int carry = 0
+    for x in a do
+        var current = x * k + carry
+        out.push(current % BASE)
+        carry = current // BASE
+    end
+    while carry > 0 do
+        out.push(carry % BASE)
+        carry = carry // BASE
+    end
+    while out.length > 0 and out[out.length - 1] == 0 do
+        out.pop()
+    end
+    return out
+end
+
+# Schoolbook long division of magnitudes: one base-10^9 digit of the quotient at a time,
+# found by binary search.
+function divide_limbs(int[] a, int[] b) returns [int[], int[]]
+    int[] quotient = [0] * (a.length)
+    int[] remainder = []
+    int i = a.length - 1
+    while i >= 0 do
+        remainder.insert(0, a[i])
+        while remainder.length > 0 and remainder[remainder.length - 1] == 0 do
+            remainder.pop()
+        end
+        int low = 0
+        int high = BASE - 1
+        while low < high do
+            var middle = (low + high + 1) // 2
+            if compare_limbs(multiply_small(b, middle), remainder) <= 0 then
+                low = middle
+            else
+                high = middle - 1
+            end
+        end
+        quotient[i] = low
+        if low > 0 then
+            remainder = subtract_limbs(remainder, multiply_small(b, low))
+        end
+        i -= 1
+    end
+    while quotient.length > 0 and quotient[quotient.length - 1] == 0 do
+        quotient.pop()
+    end
+    return [quotient, remainder]
+end

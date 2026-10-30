@@ -35,6 +35,21 @@ print values.remove_at(0), values.remove(3), values.join(", ")
 
 A `for` expression is evaluated once and captures the initial length; shrinking the array during iteration can raise `IndexError`. `for index, item in values` also binds the index.
 
+### Frozen collections
+
+`freeze()` makes an array, map, or set immutable in place and returns it; `is_frozen()` reports whether it is. Every later change (`push`, `pop`, `xs[i] = v`, `m[k] = v`, `remove`, `sort`, `clear`, and so on) raises `ValueError`, while reads, iteration, copies, and slices still work (a copy is not frozen).
+
+```flywheel
+var primes = [2, 3, 5, 7].freeze()
+try
+    primes.push(11)
+catch ValueError e
+    print e.message     # cannot modify a frozen array
+end
+```
+
+Combine it with a `readonly` field for a value that cannot change at all. Freezing is shallow: a frozen array of arrays keeps its elements mutable.
+
 ## Maps
 
 Maps are homogeneous associative values with shared mutable identity, insertion-ordered and hash-indexed:

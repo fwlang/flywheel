@@ -107,7 +107,7 @@ const std::set<std::string> errorTypes = {
     "Error",         "RuntimeError",   "FileError",    "IndexError",  "KeyError",
     "NumericError",  "AssertionError", "JsonError",    "ResultError", "CastError",
     "SelectorError", "InputError",     "ProcessError", "DesktopError", "RegexError",
-    "NetworkError"};
+    "NetworkError",  "ValueError",     "HttpError",    "DatabaseError"};
 // Enum type names; enum values are i64 member indices.
 std::set<std::string> &enumNames() {
     static std::set<std::string> names;
@@ -250,6 +250,7 @@ class Compiler {
     std::map<std::string, int64_t> enumIds;
     std::map<std::string, Class *> templates;
     std::map<std::string, Function *> functionTemplates;
+    std::map<std::string, Function *> methodTemplates; // "Class.method" -> generic method
     std::deque<Class> instances;
     std::deque<Function> functionInstances;
     std::map<std::string, int> classStates; // 1 while flattening, 2 when complete
@@ -262,6 +263,57 @@ class Compiler {
     Ty returnType;
     bool infer = false, top = false;
     std::string owner, desktopBackend;
+    std::string method; // name of the function or method being emitted
+    // Coverage: one counter per executed source line, keyed (file, line).
+    bool coverage = false, race = false;
+    std::map<std::pair<std::string, int>, llvm::GlobalVariable *> coverageCounters;
+    // --race: reports reads and writes of a module global to the race detector.
+    void raceGlobal(Var &v, bool write) {
+        if (!race || !v.initialized)
+            return;
+        auto name = v.address->getName().str();
+        if (name.rfind("global.", 0) == 0)
+            name = displayName(name.substr(7));
+        call("fw_race_global", b.getVoidTy(), {v.address, b.CreateGlobalString(name), i64(write)});
+    }
+    void countLine(Location loc) {
+        if (!coverage || loc.file.empty() || loc.file.rfind("/<flywheel>/", 0) == 0 ||
+            !b.GetInsertBlock() || terminated())
+            return;
+        auto &counter = coverageCounters[{loc.file, loc.line}];
+        if (!counter)
+            counter = new llvm::GlobalVariable(module, b.getInt64Ty(), false,
+                                               llvm::GlobalValue::InternalLinkage, i64(0),
+                                               "fw.coverage");
+        b.CreateStore(b.CreateAdd(b.CreateLoad(b.getInt64Ty(), counter), i64(1)), counter);
+    }
+    // Passes the counters and their file/line table to the runtime when main starts.
+    void registerCoverage(llvm::Function *mainFunction) {
+        std::vector<llvm::Constant *> pointers;
+        std::string table;
+        for (auto &[key, counter] : coverageCounters) {
+            pointers.push_back(counter);
+            table += key.first + "\t" + std::to_string(key.second) + "\n";
+        }
+        auto arrayType = llvm::ArrayType::get(b.getPtrTy(), pointers.size());
+        auto array = new llvm::GlobalVariable(module, arrayType, true,
+                                              llvm::GlobalValue::InternalLinkage,
+                                              llvm::ConstantArray::get(arrayType, pointers),
+                                              "fw.coverage.counters");
+        auto saved = b.saveIP();
+        auto debug = b.getCurrentDebugLocation();
+        auto &entry = mainFunction->getEntryBlock();
+        b.SetInsertPoint(&entry, entry.getFirstInsertionPt());
+        b.SetCurrentDebugLocation(entry.getFirstInsertionPt()->getDebugLoc());
+        auto f = module.getOrInsertFunction(
+            "fw_coverage_register",
+            llvm::FunctionType::get(b.getVoidTy(), {b.getPtrTy(), b.getInt64Ty(), b.getPtrTy()}, false));
+        b.CreateCall(f, {array, i64(static_cast<int64_t>(pointers.size())), b.CreateGlobalString(table)});
+        b.restoreIP(saved);
+        b.SetCurrentDebugLocation(debug);
+    }
+    // Declaring class of each private or readonly field, keyed "Class.field".
+    std::map<std::string, std::string> fieldOwners;
     std::vector<Ty> returns;
     Location location;
     uint64_t tempGeneration = 0;
@@ -292,6 +344,7 @@ class Compiler {
     std::unique_ptr<llvm::DIBuilder> dib;
     llvm::DICompileUnit *unit = nullptr;
     std::map<std::string, llvm::DIFile *> debugFiles;
+    std::map<std::string, llvm::DIType *> debugObjectTypes;
     std::string mainFile;
     llvm::DIFile *debugFile(const std::string &path) {
         auto name = path.empty() ? mainFile : path;
@@ -349,6 +402,7 @@ class Compiler {
         std::vector<LambdaContext *> lambdaStack;
         std::set<std::string> cells;
         llvm::DebugLoc debug;
+        std::string method;
     };
     FunctionState saveFunction() {
         FunctionState s{b.saveIP(),
@@ -372,7 +426,8 @@ class Compiler {
                         location,
                         std::move(lambdaStack),
                         std::move(cells),
-                        b.getCurrentDebugLocation()};
+                        b.getCurrentDebugLocation(),
+                        method};
         b.SetCurrentDebugLocation(llvm::DebugLoc());
         borrowed = false;
         attrs.clear();
@@ -409,6 +464,7 @@ class Compiler {
         location = s.location;
         lambdaStack = std::move(s.lambdaStack);
         cells = std::move(s.cells);
+        method = s.method;
         b.restoreIP(s.ip);
         b.SetCurrentDebugLocation(s.debug);
     }
@@ -542,7 +598,8 @@ class Compiler {
         if (t.numeric() || name == "bool" || name == "char" || name == "string" || name == "void" ||
             name == "element" || name == "fragment" || name == "json.value" ||
             name == "desktop.window" || name == "io.file" || name == "net.socket" ||
-            name == "net.listener" || errorTypes.count(name) || classes.count(name) ||
+            name == "net.listener" || name == "sqlite.database" || errorTypes.count(name) ||
+            classes.count(name) ||
             t.enumeration())
             return t;
         error("unknown or unsupported type '" + name + "'");
@@ -945,7 +1002,7 @@ end
         Ty base{x.t.name.substr(0, x.t.name.size() - 1)};
         if (classes.count(base.name) || base.name == "element" || base.name == "fragment" ||
             base.name == "desktop.window" || base.name == "io.file" || base.name == "net.socket" ||
-            base.name == "net.listener")
+            base.name == "net.listener" || base.name == "sqlite.database")
             return convert(x, base, true);
         return x;
     }
@@ -1037,6 +1094,14 @@ end
             return literal("<class " + displayName(x.t.name.substr(6)) + ">");
         if (x.t.name.rfind("module:", 0) == 0)
             return literal("<module " + x.t.name.substr(7) + ">");
+        // A class with `function to_string returns string` formats itself.
+        if (classes.count(x.t.name) && !resolveMethod(x.t.name, "to_string").empty() &&
+            signature(resolveMethod(x.t.name, "to_string")).ast->params.empty()) {
+            auto text = callNamedMethod(x, "to_string", {});
+            if (text.t.name != "string")
+                error(displayName(x.t.name) + ".to_string must return string");
+            return text;
+        }
         if (x.t.object())
             return {objectCall("fw_format", {frame, x.v}), Ty{"string"}};
         error("cannot format value of type " + x.t.name);
@@ -1187,11 +1252,52 @@ end
         auto a = allocate(v.t, name);
         store(a, v);
         scopes.back()[name] = {a, v.t, constant};
+        debugVariable(name, v.t, a);
+    }
+    // -g: describes a local to debuggers. Numbers, bools, and chars show their values; other
+    // values are pointers to runtime objects (print them with `fw_debug_format(name)`).
+    llvm::DIType *debugType(Ty t) {
+        if (t.integer())
+            return dib->createBasicType(t.name == "i64" ? "int" : t.name, t.bits(),
+                                        t.unsigned_() ? llvm::dwarf::DW_ATE_unsigned
+                                                      : llvm::dwarf::DW_ATE_signed);
+        if (t.real())
+            return dib->createBasicType(t.name, t.bits(), llvm::dwarf::DW_ATE_float);
+        if (t.name == "bool")
+            return dib->createBasicType("bool", 8, llvm::dwarf::DW_ATE_boolean);
+        if (t.name == "char")
+            return dib->createBasicType("char", 32, llvm::dwarf::DW_ATE_UTF);
+        if (t.enumeration())
+            return dib->createBasicType(displayName(t.name), 64, llvm::dwarf::DW_ATE_signed);
+        auto &cached = debugObjectTypes[t.name];
+        if (!cached)
+            cached = dib->createPointerType(
+                dib->createForwardDecl(llvm::dwarf::DW_TAG_structure_type, displayName(t.name),
+                                       unit, nullptr, 0),
+                64, 0, std::nullopt, displayName(t.name));
+        return cached;
+    }
+    void debugVariable(const std::string &name, Ty t, llvm::Value *address) {
+        if (!dib || !current || !current->getSubprogram() || name.empty() || name[0] == '$' ||
+            name.rfind("__fw", 0) == 0 || t.name == "void" || t.name.rfind("fn:", 0) == 0 ||
+            t.name.rfind("module:", 0) == 0 || t.classReference())
+            return;
+        auto alloca = llvm::dyn_cast<llvm::AllocaInst>(address);
+        if (!alloca)
+            return;
+        auto scope = current->getSubprogram();
+        auto line = static_cast<unsigned>(std::max(1, location.line));
+        auto variable = dib->createAutoVariable(scope, displayName(name), debugFile(location.file),
+                                                line, debugType(t), true);
+        dib->insertDeclare(alloca, variable, dib->createExpression(),
+                           llvm::DILocation::get(ctx, line, 0, scope),
+                           llvm::InsertPosition(std::next(alloca->getIterator())));
     }
     Val load(Var &v) {
         if (v.initialized && !top)
             guard(b.CreateLoad(b.getInt1Ty(), v.initialized),
                   "module global read before initialization", "RuntimeError");
+        raceGlobal(v, false);
         if (v.cell)
             return get({b.CreateLoad(b.getPtrTy(), v.address), Ty{"Error"}}, i64(0), v.type);
         if (v.narrowed) {
@@ -1218,8 +1324,11 @@ end
         if (c == classes.end())
             error("type '" + t.name + "' has no field '" + name + "'");
         for (size_t i = 0; i < c->second->fields.size(); ++i)
-            if (c->second->fields[i].name == name)
+            if (c->second->fields[i].name == name) {
+                if (c->second->fields[i].isPrivate)
+                    checkAccess(fieldOwners.at(t.name + "." + name), "field", name);
                 return {c->second, i};
+            }
         error("unknown field '" + name + "' on " + t.name);
     }
     Val get(Val obj, llvm::Value *index, Ty t) {
@@ -1275,6 +1384,42 @@ end
         return load(*v);
     }
     Val binary(const std::string &op, Val a, Val c) {
+        // Operator methods on classes: `function operator +(T other)`. `!=` negates
+        // `operator ==`; comparisons missing an operator derive from `operator <`.
+        if (classes.count(a.t.name)) {
+            auto has = [&](const std::string &name) {
+                return !resolveMethod(a.t.name, name).empty();
+            };
+            auto negate = [&](Val v) { return Val{b.CreateNot(v.v), Ty{"bool"}}; };
+            auto check = [&](Val v, const std::string &name) {
+                if ((name == "operator==" || name.find('<') != std::string::npos ||
+                     name.find('>') != std::string::npos) &&
+                    v.t.name != "bool")
+                    error(displayName(a.t.name) + "." + name + " must return bool");
+                return v;
+            };
+            auto apply = [&](const std::string &name, Val x, Val y) {
+                return check(callNamedMethod(x, name, {y}), name);
+            };
+            if (has("operator" + op))
+                return apply("operator" + op, a, c);
+            if (op == "!=" && has("operator=="))
+                return negate(apply("operator==", a, c));
+            bool sameClass = classes.count(c.t.name) && derives(c.t.name, a.t.name);
+            if (has("operator<") && sameClass) {
+                if (op == ">")
+                    return apply("operator<", c, a);
+                if (op == "<=")
+                    return negate(apply("operator<", c, a));
+                if (op == ">=")
+                    return negate(apply("operator<", a, c));
+            }
+            static const std::set<std::string> arithmetic = {"+", "-", "*", "/", "//", "%",
+                                                             "<", "<=", ">", ">="};
+            if (arithmetic.count(op))
+                error("class " + displayName(a.t.name) + " does not define operator " + op +
+                      "; declare `function operator " + op + "(...)`");
+        }
         if (op == "+" && ((a.t.name == "string" && c.t.name == "char") ||
                           (a.t.name == "char" && c.t.name == "string")))
             return binary(op, stringify(a), stringify(c));
@@ -1295,6 +1440,14 @@ end
                 auto eq = b.CreateICmpNE(call("fw_equal", b.getInt64Ty(), {a.v, c.v}), i64(0));
                 return {op == "==" ? eq : b.CreateNot(eq), Ty{"bool"}};
             }
+            // Strings order by Unicode code point (UTF-8 byte order).
+            static const std::map<std::string, llvm::CmpInst::Predicate> order = {
+                {"<", llvm::CmpInst::ICMP_SLT}, {"<=", llvm::CmpInst::ICMP_SLE},
+                {">", llvm::CmpInst::ICMP_SGT}, {">=", llvm::CmpInst::ICMP_SGE}};
+            if (auto it = order.find(op); it != order.end())
+                return {b.CreateICmp(it->second,
+                                     call("fw_string_order", b.getInt64Ty(), {a.v, c.v}), i64(0)),
+                        Ty{"bool"}};
         }
         bool optionalA = a.t.nullable() && primitive(nonNull(a.t)),
              optionalC = c.t.nullable() && primitive(nonNull(c.t));
@@ -1303,6 +1456,17 @@ end
             Ty t = optionalA ? a.t : c.t;
             auto x = convert(a, t), y = convert(c, t);
             auto eq = b.CreateICmpNE(call("fw_box_equal", b.getInt64Ty(), {x.v, y.v}), i64(0));
+            return {op == "==" ? eq : b.CreateNot(eq), Ty{"bool"}};
+        }
+        auto variantType = [&](const Ty &t) {
+            auto it = classes.find(nonNull(t).name);
+            return it != classes.end() &&
+                   (!it->second->variantOf.empty() || !it->second->variants.empty());
+        };
+        if ((op == "==" || op == "!=") && variantType(a.t) && variantType(c.t) &&
+            resolveMethod(nonNull(a.t).name, "equals").empty()) {
+            // Members of enums with data compare by member and field values.
+            auto eq = b.CreateICmpNE(call("fw_variant_equal", b.getInt64Ty(), {a.v, c.v}), i64(0));
             return {op == "==" ? eq : b.CreateNot(eq), Ty{"bool"}};
         }
         if ((optionalA || optionalC) && op != "==" && op != "!=")
@@ -1839,6 +2003,12 @@ end
     Val lambda(Expr &e, Ty expected);
     Val coalesce(Expr &e, Ty expected);
     Val typeTest(Expr &e);
+    // Private members are visible only inside methods (and lambdas in methods) of their class.
+    void checkAccess(const std::string &declaring, const std::string &kind,
+                     const std::string &name) {
+        if (owner != declaring)
+            error(kind + " '" + name + "' is private to class " + displayName(declaring));
+    }
     bool hasField(const std::string &className, const std::string &name) {
         auto c = classes.find(className);
         if (c == classes.end())
@@ -1861,6 +2031,12 @@ end
                                 const std::function<Val(llvm::Value *, Expr &)> &emit);
     Ty constructorType(const std::string &className);
     std::string instantiateClass(const std::string &base, const std::vector<Ty> &arguments);
+    void checkBounds(const std::string &generic, const std::vector<std::string> &params,
+                     const std::map<std::string, std::string> &bounds,
+                     const std::vector<Ty> &arguments);
+    std::string methodTemplate(const std::string &name, const std::string &method);
+    std::optional<Val> genericMethodCall(Val receiver, const std::string &text, Expr &e,
+                                         Ty expected);
     std::string instantiateFunction(const std::string &base, const std::vector<Ty> &arguments);
     std::optional<Val> genericCall(Expr &e, const std::string &name, Ty expected);
     uint64_t hiddenCount = 0;
@@ -1871,6 +2047,10 @@ end
     void validateClasses();
     void checkInit(Class &c, Function &init);
     void match(Stmt &s);
+    bool destructuring(Expr &p);
+    bool irrefutable(Expr &p, Ty subject);
+    void destructure(Expr &p, Val subject, llvm::BasicBlock *fail,
+                     std::vector<std::pair<std::string, Val>> &bindings);
     void iterate(Stmt &s, Val source);
     Ty lambdaBody(Function &f, const std::vector<Ty> &params, Ty result, bool inference,
                   LambdaContext &context);
@@ -1879,6 +2059,8 @@ end
     std::optional<Val> sequenceTool(Val sequence, const std::string &method, Expr &call);
     std::optional<Val> mathCall(const std::string &name, std::vector<Val> &args);
     std::optional<Val> stdlibCall(const std::string &name, std::vector<Val> &args, Ty expected);
+    Val unwrapForBinding(Val v);
+    Val expectError(Expr &e);
     std::optional<Val> resourceMethod(Val receiver, const std::string &method, Expr &e);
     Val jsonDecode(Ty t, Val json);
     llvm::Value *jsonDecodeFunction(Ty t);
@@ -1902,8 +2084,11 @@ end
             error("duplicate function '" + displayName(key) + "'");
         if (f.name == "init" && !f.owner.empty() && !f.result.empty() && f.result != "void")
             error("init cannot return a value");
-        if (!f.typeParams.empty() && !f.owner.empty())
-            error("methods cannot declare type parameters; make the class generic instead");
+        if (!f.typeParams.empty() && !f.owner.empty()) {
+            // Generic methods are instantiated per call like generic functions.
+            methodTemplates[key] = &f;
+            return;
+        }
         Signature sig;
         sig.ast = &f;
         sig.result = f.result.empty() ? (f.name == "init" ? Ty{"void"} : Ty{"$infer"})
@@ -1973,7 +2158,7 @@ end
         static const std::set<std::string> modules = {
             "desktop", "html", "math", "fs",          "os", "json",  "web", "time",
             "testing", "core", "io",   "collections", "net", "regex", "thread", "gc",
-            "svg"};
+            "svg",     "crypto", "encoding", "uuid", "compress", "sqlite", "toml", "yaml"};
         for (auto &[alias, name] : p.imports) {
             if (!modules.count(name))
                 error("module '" + name +
@@ -2003,9 +2188,12 @@ end
             error("inheritance cycle through '" + displayName(c.name) + "'");
         state = 1;
         std::set<std::string> names;
-        for (auto &f : c.fields)
+        for (auto &f : c.fields) {
             if (!names.insert(f.name).second)
                 error("duplicate field '" + f.name + "'");
+            if (f.isPrivate || f.readonly)
+                fieldOwners[c.name + "." + f.name] = c.name;
+        }
         if (!c.base.empty()) {
             c.base = type(c.base).name;
             auto base = classes.find(c.base);
@@ -2017,7 +2205,10 @@ end
                 if (names.count(f.name))
                     error("field '" + f.name + "' is already declared by base class '" +
                           displayName(c.base) + "'");
-                fields.push_back({f.name, f.type, f.value ? clone(*f.value) : nullptr, f.loc});
+                fields.push_back({f.name, f.type, f.value ? clone(*f.value) : nullptr, f.loc,
+                                  f.isPrivate, f.readonly});
+                if (f.isPrivate || f.readonly)
+                    fieldOwners[c.name + "." + f.name] = fieldOwners.at(c.base + "." + f.name);
             }
             for (auto &f : c.fields)
                 fields.push_back(std::move(f));
@@ -2051,7 +2242,7 @@ end
     std::vector<std::string> concreteClasses(const std::string &name) {
         std::vector<std::string> out;
         for (auto &[candidate, c] : classes)
-            if (!c->isInterface && derives(candidate, name))
+            if (!c->isInterface && c->variants.empty() && derives(candidate, name))
                 out.push_back(candidate);
         return out;
     }
@@ -2087,6 +2278,8 @@ end
     }
     void run(const Options &opts) {
         desktopBackend = opts.desktopBackend;
+        coverage = opts.coverage;
+        race = opts.race;
         if (opts.debug) {
             dib = std::make_unique<llvm::DIBuilder>(module);
             mainFile = module.getModuleIdentifier();
@@ -2100,9 +2293,12 @@ end
             llvm::FunctionType::get(b.getInt32Ty(), {b.getInt32Ty(), b.getPtrTy()}, false),
             llvm::GlobalValue::ExternalLinkage, "main", module);
         auto entry = llvm::BasicBlock::Create(ctx, "entry", current);
+        auto mainFunction = current;
         b.SetInsertPoint(entry);
         if (dib)
             debugFunction(current, "main", {1, 1, mainFile});
+        if (race)
+            call("fw_race_enable", b.getVoidTy(), {});
         frame = objectCall("fw_frame", {});
         call("fw_set_args", b.getVoidTy(),
              {b.CreateSExt(current->getArg(0), b.getInt64Ty()), current->getArg(1)});
@@ -2155,6 +2351,8 @@ end
         for (auto &[name, body] : p.components)
             if (!instantiatedComponents.count(name))
                 checkTemplate(*body);
+        if (coverage)
+            registerCoverage(mainFunction);
         if (dib)
             dib->finalize();
         if (llvm::verifyModule(module, &llvm::errs()))
@@ -2341,6 +2539,15 @@ Val Compiler::value(Expr &e, Ty expected) {
             error("generic function " + displayName(name) +
                   " needs type arguments to be used as a value, such as " + displayName(name) +
                   "<int>");
+        // A member of an enum with data that has no fields is a value: Shape.Empty.
+        if (classes.count(name) && !classes.at(name)->variantOf.empty() &&
+            classes.at(name)->fields.empty() && !lookup(name)) {
+            Expr construct;
+            construct.kind = "call";
+            construct.loc = e.loc;
+            construct.args.push_back(clone(e));
+            return invoke(construct, expected);
+        }
         // A bare class name is a constructor reference; construction always uses a call.
         if (classes.count(name) || name == "desktop.window")
             return {llvm::ConstantPointerNull::get(b.getPtrTy()), Ty{"class:" + name}};
@@ -2379,6 +2586,20 @@ Val Compiler::value(Expr &e, Ty expected) {
         return {llvm::ConstantPointerNull::get(b.getPtrTy()), Ty{"null"}};
     if (e.kind == "string")
         return literal(e.text);
+    if (e.kind == "format") {
+        // `{value:spec}` in an interpolated string.
+        auto x = unwrap(value(*e.args[0]));
+        auto spec = literal(e.text);
+        if (x.t.integer())
+            return {objectCall("fw_format_int",
+                               {frame, convert(x, x.t.unsigned_() ? Ty{"u64"} : Ty{"i64"}).v,
+                                i64(x.t.unsigned_()), spec.v}),
+                    Ty{"string"}};
+        if (x.t.real())
+            return {objectCall("fw_format_real", {frame, convert(x, Ty{"double"}).v, spec.v}),
+                    Ty{"string"}};
+        return {objectCall("fw_format_text", {frame, stringify(x).v, spec.v}), Ty{"string"}};
+    }
     if (e.kind == "interpolate") {
         Val out = literal("");
         for (auto &x : e.args) {
@@ -2504,6 +2725,12 @@ Val Compiler::value(Expr &e, Ty expected) {
                 return {objectCall("fw_json_get", {frame, obj.v, key.v}), obj.t};
             return {objectCall("fw_json_at", {frame, obj.v, convert(key, Ty{"i64"}).v}), obj.t};
         }
+        if (classes.count(obj.t.name)) {
+            if (resolveMethod(obj.t.name, "operator[]").empty())
+                error("class " + displayName(obj.t.name) +
+                      " cannot be indexed; declare `function operator [](...)`");
+            return callNamedMethod(obj, "operator[]", {value(position)});
+        }
         auto [index, t] = indexOf(obj, position, false);
         return get(obj, index, t);
     }
@@ -2613,6 +2840,12 @@ Val Compiler::value(Expr &e, Ty expected) {
             if (a.t.name != "bool")
                 error("'not' requires bool (no implicit truthiness)");
             return {b.CreateNot(a.v), a.t};
+        }
+        if (classes.count(a.t.name) && e.text == "-") {
+            if (resolveMethod(a.t.name, "operator-()").empty())
+                error("class " + displayName(a.t.name) +
+                      " does not define unary minus; declare `function operator -()`");
+            return callNamedMethod(a, "operator-()", {});
         }
         if (!a.t.numeric())
             error("unary operator requires a number");
@@ -2816,7 +3049,10 @@ Val Compiler::value(Expr &e, Ty expected) {
             }
             if (!attributeAllowed(*rules, name))
                 error("unknown attribute '" + name + "' on <" + e.text + ">");
-            auto x = value(*e.args[i]);
+            // A valueless attribute (`<input disabled>`) is true for a boolean attribute.
+            bool valueless = e.args[i]->kind == "string" && e.args[i]->outer;
+            auto x = valueless && rules->booleans.count(name) ? Val{b.getTrue(), Ty{"bool"}}
+                                                               : value(*e.args[i]);
             auto key = literal(name);
             if (rules->booleans.count(name)) {
                 if (x.t.name != "bool")
@@ -2995,6 +3231,13 @@ std::optional<Val> Compiler::domCall(const std::string &name, std::vector<Val> a
     if (name.rfind("html.", 0) != 0)
         return std::nullopt;
     auto method = name.substr(5);
+    if (method == "parse") {
+        // html.parse(text): a fragment holding the parsed nodes.
+        if (args.size() != 1)
+            error("html.parse expects HTML text");
+        return Val{objectCall("fw_html_parse", {frame, convert(args[0], Ty{"string"}).v}),
+                   Ty{"fragment"}};
+    }
     static const std::set<std::string> methods = {"attributes",
                                                   "closest",
                                                   "query",
@@ -3129,6 +3372,51 @@ std::optional<Val> Compiler::domCall(const std::string &name, std::vector<Val> a
                                                : 3;
     return flag("fw_dom_class", {root.v, text(1), i64(operation)});
 }
+// testing.expect_error(ErrorType, function): calls the function, requires it to raise that
+// error type (or a subtype), and returns the error. Compiled as a generated try/catch.
+Val Compiler::expectError(Expr &e) {
+    if (e.args.size() != 3 || e.args[1]->kind != "name")
+        error("testing.expect_error expects an error type and a function, such as "
+              "testing.expect_error(ValueError, function() => int(\"x\"))");
+    auto errorType = e.args[1]->text;
+    if (!errorTypes.count(errorType) && !classes.count(errorType))
+        error("'" + displayName(errorType) + "' is not an error type");
+    auto function = asFunction(value(*e.args[2]));
+    if (!function.t.function() || function.t.parts().size() != 1)
+        error("testing.expect_error needs a function without parameters");
+    auto id = std::to_string(hiddenCount++);
+    auto f = "__fw_expect_f" + id, caught = "__fw_expect_caught" + id, err = "__fw_expect_e" + id;
+    bind(f, function, true);
+    auto call = function.t.parts()[0].name == "void" ? f + "()"
+                                                     : "var __fw_expect_r" + id + " = " + f + "()";
+    auto text = "__FW_T? " + caught + " = null\ntry\n    " + call + "\ncatch __FW_T " + err +
+                "\n    " + caught + " = " + err + "\nend\nif " + caught +
+                " == null then\n    throw AssertionError(\"expected __FW_NAME, but nothing was "
+                "raised\")\nend\n";
+    auto pos = text.find("__FW_NAME");
+    text.replace(pos, 9, displayName(errorType));
+    auto generated = Parser(lex(text)).parse();
+    std::function<void(Stmt &)> place = [&](Stmt &st) {
+        st.loc = e.loc;
+        if (st.type == "__FW_T?")
+            st.type = errorType + "?";
+        for (auto &t : st.catchTypes)
+            if (t == "__FW_T")
+                t = errorType;
+        for (auto *list : {&st.body, &st.other, &st.finalizer})
+            for (auto &inner : *list)
+                place(*inner);
+        for (auto &c : st.catches)
+            for (auto &inner : c)
+                place(*inner);
+    };
+    for (auto &st : generated.body) {
+        place(*st);
+        statement(*st);
+    }
+    auto result = syntheticName(caught, e.loc);
+    return value(*result);
+}
 Val Compiler::invoke(Expr &e, Ty expected) {
     auto &callee = *e.args[0];
     std::vector<Expr *> rest;
@@ -3136,6 +3424,9 @@ Val Compiler::invoke(Expr &e, Ty expected) {
         rest.push_back(e.args[i].get());
     if (callee.kind == "inst" && !owner.empty() && !resolveMethod(owner, callee.text).empty())
         return callMethod(receiver(), owner, callee.text, e, false);
+    if (callee.kind == "inst" && !owner.empty())
+        if (auto result = genericMethodCall(receiver(), callee.text, e, expected))
+            return *result;
     if (callee.kind == "member" && callee.args[0]->kind == "super") {
         if (owner.empty())
             error("'super' is valid only in a method");
@@ -3214,6 +3505,8 @@ Val Compiler::invoke(Expr &e, Ty expected) {
         return callClosure(function, rest);
     }
     std::string name = callable(callee);
+    if (name == "testing.expect_error")
+        return expectError(e);
     if (callee.kind == "name" && !lookup(name))
         if (auto result = genericCall(e, name, expected))
             return *result;
@@ -3250,6 +3543,9 @@ Val Compiler::invoke(Expr &e, Ty expected) {
     if (method && classes.count(receiverValue.t.name) &&
         !resolveMethod(receiverValue.t.name, callee.text).empty())
         return callMethod(receiverValue, receiverValue.t.name, callee.text, e, false);
+    if (method && classes.count(receiverValue.t.name))
+        if (auto result = genericMethodCall(receiverValue, callee.text, e, expected))
+            return *result;
     if (method && classes.count(receiverValue.t.name) && !functions.count(name)) {
         auto c = classes.at(receiverValue.t.name);
         for (size_t i = 0; i < c->fields.size(); ++i)
@@ -3257,6 +3553,16 @@ Val Compiler::invoke(Expr &e, Ty expected) {
                 return callClosure(get(receiverValue, i64(static_cast<int64_t>(i)),
                                        type(c->fields[i].type)),
                                    rest);
+    }
+    if (method && (receiverValue.t.array() || receiverValue.t.map() || receiverValue.t.set()) &&
+        (callee.text == "freeze" || callee.text == "is_frozen")) {
+        // xs.freeze() makes a collection immutable in place and returns it.
+        if (e.args.size() != 1)
+            error(callee.text + " expects no arguments");
+        auto flag = call("fw_freeze", b.getInt64Ty(), {receiverValue.v, i64(callee.text == "freeze")});
+        if (callee.text == "is_frozen")
+            return {b.CreateICmpNE(flag, i64(0)), Ty{"bool"}};
+        return receiverValue;
     }
     if (method && receiverValue.t.weak()) {
         if (e.args.size() != 1 || (callee.text != "get" && callee.text != "alive"))
@@ -3491,6 +3797,9 @@ Val Compiler::invoke(Expr &e, Ty expected) {
         auto c = classes.at(name);
         if (c->isInterface)
             error("interface " + displayName(name) + " cannot be constructed");
+        if (!c->variants.empty())
+            error("enum " + displayName(name) + " is constructed through a member, such as " +
+                  displayName(c->variants[0]) + "(...)");
         if (!resolveMethod(name, "init").empty()) {
             // Fields with defaults are set first; init assigns the rest.
             Val obj = newInstance(*c);
@@ -3776,6 +4085,53 @@ Val Compiler::invoke(Expr &e, Ty expected) {
         set(response, i64(2), headers);
         return response;
     }
+    if (name == "web.get" || name == "web.post" || name == "web.put" || name == "web.patch" ||
+        name == "web.delete" || name == "web.head" || name == "web.fetch") {
+        // HTTP client calls: web.get(url, headers = {}), web.post(url, body, headers = {}),
+        // web.fetch(method, url, body = "", headers = {}, timeout = 30.0).
+        bool fetch = name == "web.fetch";
+        bool withBody = name == "web.post" || name == "web.put" || name == "web.patch";
+        size_t low = fetch ? 2 : withBody ? 2 : 1, high = fetch ? 5 : withBody ? 3 : 2;
+        if (args.size() < low || args.size() > high)
+            error(name + (fetch ? " expects method, url, and optional body, headers, timeout"
+                          : withBody ? " expects url, body, and optional headers"
+                                     : " expects url and optional headers"));
+        size_t at = 0;
+        auto method = fetch ? convert(args[at++], Ty{"string"})
+                            : literal(name == "web.delete" ? "DELETE" : [&] {
+                                  std::string m = name.substr(4);
+                                  for (auto &c : m)
+                                      c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                                  return m;
+                              }());
+        auto url = convert(args[at++], Ty{"string"});
+        Val body = literal("");
+        bool jsonBody = false;
+        if ((fetch || withBody) && at < args.size()) {
+            body = args[at++];
+            if (body.t.name == "json.value") {
+                body = {objectCall("fw_json_stringify", {frame, body.v}), Ty{"string"}};
+                jsonBody = true;
+            }
+            body = convert(body, Ty{"string"});
+        }
+        Val headers;
+        if (at < args.size()) {
+            if (args[at].t.name != "map<string,string>")
+                error(name + " headers must be map<string, string>");
+            headers = args[at++];
+        } else
+            headers = {objectCall("fw_map_new", {frame, i64(4)}), Ty{"map<string,string>"}};
+        if (jsonBody)
+            set(headers, mapIndex(headers, literal("Content-Type"), true),
+                literal("application/json"));
+        auto timeout = at < args.size() ? convert(args[at], Ty{"double"}, true).v
+                                         : llvm::ConstantFP::get(b.getDoubleTy(), 30.0);
+        Val response = newInstance(*classes.at("web.response"));
+        call("fw_http_fetch", b.getVoidTy(),
+             {frame, method.v, url.v, body.v, headers.v, timeout, response.v});
+        return response;
+    }
     if (name == "web.workers") {
         count(1);
         call("fw_web_workers", b.getVoidTy(), {convert(args[0], Ty{"i64"}).v});
@@ -3911,6 +4267,8 @@ Val Compiler::invoke(Expr &e, Ty expected) {
 }
 void Compiler::statement(Stmt &s) {
     location = s.loc;
+    if (s.kind != "declare" || s.expr)
+        countLine(s.loc);
     debugLocation();
     if (s.kind == "throw") {
         auto x = value(*s.expr);
@@ -4039,6 +4397,21 @@ void Compiler::statement(Stmt &s) {
             bind(s.name, x, s.op == "const");
         return;
     }
+    if (s.kind == "destructure") {
+        // After `var (a, b) = items`: the element count must match the names.
+        auto items = lookup(s.name);
+        auto t = items->type;
+        auto count = std::stoll(s.op);
+        if (t.tuple()) {
+            if (static_cast<int64_t>(t.parts().size()) != count)
+                error("cannot destructure a tuple of " + std::to_string(t.parts().size()) +
+                      " elements into " + s.op + " names");
+        } else if (t.sequence())
+            call("fw_check_length", b.getVoidTy(), {load(*items).v, i64(count)});
+        else
+            error("destructuring needs a tuple or array, not " + displayName(t.name));
+        return;
+    }
     if (s.kind == "assign") {
         Var *variable = nullptr;
         Val object, mapKey;
@@ -4068,6 +4441,13 @@ void Compiler::statement(Stmt &s) {
                 target = Ty{"string"};
             } else {
                 auto [c, i] = field(object.t, s.target->text);
+                // Readonly fields are set by constructors and by init of their own class.
+                if (c->fields[i].readonly &&
+                    (method != "init" ||
+                     owner != fieldOwners.at(object.t.name + "." + s.target->text)))
+                    error("field '" + s.target->text + "' is readonly; it can be set only in " +
+                          "the constructor or init of " +
+                          displayName(fieldOwners.at(object.t.name + "." + s.target->text)));
                 index = i64(i);
                 target = type(c->fields[i].type);
             }
@@ -4075,6 +4455,24 @@ void Compiler::statement(Stmt &s) {
             object = value(*s.target->args[0]);
             if (object.t.name == "string")
                 error("strings are immutable; build a new string instead");
+            if (classes.count(object.t.name)) {
+                // obj[key] = value calls `operator []=`; compound forms read with `operator []`.
+                if (resolveMethod(object.t.name, "operator[]=").empty())
+                    error("class " + displayName(object.t.name) +
+                          " does not support index assignment; declare `function operator []=(K "
+                          "key, V value)`");
+                auto key = value(*s.target->args[1]);
+                auto &setter = signature(resolveMethod(object.t.name, "operator[]="));
+                auto valueType = type(setter.ast->params[1].type);
+                Val rhs;
+                if (s.op != "=") {
+                    auto old = callNamedMethod(object, "operator[]", {key});
+                    rhs = binary(s.op.substr(0, s.op.size() - 1), old, value(*s.expr, valueType));
+                } else
+                    rhs = value(*s.expr, valueType);
+                callNamedMethod(object, "operator[]=", {key, rhs});
+                return;
+            }
             if (object.t.map()) {
                 mapKey =
                     convert(value(*s.target->args[1], object.t.parts()[0]), object.t.parts()[0]);
@@ -4103,8 +4501,10 @@ void Compiler::statement(Stmt &s) {
             index = mapIndex(object, mapKey, true);
         if (variable && variable->cell)
             set({b.CreateLoad(b.getPtrTy(), variable->address), Ty{"Error"}}, i64(0), rhs);
-        else if (variable)
+        else if (variable) {
+            raceGlobal(*variable, true);
             store(variable->address, rhs);
+        }
         else if (!domProperty.empty()) {
             if (domProperty == "text_content")
                 call("fw_dom_set_text", b.getVoidTy(), {object.v, rhs.v});
@@ -4340,6 +4740,7 @@ void Compiler::buildFunction(Signature &sig, bool inference) {
     sig.building = true;
     auto saved = saveFunction();
     owner = sig.ast->owner;
+    method = sig.ast->name;
     top = false;
     infer = inference;
     returnType = inference ? Ty{"void"} : sig.result;
@@ -4490,8 +4891,9 @@ std::optional<Val> Compiler::stdlibCall(const std::string &name, std::vector<Val
         return std::nullopt;
     auto module = name.substr(0, dot);
     auto function = name.substr(dot + 1);
-    static const std::set<std::string> modules = {"fs", "time", "regex", "io",    "json",
-                                                  "os", "net",  "gc",    "thread"};
+    static const std::set<std::string> modules = {
+        "fs",     "time",     "regex", "io",       "json",   "os",  "net",
+        "gc",     "thread",   "crypto", "encoding", "uuid", "compress", "sqlite", "toml", "yaml"};
     if (!modules.count(module))
         return std::nullopt;
     auto arity = [&](size_t low, size_t high) {
@@ -4608,6 +5010,117 @@ std::optional<Val> Compiler::stdlibCall(const std::string &name, std::vector<Val
             values.push_back(args.size() == 6 ? real(5)
                                               : llvm::ConstantFP::get(b.getDoubleTy(), 0.0));
             return Val{call("fw_time_from_date", b.getDoubleTy(), values), Ty{"double"}};
+        }
+        return std::nullopt;
+    }
+    if (module == "crypto") {
+        static const std::map<std::string, int> hashes = {{"sha256", 0}, {"sha1", 1}, {"md5", 2}};
+        auto base = function;
+        bool raw = false, keyed = false;
+        if (base.size() > 6 && base.compare(base.size() - 6, 6, "_bytes") == 0) {
+            raw = true;
+            base.resize(base.size() - 6);
+        }
+        if (base.rfind("hmac_", 0) == 0) {
+            keyed = true;
+            base = base.substr(5);
+        }
+        if (auto it = hashes.find(base); it != hashes.end()) {
+            arity(keyed ? 2 : 1, keyed ? 2 : 1);
+            auto key = keyed ? str(0) : llvm::ConstantPointerNull::get(b.getPtrTy());
+            return object("fw_hash", {str(keyed ? 1 : 0), i64(it->second), i64(raw), key},
+                          Ty{"string"});
+        }
+        if (function == "random_bytes" || function == "random_hex") {
+            arity(1, 1);
+            return object("fw_random_bytes", {integer(0), i64(function == "random_hex")},
+                          Ty{"string"});
+        }
+        if (function == "token") {
+            arity(0, 1);
+            auto bytes = object("fw_random_bytes", {args.empty() ? i64(32) : integer(0), i64(0)},
+                                Ty{"string"});
+            return object("fw_encode", {bytes.v, i64(1), i64(0)}, Ty{"string"});
+        }
+        if (function == "random_int") {
+            arity(2, 2);
+            return Val{call("fw_secure_int", b.getInt64Ty(), {integer(0), integer(1)}), Ty{"i64"}};
+        }
+        if (function == "secure_equal") {
+            arity(2, 2);
+            return flag("fw_secure_equal", {str(0), str(1)});
+        }
+        return std::nullopt;
+    }
+    if (module == "encoding") {
+        static const std::map<std::string, int> formats = {
+            {"base64", 0}, {"base64url", 1}, {"hex", 2}, {"url", 3}, {"form", 4}};
+        auto underscore = function.rfind('_');
+        if (underscore != std::string::npos) {
+            auto format = formats.find(function.substr(0, underscore));
+            auto direction = function.substr(underscore + 1);
+            if (format != formats.end() && (direction == "encode" || direction == "decode")) {
+                arity(1, 1);
+                return object("fw_encode",
+                              {str(0), i64(format->second), i64(direction == "decode")},
+                              Ty{"string"});
+            }
+        }
+        return std::nullopt;
+    }
+    if (module == "toml" || module == "yaml") {
+        if (function == "parse") {
+            arity(1, 1);
+            return object(module == "toml" ? "fw_toml_parse" : "fw_yaml_parse", {str(0)},
+                          Ty{"json.value"});
+        }
+        return std::nullopt;
+    }
+    if (module == "sqlite") {
+        if (function == "open") {
+            arity(1, 1);
+            return object("fw_sqlite_open", {str(0)}, Ty{"sqlite.database"});
+        }
+        return std::nullopt;
+    }
+    if (module == "uuid") {
+        if (function == "v4" || function == "v7") {
+            arity(0, 0);
+            return object("fw_uuid", {i64(function == "v4" ? 4 : 7)}, Ty{"string"});
+        }
+        if (function == "is_valid") {
+            arity(1, 1);
+            return flag("fw_uuid_valid", {str(0)});
+        }
+        return std::nullopt;
+    }
+    if (module == "compress") {
+        static const std::map<std::string, int> compressors = {
+            {"gzip", 0}, {"zlib", 1}, {"deflate", 2}};
+        static const std::map<std::string, int> decompressors = {
+            {"gunzip", 0}, {"unzlib", 1}, {"inflate", 2}};
+        if (auto it = compressors.find(function); it != compressors.end()) {
+            arity(1, 2);
+            return object("fw_compress", {str(0), i64(it->second), args.size() == 2 ? integer(1) : i64(6)},
+                          Ty{"string"});
+        }
+        if (auto it = decompressors.find(function); it != decompressors.end()) {
+            arity(1, 1);
+            return object("fw_decompress", {str(0), i64(it->second)}, Ty{"string"});
+        }
+        if (function == "crc32") {
+            arity(1, 1);
+            return Val{call("fw_crc32", b.getInt64Ty(), {str(0)}), Ty{"i64"}};
+        }
+        if (function == "zip") {
+            arity(1, 1);
+            if (args[0].t.name != "map<string,string>")
+                error("compress.zip expects map<string, string> (file name -> contents)");
+            return object("fw_zip", {args[0].v}, Ty{"string"});
+        }
+        if (function == "unzip") {
+            arity(1, 1);
+            return object("fw_unzip", {str(0)}, Ty{"map<string,string>"});
         }
         return std::nullopt;
     }
@@ -4796,13 +5309,25 @@ std::optional<Val> Compiler::stdlibCall(const std::string &name, std::vector<Val
     }
     return std::nullopt;
 }
+// A value bound to an SQL parameter: numbers, bools, chars, strings, enums (by index), and
+// nullable forms of these.
+Val Compiler::unwrapForBinding(Val v) {
+    auto base = nonNull(v.t);
+    if (!(base.numeric() || base.name == "bool" || base.name == "char" || base.name == "string" ||
+          base.enumeration() || v.t.name == "null"))
+        error("SQL parameters must be numbers, bools, strings, or null; got " +
+              displayName(v.t.name));
+    if (base.name == "u64")
+        error("u64 values cannot be SQL parameters; SQLite integers are signed 64-bit");
+    return v;
+}
 std::optional<Val> Compiler::resourceMethod(Val receiver, const std::string &method, Expr &e) {
     auto t = nonNull(receiver.t).name;
     bool generic = t.back() == '>';
     bool task = generic && t.rfind("thread.task<", 0) == 0,
          channel = generic && t.rfind("thread.channel<", 0) == 0;
     if (t != "io.file" && t != "net.socket" && t != "net.listener" && t != "os.process" &&
-        t != "thread.mutex" && !task && !channel)
+        t != "thread.mutex" && t != "sqlite.database" && !task && !channel)
         return std::nullopt;
     if (receiver.t.nullable())
         receiver = convert(receiver, Ty{t}, true);
@@ -4889,6 +5414,35 @@ std::optional<Val> Compiler::resourceMethod(Val receiver, const std::string &met
             return std::nullopt;
         arity(0, 0);
         return object("fw_os_run", {receiver.v}, Ty{"os.result"});
+    }
+    if (t == "sqlite.database") {
+        if (method == "execute" || method == "query") {
+            // db.execute(sql, values...) / db.query(sql, values...): `?` parameters bind the
+            // values in order.
+            if (supplied < 1)
+                error("sqlite.database." + method + " expects SQL and optional values");
+            auto sql = argument(1, Ty{"string"});
+            Val params{objectCall("fw_new", {frame, i64(static_cast<int64_t>(supplied - 1)), i64(1)}),
+                       Ty{"json.value[]"}};
+            for (size_t i = 2; i <= supplied; ++i) {
+                auto v = unwrapForBinding(value(*e.args[i]));
+                set(params, i64(static_cast<int64_t>(i - 2)), v);
+            }
+            if (method == "execute")
+                return Val{call("fw_sqlite_execute", b.getInt64Ty(), {receiver.v, sql, params.v}),
+                           Ty{"i64"}};
+            return object("fw_sqlite_query", {receiver.v, sql, params.v}, Ty{"json.value"});
+        }
+        if (method == "last_insert_id") {
+            arity(0, 0);
+            return Val{call("fw_sqlite_last_insert", b.getInt64Ty(), {receiver.v}), Ty{"i64"}};
+        }
+        if (method == "close") {
+            arity(0, 0);
+            call("fw_sqlite_close", b.getVoidTy(), {receiver.v});
+            return Val{};
+        }
+        error("sqlite.database has execute, query, last_insert_id, and close");
     }
     if (t == "io.file") {
         static const std::map<std::string, std::pair<int, std::string>> reads = {
@@ -5663,6 +6217,130 @@ void unify(std::string pattern, const std::string &concrete, const std::set<std:
     }
 }
 } // namespace
+// Checks type arguments against constraints such as `T implements Comparable`. Besides classes
+// and interfaces, a bound may be `numeric`, `comparable` (supports <), or `hashable`.
+void Compiler::checkBounds(const std::string &generic, const std::vector<std::string> &params,
+                           const std::map<std::string, std::string> &bounds,
+                           const std::vector<Ty> &arguments) {
+    for (size_t i = 0; i < params.size() && i < arguments.size(); ++i) {
+        auto it = bounds.find(params[i]);
+        if (it == bounds.end())
+            continue;
+        auto &bound = it->second;
+        auto t = arguments[i];
+        bool ok;
+        if (bound == "numeric")
+            ok = t.numeric();
+        else if (bound == "comparable")
+            ok = t.numeric() || t.name == "string" || t.name == "char" ||
+                 (classes.count(t.name) && !resolveMethod(t.name, "operator<").empty());
+        else if (bound == "hashable")
+            ok = hashable(t);
+        else {
+            auto target = type(bound);
+            if (!classes.count(target.name))
+                error("constraint " + displayName(bound) + " on " + params[i] +
+                      " must be a class, an interface, numeric, comparable, or hashable");
+            ok = classes.count(t.name) && derives(t.name, target.name);
+        }
+        if (!ok)
+            error("type argument " + displayName(t.name) + " for " + params[i] + " of " +
+                  displayName(generic) + " does not satisfy '" + params[i] +
+                  (bound == "numeric" || bound == "comparable" || bound == "hashable"
+                       ? " is " : " implements ") +
+                  displayName(bound) + "'");
+    }
+}
+// The generic method `method` of class `name` or a base class: its "Class.method" key or "".
+std::string Compiler::methodTemplate(const std::string &name, const std::string &method) {
+    auto it = classes.find(name);
+    if (it == classes.end())
+        return "";
+    if (methodTemplates.count(name + "." + method))
+        return name + "." + method;
+    if (!it->second->base.empty())
+        return methodTemplate(it->second->base, method);
+    return "";
+}
+// A call of a generic method, `obj.convert<int>(x)` or with type arguments inferred from the
+// arguments. Each instantiation is a non-virtual method of the declaring class.
+std::optional<Val> Compiler::genericMethodCall(Val receiver, const std::string &text, Expr &e,
+                                               Ty expected) {
+    auto open = text.find('<');
+    auto name = text.substr(0, open);
+    auto key = methodTemplate(receiver.t.name, name);
+    if (key.empty())
+        return std::nullopt;
+    auto &templ = *methodTemplates.at(key);
+    auto ownerClass = key.substr(0, key.size() - name.size() - 1);
+    std::vector<Ty> arguments;
+    std::vector<Val> values;
+    if (open != std::string::npos) {
+        for (auto &part : typeParts(text.substr(open + 1, text.size() - open - 2)))
+            arguments.push_back(type(part));
+        if (arguments.size() != templ.typeParams.size())
+            error(displayName(key) + " expects " + std::to_string(templ.typeParams.size()) +
+                  " type argument(s)");
+    } else {
+        std::set<std::string> names(templ.typeParams.begin(), templ.typeParams.end());
+        std::map<std::string, std::string> bound;
+        for (size_t i = 1; i < e.args.size(); ++i) {
+            auto v = asFunction(value(*e.args[i]));
+            if (v.t.classReference())
+                v = convert(v, constructorType(v.t.name.substr(6)));
+            if (i - 1 < templ.params.size())
+                unify(templ.params[i - 1].type, v.t.name, names, bound);
+            values.push_back(v);
+        }
+        for (auto &param : templ.typeParams) {
+            if (!bound.count(param))
+                error("cannot infer type parameter " + param + " of " + displayName(key) +
+                      "; write " + name + "<...>(...)");
+            arguments.push_back(type(bound.at(param)));
+        }
+    }
+    std::string instance = name + "<";
+    std::map<std::string, std::string> bindings;
+    for (size_t i = 0; i < arguments.size(); ++i) {
+        instance += (i ? "," : "") + arguments[i].name;
+        bindings[templ.typeParams[i]] = arguments[i].name;
+    }
+    instance += ">";
+    if (!functions.count(ownerClass + "." + instance)) {
+        checkBounds(key, templ.typeParams, templ.typeBounds, arguments);
+        auto saved = location;
+        functionInstances.push_back(clone(templ));
+        auto &f = functionInstances.back();
+        f.name = instance;
+        f.typeParams.clear();
+        substitute(f, bindings);
+        declareFunction(f);
+        location = saved;
+    }
+    Expr call;
+    call.kind = "call";
+    call.loc = e.loc;
+    auto callee = std::make_unique<Expr>();
+    callee->kind = "member";
+    callee->text = instance;
+    callee->loc = e.loc;
+    call.args.push_back(std::move(callee));
+    scopes.emplace_back();
+    if (open != std::string::npos)
+        for (size_t i = 1; i < e.args.size(); ++i)
+            call.args.push_back(clone(*e.args[i]));
+    else
+        for (auto &v : values) {
+            auto hidden = "$g" + std::to_string(hiddenCount++);
+            bind(hidden, v, true);
+            call.args.push_back(syntheticName(hidden, e.loc));
+        }
+    auto result = callMethod({receiver.v, Ty{ownerClass}}, ownerClass, instance, call, true);
+    releaseScopes(scopes.size() - 1);
+    scopes.pop_back();
+    (void)expected;
+    return result;
+}
 std::string Compiler::instantiateClass(const std::string &base, const std::vector<Ty> &arguments) {
     auto &templ = *templates.at(base);
     if (arguments.size() != templ.typeParams.size())
@@ -5679,6 +6357,7 @@ std::string Compiler::instantiateClass(const std::string &base, const std::vecto
     key += ">";
     if (classes.count(key))
         return key;
+    checkBounds(base, templ.typeParams, templ.typeBounds, arguments);
     if (key.size() > 2000)
         error("generic instantiation of " + displayName(base) + " is too deeply nested");
     auto saved = location;
@@ -5721,6 +6400,7 @@ std::string Compiler::instantiateFunction(const std::string &base,
     key += ">";
     if (functions.count(key))
         return key;
+    checkBounds(base, templ.typeParams, templ.typeBounds, arguments);
     auto saved = location;
     functionInstances.push_back(clone(templ));
     auto &f = functionInstances.back();
@@ -5851,6 +6531,8 @@ Val Compiler::constructorValue(const std::string &className, Ty to) {
 Val Compiler::boundMethod(Val receiver, const std::string &method) {
     auto key = resolveMethod(receiver.t.name, method);
     auto &sig = signature(key);
+    if (sig.ast->isPrivate)
+        checkAccess(key.substr(0, key.size() - method.size() - 1), "method", method);
     std::string t = "function<" + sig.result.name;
     for (auto &param : sig.ast->params)
         t += "," + type(param.type).name;
@@ -5913,6 +6595,8 @@ Val Compiler::callMethod(Val receiver, const std::string &staticType, const std:
     if (key.empty())
         error("type " + displayName(staticType) + " has no method '" + method + "'");
     auto &sig = signature(key);
+    if (sig.ast->isPrivate)
+        checkAccess(key.substr(0, key.size() - method.size() - 1), "method", method);
     size_t supplied = e.args.size() - 1;
     if (supplied > sig.ast->params.size())
         error("too many arguments to " + displayName(key));
@@ -6161,6 +6845,97 @@ void Compiler::iterate(Stmt &s, Val source) {
     releaseScopes(scopes.size() - 1);
     scopes.pop_back();
 }
+// A pattern that unpacks: `[x, y]` or `Shape.Circle(r)`.
+bool Compiler::destructuring(Expr &p) {
+    return p.kind == "array" ||
+           (p.kind == "call" && p.args[0]->kind == "name" && classes.count(p.args[0]->text) &&
+            !classes.at(p.args[0]->text)->variantOf.empty());
+}
+// True when a destructuring pattern matches every value of its shape: it only binds names.
+bool Compiler::irrefutable(Expr &p, Ty subject) {
+    for (size_t i = p.kind == "call" ? 1 : 0; i < p.args.size(); ++i) {
+        auto &a = *p.args[i];
+        if (a.kind == "bind")
+            continue;
+        if (destructuring(a) && a.kind == "array" && irrefutable(a, Ty{}))
+            continue;
+        return false;
+    }
+    // Arrays of unknown length can fail the length check; tuples cannot.
+    return p.kind == "call" || nonNull(subject).tuple();
+}
+// Emits the tests of a destructuring pattern, branching to `fail` on a mismatch, and collects
+// the names it binds. Code continues in the success path.
+void Compiler::destructure(Expr &p, Val subject, llvm::BasicBlock *fail,
+                           std::vector<std::pair<std::string, Val>> &bindings) {
+    location = p.loc;
+    auto check = [&](llvm::Value *condition) {
+        auto pass = llvm::BasicBlock::Create(ctx, "pattern.pass", current);
+        b.CreateCondBr(condition, pass, fail);
+        b.SetInsertPoint(pass);
+    };
+    if (subject.t.nullable()) {
+        if (subject.t.name == "null")
+            error("a destructuring pattern cannot match null");
+        check(b.CreateICmpNE(subject.v, llvm::ConstantPointerNull::get(b.getPtrTy())));
+        subject = unboxChecked(subject);
+    }
+    std::vector<Val> parts;
+    size_t first = 0;
+    if (p.kind == "call") {
+        auto variant = p.args[0]->text;
+        auto &c = *classes.at(variant);
+        if (!classes.count(subject.t.name) ||
+            (!derives(variant, subject.t.name) && !derives(subject.t.name, variant)))
+            error(displayName(variant) + " can never match " + displayName(subject.t.name));
+        if (p.args.size() - 1 != c.fields.size())
+            error(displayName(variant) + " has " + std::to_string(c.fields.size()) +
+                  " field(s); the pattern lists " + std::to_string(p.args.size() - 1));
+        if (variant != subject.t.name)
+            check(isInstance(subject.v, variant));
+        Val typed{subject.v, Ty{variant}};
+        for (size_t i = 0; i < c.fields.size(); ++i)
+            parts.push_back(get(typed, i64(static_cast<int64_t>(i)), type(c.fields[i].type)));
+        first = 1;
+    } else {
+        auto count = static_cast<int64_t>(p.args.size());
+        if (subject.t.tuple()) {
+            auto types = subject.t.parts();
+            if (static_cast<int64_t>(types.size()) != count)
+                error("a tuple of " + std::to_string(types.size()) +
+                      " elements never matches a pattern of " + std::to_string(count));
+            for (int64_t i = 0; i < count; ++i)
+                parts.push_back(get(subject, i64(i), types[i]));
+        } else if (subject.t.sequence()) {
+            check(b.CreateICmpEQ(call("fw_length", b.getInt64Ty(), {subject.v}), i64(count)));
+            for (int64_t i = 0; i < count; ++i)
+                parts.push_back(get(subject, i64(i), subject.t.item()));
+        } else
+            error("an array pattern needs a tuple or array, not " + displayName(subject.t.name));
+    }
+    for (size_t i = first; i < p.args.size(); ++i) {
+        auto &a = *p.args[i];
+        auto part = parts[i - first];
+        if (a.kind == "bind") {
+            if (a.text != "_")
+                bindings.push_back({a.text, part});
+        } else if (destructuring(a))
+            destructure(a, part, fail, bindings);
+        else {
+            // A value to compare, or a member of an enum with data without fields.
+            if (a.kind == "name" && classes.count(a.text) && !classes.at(a.text)->variantOf.empty()) {
+                if (!classes.count(nonNull(part.t).name))
+                    error(displayName(a.text) + " can never match " + displayName(part.t.name));
+                if (part.t.nullable())
+                    check(b.CreateICmpNE(part.v, llvm::ConstantPointerNull::get(b.getPtrTy())));
+                check(isInstance(part.v, a.text));
+                continue;
+            }
+            auto expected = value(a, nonNull(part.t));
+            check(binary("==", part, expected).v);
+        }
+    }
+}
 void Compiler::match(Stmt &s) {
     auto subject = value(*s.expr);
     if (subject.t.name == "void" || subject.t.name == "null" ||
@@ -6198,7 +6973,19 @@ void Compiler::match(Stmt &s) {
                 typeName = name;
         }
         Val binding;
-        if (!typeName.empty()) {
+        std::vector<std::pair<std::string, Val>> bindings;
+        if (typeName.empty() && values.size() == 1 && destructuring(*values[0])) {
+            if (unguarded && irrefutable(*values[0], base))
+                for (auto &c : concreteClasses(values[0]->kind == "call"
+                                                   ? values[0]->args[0]->text
+                                                   : base.name))
+                    covered.insert(values[0]->kind == "call" ? "class:" + c : "all");
+            if (unguarded && irrefutable(*values[0], base) && values[0]->kind == "array")
+                covered.insert("all");
+            destructure(*values[0], subject, next, bindings);
+            b.CreateBr(matched);
+            b.SetInsertPoint(matched);
+        } else if (!typeName.empty()) {
             llvm::Value *condition = nullptr;
             if ((typeName == "ok" || typeName == "error") && subject.t.result()) {
                 auto ok = get(subject, i64(0), Ty{"bool"});
@@ -6283,6 +7070,8 @@ void Compiler::match(Stmt &s) {
         scopes.emplace_back();
         if (!s.catchNames[i].empty())
             bind(s.catchNames[i], binding);
+        for (auto &[name, v] : bindings)
+            bind(name, v);
         if (s.guards[i]) {
             auto guardValue = value(*s.guards[i]);
             if (guardValue.t.name != "bool")

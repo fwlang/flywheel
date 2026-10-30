@@ -259,6 +259,8 @@ int64_t fw_map_find_hashed(Object *map, uint64_t hash, Object *key,
     }
 }
 void fw_map_remove_at(Object *map, int64_t index) {
+    if (frozen(map))
+        return;
     nativeBoundary([&] {
         Slot key, value; // released after unlocking
         ObjectGuard guard(map);
@@ -283,6 +285,8 @@ Object *fw_map_values(Frame *frame, Object *map) {
 }
 // Inserts every item of a sequence into a set built for the item kind (see fw_map_new).
 void fw_set_add_all(Object *set, Object *items) {
+    if (frozen(set))
+        return;
     nativeBoundary([&] {
         auto added = itemsOf(items);
         ObjectGuard guard(set);
@@ -504,6 +508,8 @@ Object *fw_array_join(Frame *frame, Object *array, Object *separator) {
     });
 }
 void fw_array_sort(Object *array) {
+    if (frozen(array))
+        return;
     nativeBoundary([&] {
         ObjectGuard guard(array);
         std::stable_sort(array->slots.begin(), array->slots.end(),
@@ -513,6 +519,8 @@ void fw_array_sort(Object *array) {
 // Sorts with a generated callback: less(closure, array, i, j) compares the original items i, j.
 void fw_array_sort_by(Object *array, Object *closure,
                       int64_t (*less)(Object *, Object *, int64_t, int64_t)) {
+    if (frozen(array))
+        return;
     try {
         // The comparator is Flywheel code, so it runs without the array's lock.
         std::vector<int64_t> order(static_cast<size_t>(fw_length(array)));
@@ -540,6 +548,8 @@ void fw_array_sort_by(Object *array, Object *closure,
     }
 }
 void fw_array_reverse(Object *array) {
+    if (frozen(array))
+        return;
     nativeBoundary([&] {
         ObjectGuard guard(array);
         std::reverse(array->slots.begin(), array->slots.end());
@@ -568,6 +578,8 @@ int64_t fw_array_index_of(Object *array, Object *box) {
 }
 // Opens slot `index` (0..length) for an inserted value and returns it.
 int64_t fw_array_insert(Object *array, int64_t index) {
+    if (frozen(array))
+        return {};
     return nativeBoundary([&]() -> int64_t {
         ObjectGuard guard(array);
         if (index < 0 || static_cast<size_t>(index) > array->slots.size())
@@ -577,6 +589,8 @@ int64_t fw_array_insert(Object *array, int64_t index) {
     });
 }
 void fw_array_remove_at(Object *array, int64_t index) {
+    if (frozen(array))
+        return;
     nativeBoundary([&] {
         Slot removed; // released after unlocking
         ObjectGuard guard(array);
@@ -594,6 +608,8 @@ Object *fw_array_copy(Frame *frame, Object *array) {
     });
 }
 void fw_array_extend(Object *array, Object *other) {
+    if (frozen(array))
+        return;
     nativeBoundary([&] {
         auto items = itemsOf(other);
         ObjectGuard guard(array);

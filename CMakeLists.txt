@@ -1,9 +1,9 @@
 cmake_minimum_required(VERSION 3.24)
-project(Flywheel VERSION 0.1.0 LANGUAGES C CXX)
+project(Flywheel VERSION 2.3 LANGUAGES C CXX)
 # Pre-release tag of this version; empty for a final release. `flywheel --version` reports both.
-set(FLYWHEEL_PRERELEASE "beta.1")
+set(FLYWHEEL_PRERELEASE "beta-3")
 if(FLYWHEEL_PRERELEASE)
-  set(FLYWHEEL_VERSION "${PROJECT_VERSION}-${FLYWHEEL_PRERELEASE}")
+  set(FLYWHEEL_VERSION "${PROJECT_VERSION} (${FLYWHEEL_PRERELEASE})")
 else()
   set(FLYWHEEL_VERSION "${PROJECT_VERSION}")
 endif()
@@ -20,7 +20,17 @@ if(WIN32)
   target_link_libraries(flywheel_runtime PUBLIC ws2_32)
 endif()
 set_target_properties(flywheel_runtime PROPERTIES POSITION_INDEPENDENT_CODE ON MSVC_RUNTIME_LIBRARY MultiThreadedDLL)
-add_executable(flywheel src/frontend.cpp src/modules.cpp src/compiler.cpp src/format.cpp src/lsp.cpp src/main.cpp)
+# Library modules written in Flywheel (stdlib/fw/*.fw) are embedded into the compiler.
+file(GLOB FW_LIBRARY_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/stdlib/fw/*.fw")
+add_custom_command(
+  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/library_modules.cpp"
+  COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/stdlib/fw
+          -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/library_modules.cpp
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedStdlib.cmake
+  DEPENDS ${FW_LIBRARY_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedStdlib.cmake
+  COMMENT "Embedding Flywheel library modules")
+add_executable(flywheel src/frontend.cpp src/modules.cpp src/compiler.cpp src/format.cpp src/lsp.cpp
+               src/package.cpp src/docs.cpp src/main.cpp "${CMAKE_CURRENT_BINARY_DIR}/library_modules.cpp")
 target_include_directories(flywheel PRIVATE include)
 target_include_directories(flywheel SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
 separate_arguments(LLVM_DEFINITION_LIST NATIVE_COMMAND ${LLVM_DEFINITIONS})

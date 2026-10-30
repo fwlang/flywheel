@@ -26,7 +26,7 @@ Closures are ARC-managed objects holding a code pointer and their captured value
 
 ## Markup, processes, and windows
 
-Markup is constructed by compiled native calls, with no runtime XML parser. Fragments preserve their sequence of children and serialize without a wrapper. Children keep a weak link to their most recent parent for `.parent`, siblings, and `closest`. Function-valued event attributes are stored on elements as retained closures.
+Markup literals are constructed by compiled native calls; `html.parse` builds the same trees from HTML text at run time. Fragments preserve their sequence of children and serialize without a wrapper. Children keep a weak link to their most recent parent for `.parent`, siblings, and `closest`. Function-valued event attributes are stored on elements as retained closures.
 
 Managed slots carry a compact value-kind tag for recursive formatting, JSON encoding, and checked collection conversion. Classes include compiler-generated field-name/type identity metadata; each class also has a unique identity used by dynamic dispatch, `is`, and `match`.
 

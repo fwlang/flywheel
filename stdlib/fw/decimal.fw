@@ -1,0 +1,238 @@
+# Exact decimal numbers for money and other base-10 quantities: a BigInt of units and a
+# scale (digits after the point). Addition, subtraction, and multiplication are exact;
+# division rounds to a chosen number of places.
+#
+# ```
+# import decimal
+# var price = decimal.parse("19.99")
+# var total = price * decimal.of(3)
+# print total, total.round(1)   # 59.97 60.0
+# ```
+import bigint
+
+# How to round a value that lies between two results.
+enum Rounding
+    HalfEven, HalfUp, Down, Up, Floor, Ceiling
+end
+
+class Decimal
+    private readonly bigint.BigInt units
+    private readonly int scale
+
+    function operator +(Decimal other) returns Decimal
+        var s = max_scale(inst scale, other.scale)
+        return Decimal(inst rescaled(s) + other.rescaled(s), s)
+    end
+
+    function operator -(Decimal other) returns Decimal
+        var s = max_scale(inst scale, other.scale)
+        return Decimal(inst rescaled(s) - other.rescaled(s), s)
+    end
+
+    function operator -() returns Decimal
+        return Decimal(-inst units, inst scale)
+    end
+
+    function operator *(Decimal other) returns Decimal
+        return Decimal(inst units * other.units, inst scale + other.scale)
+    end
+
+    # Division rounded half-even to 20 places past the larger scale, with trailing zeros
+    # removed. Use divide to choose places and rounding.
+    function operator /(Decimal other) returns Decimal
+        return inst divide(other, max_scale(inst scale, other.scale) + 20, Rounding.HalfEven).normalized()
+    end
+
+    # Division rounded to `places` digits after the point.
+    function divide(Decimal other, int places, Rounding mode = Rounding.HalfEven) returns Decimal
+        if other.units.is_zero() then
+            throw NumericError("division by zero")
+        end
+        if places < 0 then
+            throw ValueError("places must not be negative")
+        end
+        # units / 10^scale / (other.units / 10^other.scale), scaled to 10^places.
+        var shift = places + other.scale - inst scale
+        var numerator = inst units
+        var denominator = other.units
+        if shift >= 0 then
+            numerator = numerator * ten_power(shift)
+        else
+            denominator = denominator * ten_power(-shift)
+        end
+        return Decimal(rounded_quotient(numerator, denominator, mode), places)
+    end
+
+    # The value rounded to `places` digits after the point.
+    function round(int places, Rounding mode = Rounding.HalfEven) returns Decimal
+        if places >= inst scale then
+            return Decimal(inst rescaled(places), places)
+        end
+        return Decimal(rounded_quotient(inst units, ten_power(inst scale - places), mode), places)
+    end
+
+    function compare(Decimal other) returns int
+        var s = max_scale(inst scale, other.scale)
+        return inst rescaled(s).compare(other.rescaled(s))
+    end
+
+    function operator ==(Decimal other) returns bool
+        return inst compare(other) == 0
+    end
+
+    function operator <(Decimal other) returns bool
+        return inst compare(other) < 0
+    end
+
+    function equals(Decimal other) returns bool
+        return inst compare(other) == 0
+    end
+
+    function hash returns int
+        return inst normalized().units.hash()
+    end
+
+    function abs returns Decimal
+        return Decimal(inst units.abs(), inst scale)
+    end
+
+    function signum returns int
+        return inst units.signum()
+    end
+
+    # Digits after the point.
+    function places returns int
+        return inst scale
+    end
+
+    # The same value without trailing zeros after the point.
+    function normalized returns Decimal
+        var u = inst units
+        var s = inst scale
+        var ten = bigint.of(10)
+        while s > 0 and not u.is_zero() and (u % ten).is_zero() do
+            u = u // ten
+            s -= 1
+        end
+        if u.is_zero() then
+            s = 0
+        end
+        return Decimal(u, s)
+    end
+
+    # The units at a larger scale.
+    function rescaled(int s) returns bigint.BigInt
+        if s == inst scale then
+            return inst units
+        end
+        return inst units * ten_power(s - inst scale)
+    end
+
+    # The nearest double (may lose precision).
+    function to_double returns double
+        return double(inst to_string())
+    end
+
+    # Plain decimal notation such as -12.50 (keeping the scale's trailing zeros).
+    function to_string returns string
+        var digits = inst units.abs().to_string()
+        var sign = ""
+        if inst units.signum() < 0 then
+            sign = "-"
+        end
+        if inst scale == 0 then
+            return sign + digits
+        end
+        digits = digits.pad_start(inst scale + 1, "0")
+        var point = digits.length - inst scale
+        return sign + digits.slice(0, point) + "." + digits.slice(point)
+    end
+end
+
+function max_scale(int a, int b) returns int
+    if a > b then
+        return a
+    end
+    return b
+end
+
+function ten_power(int n) returns bigint.BigInt
+    return bigint.of(10).pow(n)
+end
+
+# numerator / denominator rounded to an integer.
+function rounded_quotient(bigint.BigInt numerator, bigint.BigInt denominator, Rounding mode) returns bigint.BigInt
+    var (q, r) = numerator.divmod(denominator)
+    if r.is_zero() then
+        return q
+    end
+    var negative = numerator.signum() * denominator.signum() < 0
+    var away = q - bigint.of(1)
+    if not negative then
+        away = q + bigint.of(1)
+    end
+    # Compare twice the remainder with the divisor to place the value between q and away.
+    var twice = r.abs() * bigint.of(2)
+    var c = twice.compare(denominator.abs())
+    match mode
+        case Rounding.Down then
+            return q
+        case Rounding.Up then
+            return away
+        case Rounding.Floor then
+            if negative then
+                return away
+            end
+            return q
+        case Rounding.Ceiling then
+            if negative then
+                return q
+            end
+            return away
+        case Rounding.HalfUp then
+            if c >= 0 then
+                return away
+            end
+            return q
+        case Rounding.HalfEven then
+            if c > 0 or (c == 0 and not (q % bigint.of(2)).is_zero()) then
+                return away
+            end
+            return q
+    end
+end
+
+# A decimal with an int's value.
+function of(int value) returns Decimal
+    return Decimal(bigint.of(value), 0)
+end
+
+# Parses text such as "12", "-0.50", or "1.5e3".
+function parse(string text) returns Decimal
+    var t = text.trim().replace("_", "")
+    int exponent = 0
+    var e = t.lower().find("e")
+    if e >= 0 then
+        try
+            exponent = int(t.slice(e + 1))
+        catch CastError problem
+            throw ValueError("invalid decimal '" + text + "'")
+        end
+        t = t.slice(0, e)
+    end
+    var point = t.find(".")
+    int s = 0
+    if point >= 0 then
+        s = t.length - point - 1
+        t = t.slice(0, point) + t.slice(point + 1)
+    end
+    if t == "" or t == "-" or t == "+" then
+        throw ValueError("invalid decimal '" + text + "'")
+    end
+    var units = bigint.parse(t)
+    s -= exponent
+    if s < 0 then
+        return Decimal(units * ten_power(-s), 0)
+    end
+    return Decimal(units, s)
+end

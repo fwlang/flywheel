@@ -117,7 +117,8 @@ std::string format(const std::string &source) {
         }
         size_t first = 0;
         while (first + 1 < line.size() &&
-               (line[first]->text == "public" || line[first]->text == "private"))
+               (line[first]->text == "public" || line[first]->text == "private" ||
+                line[first]->text == "readonly"))
             ++first;
         auto &keyword = line[first]->text;
         bool isKeyword = line[first]->kind == "id";
@@ -165,6 +166,8 @@ std::string format(const std::string &source) {
             stack.push_back({"block", depth});
         else if (keyword == "if" && line.back()->text == "then")
             stack.push_back({"block", depth});
+        else if (keyword == "defer" && first + 1 == line.size())
+            stack.push_back({"block", depth}); // `defer` alone opens a block ending in `end`
         int lambdaDepth = 0;
         if (!(isKeyword && keyword == "function" && first + 1 < line.size() &&
               line[first + 1]->kind == "id") &&

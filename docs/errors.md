@@ -15,7 +15,9 @@ finally
 end
 ```
 
-Native runtime errors include `FileError`, `IndexError`, `KeyError`, `NumericError`, `AssertionError`, `JsonError`, `CastError`, `SelectorError`, `InputError`, `ProcessError`, `DesktopError`, `RegexError`, `NetworkError`, `ResultError`, and `RuntimeError`. They expose `.message` and format as their message. Error constructors accept a string, for example `throw FileError("missing")`. Custom nominal class errors are matched exactly. `Error` is the universal catch type; builtin errors can also be assigned to an `Error` binding. Rethrowing a catch-all error preserves its original dynamic type.
+Native runtime errors include `FileError`, `IndexError`, `KeyError`, `NumericError`, `AssertionError`, `JsonError`, `CastError`, `SelectorError`, `InputError`, `ProcessError`, `DesktopError`, `RegexError`, `NetworkError`, `ValueError` (invalid arguments and formats: format specs, destructuring lengths, frozen collections, parsing), `HttpError` (HTTP client failures), `DatabaseError` (SQLite), `ResultError`, and `RuntimeError`. They expose `.message` and format as their message. Error constructors accept a string, for example `throw FileError("missing")`. Custom nominal class errors are matched exactly. `Error` is the universal catch type; builtin errors can also be assigned to an `Error` binding. Rethrowing a catch-all error preserves its original dynamic type.
+
+`defer` (see [language](language.md#cleanup-with-defer)) registers cleanup that runs like `finally` when its block ends.
 
 Errors propagate across native generated function calls, out of callbacks (sort comparators, desktop handlers, web handlers, map key `hash`/`equals`), and from a thread task to the thread that calls `join`. `finally` executes on normal completion, handled or unhandled errors, returns, and loop exits. A new return, throw, break, or continue from a finalizer supersedes the pending exit. A finalizer cannot see locals declared inside its try or catch bodies. Return expressions are evaluated before finalization and their referenced objects remain alive until the return completes or is abandoned.
 

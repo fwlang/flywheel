@@ -10,7 +10,7 @@ This document records implemented provisional choices and current restrictions. 
 | 2 | `and` | left, short circuit |
 | unary | `not` | takes comparison/equality expression, binds above `and` |
 | 3 | `== !=` | chained |
-| 4 | `< <= > >= in is` | chained (`in` and `is` do not chain) |
+| 4 | `< <= > >= in is` | chained (`in` and `is` do not chain); strings order by code point |
 | 5 | `??` | left; the right side is evaluated only when needed |
 | 6 | `.. ..<` | left (integer endpoints) |
 | 7 | `+ -` | left |
@@ -39,7 +39,7 @@ var other = first \
     + second
 ```
 
-Semicolons separate statements at the top grouping level. UTF-8 source is validated and strings are UTF-8. Identifiers may contain non-ASCII letters; see [characters and strings](types.md#characters-and-strings). String `length` and `len` count characters (Unicode scalar values), not bytes. `'x'` is a `char` literal; `{` inside a string starts interpolation, and `{{` / `}}` write literal braces (remember this when embedding JavaScript or JSON in strings).
+Semicolons separate statements at the top grouping level. UTF-8 source is validated and strings are UTF-8. Identifiers may contain non-ASCII letters; see [characters and strings](types.md#characters-and-strings). String `length` and `len` count characters (Unicode scalar values), not bytes. `'x'` is a `char` literal; `{name}` inside a string interpolates, but a `{` followed by whitespace is a literal brace, as is a `}` with whitespace on either side, so `"{ name }"` is the text `{ name }` and CSS or JavaScript such as `"p { color: {c}; }"` reads naturally (the `{c}` still interpolates). The same rule applies to markup text. Write `{{` / `}}` for a literal brace with no space beside it, as in compact JSON.
 
 ## Calls and construction
 
@@ -84,6 +84,47 @@ Variables that are captured but never assigned are copied into the closure, whic
 
 Zero-argument function and method declarations may omit `()`: `function main returns void`, `function answer returns int`, or `function inferred` followed by its body. Non-empty parameter lists still require parentheses and typed parameters.
 
+## Format specs
+
+An interpolation can end with `:` and a format spec, as in Python: `"{price:.2f}"`, `"{n:>8}"`, `"{count:,}"`. The spec is `[[fill]align][sign][#][0][width][,|_][.precision][type]`:
+
+| Part | Meaning |
+|---|---|
+| align | `<` left, `>` right, `^` center, `=` pad after the sign; the optional fill before it is any character (`{x:*^9}`) |
+| sign | `+` always, `-` only for negatives (default), space for a leading space on positives |
+| `#` | `0x`/`0o`/`0b` prefixes for `x`, `o`, `b` |
+| `0` | pad numbers with zeros after the sign (`{n:05}` is `00042`) |
+| width | minimum width in characters |
+| `,` or `_` | group thousands (`_` groups hexadecimal and binary digits by four) |
+| `.precision` | digits after the point for `f`, `e`, `%`; significant digits for `g` or no type; maximum characters for text |
+| type | `d` integer, `f` fixed, `e` exponent, `g` general, `%` percent, `x`/`X` hex, `o` octal, `b` binary, `c` character, `s` text |
+
+Integers accept the floating types too (`{n:.2f}`), and floats accept the integer types when they hold a whole number. Other values are formatted as text first, so width, alignment, and precision apply to anything. An invalid spec raises `ValueError`. A `:` inside brackets, braces, or quotes does not start a spec, so `{m["a:b"]}` and `{ {"k": 1} }` are unaffected.
+
+```flywheel
+var price = 1234.5
+print "{price:,.2f} | {42:>6} | {0.256:.1%} | {255:#x} | {"ok":*^6}"
+# 1,234.50 |     42 | 25.6% | 0xff | **ok**
+```
+
+## Cleanup with defer
+
+`defer statement` runs the statement when the enclosing block ends, however it ends: normally, by `return`, `break`, or `continue`, or by an error. Several `defer`s in one block run in reverse order. A deferred block is written `defer` ... `end`.
+
+```flywheel
+import io
+
+function copy_first_line(string from, string to)
+    var input = io.open(from)
+    defer input.close()
+    var output = io.open(to, "w")
+    defer output.close()
+    output.write(input.read_line() ?? "")
+end
+```
+
+The block is the enclosing `if`, loop, `try`, or function body, so a `defer` inside a loop runs at the end of each iteration. `defer` is not allowed at the top level of a file.
+
 ## Collections and control flow
 
 Arrays infer a homogeneous common type, or use the declared element type. Empty arrays require context. Heterogeneous literals infer tuples, with compile-time integer indices. Maps use `{key: value}` literals and sets `{a, b}`; `{}` is an empty map or set, depending on the expected type. See [collections](collections.md). Arrays use shared mutable identity and checked indices; `s[a..b]` and `s[a..<b]` slice strings and sequences.
@@ -92,7 +133,7 @@ Arrays infer a homogeneous common type, or use the declared element type. Empty 
 
 ## Markup
 
-Markup supports named tags, self-closing tags, and fragments. `</>` only closes a fragment. Indentation-only text containing a newline between children is discarded; other text whitespace is retained. Entities supported: `amp`, `lt`, `gt`, `quot`, `apos`, decimal numeric, and hexadecimal numeric. HTML names require `import html.*`, SVG names `import svg.*`, and other tag sets can be declared as [element families](html-dom.md#element-families). `data-*` and `aria-*` attributes are accepted everywhere. Numeric attribute values render with their usual text. `on*` attributes take inline JavaScript text, or a Flywheel function that runs in [desktop windows](desktop.md).
+Markup supports named tags, self-closing tags, and fragments. Attribute values are written as in HTML: `class="card"`, `class='card'`, unquoted `class=card` (no spaces, quotes, `=`, `<`, `>`, backticks, or braces), or `{expression}`; quoted values may interpolate (`class="item {kind}"`). An attribute without a value, such as `<input disabled>`, is an empty string, or `true` for HTML boolean attributes (`disabled={flag}` sets one conditionally). HTML void elements (`br`, `hr`, `img`, `input`, `link`, `meta`, ...) need no `/>` or closing tag. `</>` only closes a fragment. Indentation-only text containing a newline between children is discarded; other text whitespace is retained. HTML comments (`<!-- ... -->`) may appear among children; they are dropped at compile time, as `html.parse` drops them, and their contents are not interpolated. Text on both sides of a comment joins. Entities supported: `amp`, `lt`, `gt`, `quot`, `apos`, decimal numeric, and hexadecimal numeric. HTML names require `import html.*`, SVG names `import svg.*`, and other tag sets can be declared as [element families](html-dom.md#element-families). `data-*` and `aria-*` attributes are accepted everywhere. Numeric attribute values render with their usual text. `on*` attributes take inline JavaScript text, or a Flywheel function that runs in [desktop windows](desktop.md).
 
 Components specialize from supplied concrete attribute types and must use each referenced attribute consistently across uses. `style` defaults to empty string and `inner` to an empty fragment. Other referenced attributes are required. Attribute types are checked when a component is instantiated; components that are never used still have their tags, attribute names, and void-element children checked.
 

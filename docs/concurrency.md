@@ -78,7 +78,9 @@ end
 print counter[0]   # 4000
 ```
 
-Two limits remain. A value read directly as part of a simple expression, such as the argument in `print xs[0]`, is borrowed rather than retained; if another thread replaces that same slot at that moment, the old value can be released while it is in use. HTML elements are not locked, so build and change a markup tree on one thread.
+A value read directly as part of a simple expression, such as the argument in `print xs[0]`, is kept alive by the reading thread while other threads run, so replacing that slot from another thread cannot free it while it is in use. HTML elements are not locked, so build and change a markup tree on one thread.
+
+To find missing synchronization, build or run with `--race`: the program stops with a report when two threads access the same collection, instance, captured variable, or global without a mutex, channel, or join ordering them. See [race detection](tooling.md#race-detection).
 
 `desktop` windows and `web.wait` must run on the main thread. The cycle collector pauses while spawned threads or web workers are running. There is no `async`/`await`; tasks serve as futures.
 
