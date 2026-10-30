@@ -85,7 +85,7 @@ std::string formatObject(Object *object, bool nested, std::set<Object *> &active
     if (object->kind == Object::Resource)
         return "<" + object->text + ">";
     if (object->kind == Object::Box)
-        return formatSlot(object->slots.at(0), nested, active, depth + 1);
+        return formatSlot(itemsOf(object).at(0), nested, active, depth + 1);
     if (object->kind == Object::Weak) {
         auto target = object->link ? object->link->target : nullptr;
         if (!target)
@@ -107,45 +107,54 @@ std::string formatObject(Object *object, bool nested, std::set<Object *> &active
         }
     } remove{active, object};
     auto item = [&](const Slot &slot) { return formatSlot(slot, true, active, depth + 1); };
+    // Formatting reads copies, so nested values are formatted without holding this object's lock.
+    auto slots = itemsOf(object);
     std::string out;
     if (object->kind == Object::Set) {
+        auto keys = keysOf(object);
         out = "{";
-        for (size_t i = 0; i < object->keys.size(); ++i)
-            out += (i ? ", " : "") + item(object->keys[i]);
+        for (size_t i = 0; i < keys.size(); ++i)
+            out += (i ? ", " : "") + item(keys[i]);
         return out + "}";
     }
     if (object->kind == Object::Map) {
+        std::vector<Slot> keys;
+        {
+            ObjectGuard guard(object);
+            keys = object->keys;
+            slots = object->slots;
+        }
         out = "{";
-        for (size_t i = 0; i < object->slots.size(); ++i) {
+        for (size_t i = 0; i < slots.size() && i < keys.size(); ++i) {
             if (i)
                 out += ", ";
-            out += item(object->keys[i]) + ": " + item(object->slots[i]);
+            out += item(keys[i]) + ": " + item(slots[i]);
         }
         return out + "}";
     }
     if (object->kind == Object::Result) {
-        return std::string(object->slots[0].integer ? "Result.ok(" : "Result.error(") +
-               item(object->slots[1]) + ")";
+        return std::string(slots.at(0).integer ? "Result.ok(" : "Result.error(") +
+               item(slots.at(1)) + ")";
     }
     if (object->kind == Object::Instance) {
         out = (object->text.empty() ? "instance" : object->text) + "(";
-        for (size_t i = 0; i < object->slots.size(); ++i) {
+        for (size_t i = 0; i < slots.size(); ++i) {
             if (i)
                 out += ", ";
             if (i < object->fieldNames.size())
                 out += object->fieldNames[i] + "=";
-            out += item(object->slots[i]);
+            out += item(slots[i]);
         }
         return out + ")";
     }
     bool tuple = object->kind == Object::Tuple;
     out = tuple ? "(" : "[";
-    for (size_t i = 0; i < object->slots.size(); ++i) {
+    for (size_t i = 0; i < slots.size(); ++i) {
         if (i)
             out += ", ";
-        out += item(object->slots[i]);
+        out += item(slots[i]);
     }
-    if (tuple && object->slots.size() == 1)
+    if (tuple && slots.size() == 1)
         out += ',';
     return out + (tuple ? ")" : "]");
 }
@@ -376,6 +385,13 @@ Slot castValue(Frame *frame, const Slot &value, const CastType &source, const Ca
             fail("cannot cast null to a non-null type", "CastError");
         return castValue(frame, unboxed(value), source.parts[0], target, root, depth + 1);
     }
+    // Casting reads copies of the value's items, so nested casts run without its lock.
+    std::vector<Slot> slots, keys;
+    if (value.kind == Slot::Reference && value.object && value.object->kind != Object::String) {
+        ObjectGuard guard(value.object);
+        slots = value.object->slots;
+        keys = value.object->keys;
+    }
     if (target.kind == CastType::Map) {
         auto output = managed(frame, Object::Map);
         output->objectKeys = target.parts[0].text == "string";
@@ -395,19 +411,20 @@ Slot castValue(Frame *frame, const Slot &value, const CastType &source, const Ca
                 output->slots[static_cast<size_t>(index)] = convertedValue;
         };
         if (source.kind == CastType::Map) {
-            for (size_t i = 0; i < value.object->slots.size(); ++i)
-                insert(value.object->keys[i], source.parts[0], value.object->slots[i],
+            for (size_t i = 0; i < slots.size(); ++i)
+                insert(keys[i], source.parts[0], slots[i],
                        source.parts[1]);
         } else if (sequenceType(source) && value.kind == Slot::Reference &&
                    sequenceObject(value.object)) {
-            for (size_t i = 0; i < value.object->slots.size(); ++i) {
-                auto &pair = value.object->slots[i];
+            for (size_t i = 0; i < slots.size(); ++i) {
+                auto &pair = slots[i];
                 auto pairType = itemType(source, i);
-                if (pair.kind != Slot::Reference || !sequenceObject(pair.object) ||
-                    pair.object->slots.size() != 2 || !sequenceType(pairType))
+                auto parts = pair.kind == Slot::Reference && sequenceObject(pair.object)
+                                 ? itemsOf(pair.object)
+                                 : std::vector<Slot>{};
+                if (parts.size() != 2 || !sequenceType(pairType))
                     fail("map cast requires two-item pairs", "CastError");
-                insert(pair.object->slots[0], itemType(pairType, 0), pair.object->slots[1],
-                       itemType(pairType, 1));
+                insert(parts[0], itemType(pairType, 0), parts[1], itemType(pairType, 1));
             }
         } else
             fail("map cast requires a map or sequence of pairs", "CastError");
@@ -417,16 +434,16 @@ Slot castValue(Frame *frame, const Slot &value, const CastType &source, const Ca
         std::vector<Slot> items;
         std::vector<CastType> types;
         if (source.kind == CastType::Map) {
-            for (size_t i = 0; i < value.object->slots.size(); ++i) {
+            for (size_t i = 0; i < slots.size(); ++i) {
                 auto pair = managed(frame, Object::Tuple);
-                pair->slots = {value.object->keys[i], value.object->slots[i]};
+                pair->slots = {keys[i], slots[i]};
                 items.push_back(reference(pair));
                 types.push_back(
                     castType("[" + source.parts[0].text + "," + source.parts[1].text + "]"));
             }
         } else if (sequenceType(source) && value.kind == Slot::Reference &&
                    sequenceObject(value.object)) {
-            items = value.object->slots;
+            items = slots;
             for (size_t i = 0; i < items.size(); ++i)
                 types.push_back(itemType(source, i));
         } else {
@@ -460,7 +477,7 @@ Slot castValue(Frame *frame, const Slot &value, const CastType &source, const Ca
                 else
                     fail("boolean string must be true, false, 1, or 0", "CastError");
             } else if (sequenceObject(value.object) || value.object->kind == Object::Map)
-                out.integer = !value.object->slots.empty();
+                out.integer = !slots.empty();
             else
                 out.integer = 1;
         } else
@@ -471,18 +488,18 @@ Slot castValue(Frame *frame, const Slot &value, const CastType &source, const Ca
          target.text[1] >= '0' && target.text[1] <= '9') ||
         target.text == "float" || target.text == "double") {
         if (sequenceType(source) && value.kind == Slot::Reference && sequenceObject(value.object)) {
-            if (value.object->slots.size() != 1)
+            if (slots.size() != 1)
                 fail("scalar cast requires a single-item sequence", "CastError");
-            return castValue(frame, value.object->slots[0], itemType(source, 0), target, false,
+            return castValue(frame, slots[0], itemType(source, 0), target, false,
                              depth + 1);
         }
         return castNumber(value, target.text);
     }
     if (target.kind == CastType::Result && source.kind == CastType::Result) {
         auto result = managed(frame, Object::Result);
-        bool ok = value.object->slots[0].integer != 0;
-        result->slots.push_back(value.object->slots[0]);
-        result->slots.push_back(castValue(frame, value.object->slots[1], source.parts[ok ? 0 : 1],
+        bool ok = slots[0].integer != 0;
+        result->slots.push_back(slots[0]);
+        result->slots.push_back(castValue(frame, slots[1], source.parts[ok ? 0 : 1],
                                           target.parts[ok ? 0 : 1], false, depth + 1));
         return reference(result);
     }
@@ -563,7 +580,7 @@ Object *fw_format(Frame *frame, Object *value) {
 }
 Object *fw_collection_cast(Frame *frame, Object *box, const char *source, const char *target) {
     return nativeBoundary([&] {
-        auto result = castValue(frame, box->slots[0], castType(source), castType(target), true, 0);
+        auto result = castValue(frame, itemsOf(box).at(0), castType(source), castType(target), true, 0);
         auto out = managed(frame, Object::Instance);
         out->slots.push_back(result);
         return out;
@@ -588,13 +605,14 @@ Object *fw_repeat(Frame *frame, Object *source, int64_t count) {
         if (!sequenceObject(source))
             fail("only arrays, tuples, and strings can be repeated", "CastError");
         auto out = managed(frame, source->kind);
-        if (source->slots.empty())
+        auto items = itemsOf(source);
+        if (items.empty())
             return out;
-        if (count && source->slots.size() > out->slots.max_size() / static_cast<uint64_t>(count))
+        if (count && items.size() > out->slots.max_size() / static_cast<uint64_t>(count))
             fail("collection repetition size overflow", "NumericError");
-        out->slots.reserve(source->slots.size() * static_cast<size_t>(count));
+        out->slots.reserve(items.size() * static_cast<size_t>(count));
         for (int64_t i = 0; i < count; ++i)
-            out->slots.insert(out->slots.end(), source->slots.begin(), source->slots.end());
+            out->slots.insert(out->slots.end(), items.begin(), items.end());
         return out;
     });
 }

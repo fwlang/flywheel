@@ -263,6 +263,13 @@ class Loader {
                 for (auto extension : {".fw", ".fly"}) {
                     auto candidate = base / (relative + extension);
                     if (fs::is_regular_file(candidate)) {
+                        // A file never resolves an import to itself: `math.fw` importing `math`
+                        // means the native library, and any other self-import is an error.
+                        if (fs::weakly_canonical(candidate).string() == u.path) {
+                            if (native.count(name))
+                                continue;
+                            throw Error(importLoc, "module '" + name + "' imports itself");
+                        }
                         found = candidate;
                         break;
                     }

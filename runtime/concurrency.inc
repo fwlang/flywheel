@@ -200,6 +200,7 @@ Object *fw_thread_spawn(Frame *frame, Object *closure, TaskRunner runner) {
         ++activeThreads;
         try {
             state->worker = std::thread([state, runner] {
+                guardStack();
                 runner(state->closure, state->result);
                 if (pendingError.value) {
                     state->errorType = pendingError.type;

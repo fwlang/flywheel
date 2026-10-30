@@ -143,10 +143,11 @@ extern "C" int64_t fw_shell(Object *command) {
 }
 extern "C" int64_t fw_command(Object *command) {
     return nativeBoundary([&] {
-        if (command->slots.empty())
+        auto items = itemsOf(command);
+        if (items.empty())
             fail("os.command requires a nonempty argument array", "ProcessError");
         std::vector<std::string> arguments;
-        for (auto &slot : command->slots) {
+        for (auto &slot : items) {
             auto &text = slot.object->text;
             processArgument(text);
             arguments.push_back(text);

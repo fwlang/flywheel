@@ -143,7 +143,11 @@ std::string format(const std::string &source) {
         } else if (isKeyword && (keyword == "else" || keyword == "catch" || keyword == "finally"))
             level = stack.empty() ? 0 : stack.size() - 1;
         int base = closed >= 0 ? closed : stack.empty() ? 0 : stack.back().depth;
-        size_t extra = (line.front()->depth > base ? 1 : 0) + (continued[n] ? 1 : 0);
+        // An opening delimiter carries the depth inside it; the line itself starts one level out.
+        auto front = line.front();
+        bool opens = front->kind == "op" &&
+                     (front->text == "(" || front->text == "[" || front->text == "{");
+        size_t extra = (front->depth - (opens ? 1 : 0) > base ? 1 : 0) + (continued[n] ? 1 : 0);
         out.push_back(indent(level + extra) + content);
         lastDepth = line.back()->depth;
         auto depth = line[first]->depth;

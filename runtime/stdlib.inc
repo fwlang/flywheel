@@ -75,16 +75,41 @@ double fromCalendar(std::tm &parts) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// regex (ECMAScript syntax over UTF-8 bytes)
-const std::regex &compiledRegex(const std::string &pattern) {
-    thread_local std::map<std::string, std::regex> cache;
+// regex (ECMAScript syntax over characters). Text and patterns are matched as wide strings, so
+// `.` and character classes see whole characters, matching the string model. wchar_t is UTF-32
+// except on Windows, where characters outside the BMP become surrogate pairs.
+std::wstring wideText(const std::string &text) {
+    std::wstring out;
+    for (auto c : decodeUtf8(text)) {
+        if (sizeof(wchar_t) == 2 && c > 0xffff) {
+            c -= 0x10000;
+            out += static_cast<wchar_t>(0xd800 + (c >> 10));
+            out += static_cast<wchar_t>(0xdc00 + (c & 0x3ff));
+        } else
+            out += static_cast<wchar_t>(c);
+    }
+    return out;
+}
+std::string narrowText(const std::wstring &text) {
+    std::string out;
+    for (size_t i = 0; i < text.size(); ++i) {
+        auto c = static_cast<uint32_t>(text[i]);
+        if (sizeof(wchar_t) == 2 && c >= 0xd800 && c < 0xdc00 && i + 1 < text.size())
+            c = 0x10000 + ((c - 0xd800) << 10) + (static_cast<uint32_t>(text[++i]) - 0xdc00);
+        appendUtf8(out, c);
+    }
+    return out;
+}
+const std::wregex &compiledRegex(const std::string &pattern) {
+    thread_local std::map<std::string, std::wregex> cache;
     auto it = cache.find(pattern);
     if (it != cache.end())
         return it->second;
     if (cache.size() > 128)
         cache.clear();
     try {
-        return cache.emplace(pattern, std::regex(pattern, std::regex::ECMAScript)).first->second;
+        return cache.emplace(pattern, std::wregex(wideText(pattern), std::regex::ECMAScript))
+            .first->second;
     } catch (const std::regex_error &error) {
         fail("invalid regular expression '" + pattern + "': " + error.what(), "RegexError");
     }
@@ -142,7 +167,7 @@ void encodeObject(Object *object, std::string &out, int indent, int depth,
         out += jsonRender(*object->json);
         return;
     case Object::Box:
-        encodeSlot(object->slots.at(0), out, indent, depth, active);
+        encodeSlot(itemsOf(object).at(0), out, indent, depth, active);
         return;
     default:
         break;
@@ -182,40 +207,47 @@ void encodeObject(Object *object, std::string &out, int indent, int depth,
         out += jsonQuote(name) + (indent > 0 ? ": " : ":");
         encodeSlot(value, out, indent, depth + 1, active);
     };
+    // Encoding reads copies, so nested values are encoded without holding this object's lock.
+    std::vector<Slot> slots, keys;
+    {
+        ObjectGuard guard(object);
+        slots = object->slots;
+        keys = object->keys;
+    }
     switch (object->kind) {
     case Object::Array:
     case Object::Tuple:
-        list(object->slots);
+        list(slots);
         return;
     case Object::Set:
-        list(object->keys);
+        list(keys);
         return;
     case Object::Map:
         out += '{';
-        for (size_t i = 0; i < object->keys.size(); ++i) {
-            auto &key = object->keys[i];
+        for (size_t i = 0; i < keys.size(); ++i) {
+            auto &key = keys[i];
             auto name = key.kind == Slot::Reference && key.object &&
                                 key.object->kind == Object::String
                             ? key.object->text
                             : formatValue(key);
-            field(i, name, object->slots[i]);
+            field(i, name, slots[i]);
         }
-        if (!object->keys.empty())
+        if (!keys.empty())
             encodeNewline(out, indent, depth);
         out += '}';
         return;
     case Object::Instance:
         out += '{';
-        for (size_t i = 0; i < object->slots.size(); ++i)
+        for (size_t i = 0; i < slots.size(); ++i)
             field(i, i < object->fieldNames.size() ? object->fieldNames[i] : std::to_string(i),
-                  object->slots[i]);
-        if (!object->slots.empty())
+                  slots[i]);
+        if (!slots.empty())
             encodeNewline(out, indent, depth);
         out += '}';
         return;
     case Object::Result:
         out += '{';
-        field(0, object->slots[0].integer ? "ok" : "error", object->slots[1]);
+        field(0, slots[0].integer ? "ok" : "error", slots[1]);
         encodeNewline(out, indent, depth);
         out += '}';
         return;
@@ -616,17 +648,20 @@ ProcessRequest processRequest(Object *process) {
     // os.process fields: command, cwd, env, inherit_env, input, timeout, capture
     ProcessRequest request;
     auto command = process->slots.at(0).object;
-    if (!command || command->slots.empty())
+    auto arguments = command ? itemsOf(command) : std::vector<Slot>{};
+    if (arguments.empty())
         fail("os.process requires a nonempty command array", "ProcessError");
     std::vector<std::string> stage;
-    for (auto &slot : command->slots)
+    for (auto &slot : arguments)
         stage.push_back(slot.object ? slot.object->text : "");
     request.stages.push_back(std::move(stage));
     request.cwd = instanceText(process, 1);
-    if (auto env = process->slots.at(2).object)
+    if (auto env = process->slots.at(2).object) {
+        ObjectGuard guard(env);
         for (size_t i = 0; i < env->keys.size(); ++i)
             request.env.emplace_back(env->keys[i].object->text,
                                      env->slots[i].object ? env->slots[i].object->text : "");
+    }
     request.inheritEnv = process->slots.at(3).integer != 0;
     request.input = instanceText(process, 4);
     request.timeout = process->slots.at(5).real;
@@ -857,7 +892,7 @@ Object *fw_fs_path(Frame *frame, Object *path, int64_t operation) {
 Object *fw_fs_join(Frame *frame, Object *parts) {
     return nativeBoundary([&] {
         std::filesystem::path out;
-        for (auto &part : parts->slots)
+        for (auto &part : itemsOf(parts))
             out /= fsPath(part.object);
         return string(frame, fsText(out));
     });
@@ -930,53 +965,54 @@ double fw_time_from_date(int64_t year, int64_t month, int64_t day, int64_t hour,
 int64_t fw_regex_test(Object *pattern, Object *text, int64_t full) {
     return regexBoundary([&]() -> int64_t {
         auto &re = compiledRegex(requireString(pattern)->text);
-        return full ? std::regex_match(requireString(text)->text, re)
-                    : std::regex_search(requireString(text)->text, re);
+        auto source = wideText(requireString(text)->text);
+        return full ? std::regex_match(source, re) : std::regex_search(source, re);
     });
 }
 Object *fw_regex_find(Frame *frame, Object *pattern, Object *text) {
     return regexBoundary([&]() -> Object * {
-        std::smatch match;
-        auto &source = requireString(text)->text;
+        std::wsmatch match;
+        auto source = wideText(requireString(text)->text);
         if (!std::regex_search(source, match, compiledRegex(requireString(pattern)->text)))
             return nullptr;
-        return string(frame, match.str(0));
+        return string(frame, narrowText(match.str(0)));
     });
 }
 // 0 find_all (whole matches), 1 groups of the first match (null when nothing matches)
 Object *fw_regex_list(Frame *frame, Object *pattern, Object *text, int64_t groups) {
     return regexBoundary([&]() -> Object * {
-        auto &source = requireString(text)->text;
+        auto source = wideText(requireString(text)->text);
         auto &re = compiledRegex(requireString(pattern)->text);
         std::vector<std::string> out;
         if (groups) {
-            std::smatch match;
+            std::wsmatch match;
             if (!std::regex_search(source, match, re))
                 return nullptr;
             for (size_t i = 1; i < match.size(); ++i)
-                out.push_back(match[i].matched ? match.str(i) : "");
+                out.push_back(match[i].matched ? narrowText(match.str(i)) : "");
         } else
-            for (std::sregex_iterator it(source.begin(), source.end(), re), end; it != end; ++it)
-                out.push_back(it->str(0));
+            for (std::wsregex_iterator it(source.begin(), source.end(), re), end; it != end; ++it)
+                out.push_back(narrowText(it->str(0)));
         return stringArray(frame, out);
     });
 }
 Object *fw_regex_replace(Frame *frame, Object *pattern, Object *text, Object *replacement) {
     return regexBoundary([&] {
-        return string(frame, std::regex_replace(requireString(text)->text,
-                                                compiledRegex(requireString(pattern)->text),
-                                                requireString(replacement)->text));
+        return string(frame, narrowText(std::regex_replace(
+                                 wideText(requireString(text)->text),
+                                 compiledRegex(requireString(pattern)->text),
+                                 wideText(requireString(replacement)->text))));
     });
 }
 Object *fw_regex_split(Frame *frame, Object *pattern, Object *text) {
     return regexBoundary([&] {
-        auto &source = requireString(text)->text;
+        auto source = wideText(requireString(text)->text);
         std::vector<std::string> out;
-        std::sregex_token_iterator it(source.begin(), source.end(),
-                                      compiledRegex(requireString(pattern)->text), -1),
+        std::wsregex_token_iterator it(source.begin(), source.end(),
+                                       compiledRegex(requireString(pattern)->text), -1),
             end;
         for (; it != end; ++it)
-            out.push_back(it->str());
+            out.push_back(narrowText(it->str()));
         return stringArray(frame, out);
     });
 }
@@ -1132,7 +1168,7 @@ Object *fw_json_encode(Frame *frame, Object *box, int64_t indent) {
     return nativeBoundary([&] {
         std::string out;
         std::set<Object *> active;
-        encodeSlot(box->slots.at(0), out, static_cast<int>(std::clamp<int64_t>(indent, 0, 16)), 0,
+        encodeSlot(itemsOf(box).at(0), out, static_cast<int>(std::clamp<int64_t>(indent, 0, 16)), 0,
                    active);
         return string(frame, out);
     });
@@ -1140,6 +1176,7 @@ Object *fw_json_encode(Frame *frame, Object *box, int64_t indent) {
 
 // os -------------------------------------------------------------------------------------------
 void fw_set_args(int64_t count, char **values) {
+    guardStack(true);
     auto &arguments = programArguments();
     arguments.clear();
     for (int64_t i = 1; i < count; ++i)
@@ -1164,9 +1201,9 @@ Object *fw_os_run(Frame *frame, Object *process) {
 Object *fw_os_pipeline(Frame *frame, Object *commands, Object *input) {
     return nativeBoundary([&] {
         ProcessRequest request;
-        for (auto &slot : commands->slots) {
+        for (auto &slot : itemsOf(commands)) {
             std::vector<std::string> stage;
-            for (auto &arg : slot.object->slots)
+            for (auto &arg : itemsOf(slot.object))
                 stage.push_back(arg.object ? arg.object->text : "");
             request.stages.push_back(std::move(stage));
         }

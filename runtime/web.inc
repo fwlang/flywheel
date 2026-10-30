@@ -815,6 +815,7 @@ bool serveLoop(HttpRuntime &state) {
         for (int i = 0; i < state.workerCount; ++i) {
             ++activeThreads; // also keeps the cycle collector paused while workers exist
             state.workers->threads.emplace_back([&workers = *state.workers] {
+                guardStack();
                 workerLoop(workers);
                 --activeThreads;
             });

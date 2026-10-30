@@ -12,6 +12,7 @@
 #include <llvm/Support/Program.h>
 #ifdef FW_JIT
 #include <cerrno>
+#include <cstring>
 #include <cstdio>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/Support/MemoryBuffer.h>
@@ -131,7 +132,15 @@ std::optional<int> runInProcess(const std::string &object, std::vector<std::stri
     while (waitpid(child, &status, 0) < 0)
         if (errno != EINTR)
             return 1;
-    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    if (WIFEXITED(status))
+        return WEXITSTATUS(status);
+    // Report a crash the way a shell would, rather than exiting with a bare status.
+    int signal = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+    std::cerr << "flywheel: program terminated by signal " << signal;
+    if (auto name = signal ? strsignal(signal) : nullptr)
+        std::cerr << " (" << name << ")";
+    std::cerr << '\n';
+    return 128 + signal;
 }
 #endif
 // Compiles `load()` and runs it (run), links it (build), or only checks it (check). `load` is
@@ -314,7 +323,7 @@ int main(int argc, char **argv) {
         "       flywheel fmt [--check] files...\n"
         "       flywheel lsp | selftest | --version\n";
     if (argc == 2 && std::string(argv[1]) == "--version") {
-        std::cout << "Flywheel 0.1.0 (LLVM " LLVM_VERSION_STRING ")\n";
+        std::cout << "Flywheel " FW_VERSION " (LLVM " LLVM_VERSION_STRING ")\n";
         return 0;
     }
     if (argc < 2) {

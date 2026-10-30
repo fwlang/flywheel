@@ -54,7 +54,9 @@ A task that is never joined is joined when its last reference is released. A tas
 
 ## Shared state
 
-Mutable arrays, maps, sets, class fields, globals, and captured variables are not synchronized. Reading shared data that no thread is changing is safe; changing it from several threads at once is a data race. Pass values through channels, or guard shared state with a mutex:
+While spawned threads run, each operation on an array, map, set, class instance, global, or captured variable is atomic: `xs.push(x)` from several threads keeps every value, `xs.pop()` never returns the same item twice, and a value read into a variable or passed to a function stays alive even if another thread replaces it. Formatting, `json.encode`, casts, and copies read a snapshot of each collection. When no other thread is running these locks are skipped.
+
+Only single operations are atomic. A sequence such as `counter[0] += 1` (a read then a write), or `if xs.length > 0 then xs.pop()`, can interleave with other threads, so combine steps with a mutex or pass values through channels:
 
 ```flywheel
 import thread
@@ -75,6 +77,8 @@ for w in workers do
 end
 print counter[0]   # 4000
 ```
+
+Two limits remain. A value read directly as part of a simple expression, such as the argument in `print xs[0]`, is borrowed rather than retained; if another thread replaces that same slot at that moment, the old value can be released while it is in use. HTML elements are not locked, so build and change a markup tree on one thread.
 
 `desktop` windows and `web.wait` must run on the main thread. The cycle collector pauses while spawned threads or web workers are running. There is no `async`/`await`; tasks serve as futures.
 

@@ -572,7 +572,7 @@ POSITIVE.update(
         ),
         "ranges": (
             "print 1..3\nprint 1..<3\nprint -2..1\nprint 2..2\nprint 2..<2\nprint 4..1\nint start=2\nint finish=4\nvar runtime_range=start..finish\nprint runtime_range[1]\nprint typeof(runtime_range)\nfor value in runtime_range do\nprint value\nend\nprint 3 in runtime_range\nprint((1..<3)*2)\nprint 1..1+2\n",
-            "(1, 2, 3)\n(1, 2)\n(-2, -1, 0, 1)\n(2,)\n()\n()\n3\ntuple<i64>\n2\n3\n4\ntrue\n(1, 2, 1, 2)\n(1, 2, 3)\n",
+            "(1, 2, 3)\n(1, 2)\n(-2, -1, 0, 1)\n(2,)\n()\n()\n3\ntuple<int>\n2\n3\n4\ntrue\n(1, 2, 1, 2)\n(1, 2, 3)\n",
         ),
         "cast_errors": (
             'try\nprint int([1,2])\ncatch CastError error\nprint "size"\nend\ntry\nprint bool("maybe")\ncatch CastError error\nprint "bool"\nend\ntry\nprint array<i8>(["256"])\ncatch NumericError error\nprint "narrow"\nend\ntry\nprint [1]*-1\ncatch NumericError error\nprint "negative"\nend\ntry\nprint -9223372036854775808..9223372036854775807\ncatch NumericError error\nprint "range"\nend\n',
@@ -948,7 +948,7 @@ var next = counter()
 next()
 next
 print next()""",
-            '42\n15\n11\n[1, 4, 9, 16, 25]\n[1, 3, 5]\n15\ntrue\nfalse\nthree\n[2, 4, 6, 8, 10]\n["n1", "n2", "n3", "n4", "n5"]\n6\n13\n3\n11\nfunction(i64) returns i64\n<function>\n3\n',
+            '42\n15\n11\n[1, 4, 9, 16, 25]\n[1, 3, 5]\n15\ntrue\nfalse\nthree\n[2, 4, 6, 8, 10]\n["n1", "n2", "n3", "n4", "n5"]\n6\n13\n3\n11\nfunction(int) returns int\n<function>\n3\n',
         ),
         "closure_fields_and_nesting": (
             """import testing
@@ -1345,17 +1345,17 @@ NEGATIVE.update(
         ),
         "closure_argument_type": (
             'var f = function(int x) => x\nprint f("a")',
-            "cannot convert string to i64",
+            "cannot convert string to int",
         ),
         "function_value_mismatch": (
             "function g(int a, int b) returns int\nreturn a\nend\nfunction(int) returns int f = g",
-            "does not match type function(i64) returns i64",
+            "does not match type function(int) returns int",
         ),
         "not_callable": ("var n = 5\nprint n(1)", "is not callable"),
         "weak_primitive": ("weak<int> w = 1", "weak<T> requires a non-null reference type"),
         "filter_predicate": (
             "print [1, 2].filter(function(int x) => x)",
-            "cannot convert i64 to bool",
+            "cannot convert int to bool",
         ),
         "lambda_default": ("var f = function(int x = 1) => x", "cannot have defaults"),
         "lambda_all_paths": (
@@ -1566,7 +1566,7 @@ POSITIVE.update(
     {
         "integer_division_any_numeric": (
             "print 7 // 2\nprint -7 // 2\nprint 7.5 // 2.0\nprint -7.9 // 2\nprint typeof(7.5 // 2)\nvar x = 10\nx //= 3\nprint x",
-            "3\n-3\n3\n-3\ni64\n3\n",
+            "3\n-3\n3\n-3\nint\n3\n",
         ),
         "unicode_string_length": (
             'print "héllo".length\nprint len("日本語")\nvar größe = 3\nprint größe',
@@ -1808,7 +1808,7 @@ NEGATIVE.update(
             "cannot cast A to unrelated type B",
         ),
         "nullable_arithmetic": ("int? a = 1\nprint a + 1", "requires non-null operands"),
-        "nullable_implicit": ("int? a = 1\nint b = a", "cannot implicitly convert i64? to i64"),
+        "nullable_implicit": ("int? a = 1\nint b = a", "cannot implicitly convert int? to int"),
         "char_literal_length": ("print 'ab'", "exactly one character"),
         "string_immutable": ('var s = "abc"\ns[0] = \'x\'', "strings are immutable"),
     }
@@ -1957,7 +1957,7 @@ Box<int>[] boxes = [Box(1), Box(2)]
 print boxes.map(function(Box<int> x) => x.get() * 10)
 var getter = first<int>
 print getter([9])""",
-            '5 Box<i64> there\n3 a 1.5\n["n1", "n2", "n3"]\nPair<i64,string>(first=1, second="one") Pair<i64,string>\n2 1 null\n[10, 20]\n9\n',
+            '5 Box<int> there\n3 a 1.5\n["n1", "n2", "n3"]\nPair<int,string>(first=1, second="one") Pair<int,string>\n2 1 null\n[10, 20]\n9\n',
         ),
     }
 )
@@ -2050,6 +2050,65 @@ POSITIVE.update(
         "example_types": ('# Classes, interfaces, enums, generics, optional values, and pattern matching.\ninterface Shape\n    function area() returns double\n    function name() returns string\nend\n\nclass Circle implements Shape\n    double radius\n    function area() returns double\n        return 3.14159 * inst radius * inst radius\n    end\n    function name() returns string\n        return "circle"\n    end\nend\n\nclass Rectangle implements Shape\n    double width\n    double height\n    function area() returns double\n        return inst width * inst height\n    end\n    function name() returns string\n        return "rectangle"\n    end\nend\n\nclass Square extends Rectangle\n    function init(double side)\n        super.init(side, side)\n    end\n    function name() returns string\n        return "square"\n    end\nend\n\nenum Verdict\n    Small, Medium, Large\nend\n\nfunction judge(Shape shape) returns Verdict\n    match shape\n        case Square s if s.width > 3.0 then\n            return Verdict.Large\n        case Circle c if c.radius < 1.0 then\n            return Verdict.Small\n        else\n            return Verdict.Medium\n    end\nend\n\nclass Stack<T>\n    T[] items\n    function init()\n        inst items = []\n    end\n    function push(T item)\n        inst items.push(item)\n    end\n    function pop() returns T?\n        if inst items.length == 0 then\n            return null\n        end\n        return inst items.pop()\n    end\nend\n\nShape[] shapes = [Circle(0.5), Rectangle(2.0, 3.0), Square(4.0)]\nfor shape in shapes do\n    print shape.name(), shape.area(), judge(shape)\nend\n\nStack<string> names = Stack()\nnames.push("first")\nnames.push("second")\nvar top = names.pop()\nprint top ?? "empty", names.pop() ?? "empty", names.pop() ?? "empty"\n', "circle 0.7853975 Small\nrectangle 6 Medium\nsquare 16 Large\nsecond first empty\n"),
     }
 )
+
+# Beta feedback: grouped function types, character-aware regex, stack overflow, self-imports.
+POSITIVE.update(
+    {
+        "function_type_grouping": (
+            "(function() returns int)[] fs = []\nfs.push(function() => 7)\nprint fs[0](), fs.length\n"
+            "function(int) returns int[] pair = function(int n) => [n, n]\nprint pair(3)\n"
+            "(function(int) returns int)? maybe = null\nprint maybe == null\n",
+            "7 1\n[3, 3]\ntrue\n",
+        ),
+        "threads_shared_collections": (
+            "import thread\nint[] xs = []\nmap<int, int> m = {}\nthread.task<void>[] ws = []\n"
+            "for t in 0..<4 do\n    ws.push(thread.spawn(function()\n        for k in 0..<20000 do\n"
+            "            xs.push(k)\n            m[k % 100] = k\n            if k % 2 == 0 then\n"
+            "                xs.pop()\n            end\n        end\n    end))\nend\n"
+            "for w in ws do\n    w.join()\nend\nprint xs.length, m.length\n",
+            "40000 100\n",
+        ),
+        "regex_characters": (
+            'import regex\nprint regex.find(".", "é")\nprint regex.find_all("[^a]", "aéb😀")\n'
+            'print regex.replace("é+", "caféé!", "E"), regex.split("ß", "aßbßc")\n'
+            'print regex.matches("^.{{3}}$", "日本語"), regex.groups("(.)(.)", "ñü")\n',
+            'é\n["é", "b", "😀"]\ncafE! ["a", "b", "c"]\ntrue ["ñ", "ü"]\n',
+        ),
+    }
+)
+NEGATIVE.update(
+    {
+        "function_type_array_hint": (
+            "function() returns int[] fs = []",
+            "group the function type: (function() returns int)[]",
+        ),
+        "int_spelling": ('int x = "a"', "cannot convert string to int"),
+    }
+)
+TRAPS.update(
+    {
+        "stack_overflow": (
+            "function f(int n) returns int\n    return f(n + 1) + 1\nend\nprint f(0)",
+            "stack overflow",
+        ),
+        "stack_overflow_thread": (
+            "import thread\nfunction f(int n) returns int\n    return f(n + 1) + 1\nend\n"
+            "print thread.spawn(function() => f(0)).join()",
+            "stack overflow",
+        ),
+    }
+)
+MODULE_CASES.extend(
+    [
+        (
+            "native_named_entry",
+            {"main.fw": 'import math\nprint "main"', "math.fw": "import math\nprint math.sqrt(4.0)"},
+            "2\nmain\n",
+        ),
+    ]
+)
+MODULE_ERRORS.append(("self_import", {"main.fw": "import main"}, "module 'main' imports itself"))
+
 
 class CompilerTests(unittest.TestCase):
     def setUp(self):
@@ -2489,6 +2548,9 @@ print web.route("POST", "/echo", echo, 0, "::1")
         self.assertEqual(self.command("fmt", "--check", messy).returncode, 1)
         self.assertEqual(self.command("fmt", messy).returncode, 0)
         self.assertEqual(messy.read_text(encoding="utf-8"), expected)
+        self.assertEqual(self.command("fmt", "--check", messy).returncode, 0)
+        # A line opening with a delimiter is not a continuation line.
+        messy.write_text("print 1\n[int, int] p = [1, 2]\n(print)(p)\n", encoding="utf-8")
         self.assertEqual(self.command("fmt", "--check", messy).returncode, 0)
 
         self.source.write_text("function f() returns int\n    return 1\nend\nprint f()", encoding="utf-8")

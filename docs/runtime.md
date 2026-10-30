@@ -22,7 +22,7 @@ Closures are ARC-managed objects holding a code pointer and their captured value
 
 ## Threads
 
-`thread.spawn` runs a closure on a native thread with its own ownership frames and error channel; see [concurrency](concurrency.md). Reference counts and the runtime's internal tables are thread-safe. Mutable arrays, maps, sets, class fields, and globals are **not** synchronized: share them through `thread.channel`, or guard them with `thread.mutex`.
+`thread.spawn` runs a closure on a native thread with its own ownership frames and error channel; see [concurrency](concurrency.md). Reference counts and the runtime's internal tables are thread-safe. While spawned threads run, each array, map, set, field, and global operation takes a lock chosen by the object's address (skipped when only one thread runs); sequences of operations still need `thread.mutex` or `thread.channel`. See [shared state](concurrency.md#shared-state) for the exact guarantees.
 
 ## Markup, processes, and windows
 

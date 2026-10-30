@@ -209,7 +209,11 @@ extern "C" {
 int64_t fw_box_equal(Object *a, Object *b) {
     if (!a || !b)
         return a == b;
-    return slotEqual(a->slots.at(0), b->slots.at(0));
+    auto read = [](Object *box) {
+        ObjectGuard guard(box);
+        return box->slots.at(0);
+    };
+    return slotEqual(read(a), read(b));
 }
 uint64_t fw_structural_hash(Object *key) {
     return structuralHash(key);
@@ -220,20 +224,28 @@ uint64_t fw_structural_hash(Object *key) {
 int64_t fw_map_find_hashed(Object *map, uint64_t hash, Object *key,
                            int64_t (*equal)(Object *, Object *), int64_t mode) {
     try {
-        auto &index = mapIndex(map);
-        auto [begin, end] = index.hashed.equal_range(hash);
-        for (auto it = begin; it != end; ++it) {
-            auto candidate = map->keys[it->second].object;
-            bool same = equal ? equal(key, candidate) != 0 : structuralEqual(key, candidate);
+        // Candidates are copied out so the generated equals() runs without the map's lock.
+        std::vector<std::pair<size_t, Slot>> candidates;
+        {
+            ObjectGuard guard(map);
+            auto &index = mapIndex(map);
+            auto [begin, end] = index.hashed.equal_range(hash);
+            for (auto it = begin; it != end; ++it)
+                candidates.emplace_back(it->second, map->keys[it->second]);
+        }
+        for (auto &[position, candidate] : candidates) {
+            bool same = equal ? equal(key, candidate.object) != 0
+                              : structuralEqual(key, candidate.object);
             if (pendingError.value)
                 throw CallbackFailure{};
             if (same)
-                return static_cast<int64_t>(it->second);
+                return static_cast<int64_t>(position);
         }
         if (mode == 0)
             fail("map key not found", "KeyError");
         if (mode == 2)
             return -1;
+        ObjectGuard guard(map);
         map->more().keyHashes.push_back(hash);
         return static_cast<int64_t>(appendKey(map, reference(key), Slot{}));
     } catch (const CallbackFailure &) {
@@ -248,7 +260,13 @@ int64_t fw_map_find_hashed(Object *map, uint64_t hash, Object *key,
 }
 void fw_map_remove_at(Object *map, int64_t index) {
     nativeBoundary([&] {
+        Slot key, value; // released after unlocking
+        ObjectGuard guard(map);
         auto i = static_cast<size_t>(index);
+        if (index < 0 || i >= map->keys.size())
+            fail("map index out of bounds", "IndexError");
+        key = map->keys[i];
+        value = map->slots[i];
         map->keys.erase(map->keys.begin() + index);
         map->slots.erase(map->slots.begin() + index);
         if (map->extra && i < map->extra->keyHashes.size())
@@ -259,14 +277,16 @@ void fw_map_remove_at(Object *map, int64_t index) {
 Object *fw_map_values(Frame *frame, Object *map) {
     return nativeBoundary([&] {
         auto values = managed(frame, Object::Array);
-        values->slots = map->slots;
+        values->slots = itemsOf(map);
         return values;
     });
 }
 // Inserts every item of a sequence into a set built for the item kind (see fw_map_new).
 void fw_set_add_all(Object *set, Object *items) {
     nativeBoundary([&] {
-        for (auto &item : items->slots) {
+        auto added = itemsOf(items);
+        ObjectGuard guard(set);
+        for (auto &item : added) {
             if (set->hashMode() == 1) {
                 auto hash = structuralHash(item.object);
                 if (fw_map_find_hashed(set, hash, item.object, nullptr, 2) < 0)
@@ -470,10 +490,11 @@ Object *fw_array_join(Frame *frame, Object *array, Object *separator) {
     return nativeBoundary([&] {
         auto &sep = requireString(separator)->text;
         std::string out;
-        for (size_t i = 0; i < array->slots.size(); ++i) {
+        auto items = itemsOf(array);
+        for (size_t i = 0; i < items.size(); ++i) {
             if (i)
                 out += sep;
-            auto &item = array->slots[i];
+            auto &item = items[i];
             out += item.kind == Slot::Reference && item.object &&
                            item.object->kind == Object::String
                        ? item.object->text
@@ -484,6 +505,7 @@ Object *fw_array_join(Frame *frame, Object *array, Object *separator) {
 }
 void fw_array_sort(Object *array) {
     nativeBoundary([&] {
+        ObjectGuard guard(array);
         std::stable_sort(array->slots.begin(), array->slots.end(),
                          [](const Slot &a, const Slot &b) { return compareSlots(a, b) < 0; });
     });
@@ -492,7 +514,8 @@ void fw_array_sort(Object *array) {
 void fw_array_sort_by(Object *array, Object *closure,
                       int64_t (*less)(Object *, Object *, int64_t, int64_t)) {
     try {
-        std::vector<int64_t> order(array->slots.size());
+        // The comparator is Flywheel code, so it runs without the array's lock.
+        std::vector<int64_t> order(static_cast<size_t>(fw_length(array)));
         for (size_t i = 0; i < order.size(); ++i)
             order[i] = static_cast<int64_t>(i);
         std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) {
@@ -503,9 +526,12 @@ void fw_array_sort_by(Object *array, Object *closure,
         });
         std::vector<Slot> sorted;
         sorted.reserve(order.size());
+        ObjectGuard guard(array);
+        if (array->slots.size() != order.size())
+            fail("array changed size while sorting");
         for (auto i : order)
             sorted.push_back(array->slots[static_cast<size_t>(i)]);
-        array->slots = std::move(sorted);
+        array->slots.swap(sorted);
     } catch (const CallbackFailure &) {
     } catch (const NativeFailure &e) {
         recordFailure(e.type, e.message);
@@ -514,12 +540,16 @@ void fw_array_sort_by(Object *array, Object *closure,
     }
 }
 void fw_array_reverse(Object *array) {
-    nativeBoundary([&] { std::reverse(array->slots.begin(), array->slots.end()); });
+    nativeBoundary([&] {
+        ObjectGuard guard(array);
+        std::reverse(array->slots.begin(), array->slots.end());
+    });
 }
 Object *fw_array_slice(Frame *frame, Object *array, int64_t begin, int64_t end, int64_t mode) {
     return nativeBoundary([&] {
-        auto [from, to] = sliceBounds(static_cast<int64_t>(array->slots.size()), begin, end, mode);
         auto out = managed(frame, array->kind);
+        ObjectGuard guard(array);
+        auto [from, to] = sliceBounds(static_cast<int64_t>(array->slots.size()), begin, end, mode);
         out->slots.assign(array->slots.begin() + static_cast<ptrdiff_t>(from),
                           array->slots.begin() + static_cast<ptrdiff_t>(to));
         return out;
@@ -528,7 +558,8 @@ Object *fw_array_slice(Frame *frame, Object *array, int64_t begin, int64_t end, 
 // Searches with the item boxed in slot 0 of `box`; returns the first index or -1.
 int64_t fw_array_index_of(Object *array, Object *box) {
     return nativeBoundary([&]() -> int64_t {
-        auto &item = box->slots.at(0);
+        auto item = itemsOf(box).at(0);
+        ObjectGuard guard(array);
         for (size_t i = 0; i < array->slots.size(); ++i)
             if (slotEqual(array->slots[i], item))
                 return static_cast<int64_t>(i);
@@ -538,6 +569,7 @@ int64_t fw_array_index_of(Object *array, Object *box) {
 // Opens slot `index` (0..length) for an inserted value and returns it.
 int64_t fw_array_insert(Object *array, int64_t index) {
     return nativeBoundary([&]() -> int64_t {
+        ObjectGuard guard(array);
         if (index < 0 || static_cast<size_t>(index) > array->slots.size())
             fail("insert index out of bounds", "IndexError");
         array->slots.insert(array->slots.begin() + index, Slot{});
@@ -546,21 +578,25 @@ int64_t fw_array_insert(Object *array, int64_t index) {
 }
 void fw_array_remove_at(Object *array, int64_t index) {
     nativeBoundary([&] {
+        Slot removed; // released after unlocking
+        ObjectGuard guard(array);
         if (index < 0 || static_cast<size_t>(index) >= array->slots.size())
             fail("remove_at index out of bounds", "IndexError");
+        removed = array->slots[static_cast<size_t>(index)];
         array->slots.erase(array->slots.begin() + index);
     });
 }
 Object *fw_array_copy(Frame *frame, Object *array) {
     return nativeBoundary([&] {
         auto out = managed(frame, array->kind);
-        out->slots = array->slots;
+        out->slots = itemsOf(array);
         return out;
     });
 }
 void fw_array_extend(Object *array, Object *other) {
     nativeBoundary([&] {
-        auto items = other->slots;
+        auto items = itemsOf(other);
+        ObjectGuard guard(array);
         array->slots.insert(array->slots.end(), items.begin(), items.end());
     });
 }

@@ -86,7 +86,7 @@ Paths are UTF-8 strings and are returned with `/` separators. Failures raise `Fi
 
 ## regex
 
-ECMAScript regular expressions (the syntax of JavaScript), applied to the UTF-8 bytes of the text; character classes such as `.` match bytes, not characters. Patterns are compiled once and cached per thread. Invalid patterns raise `RegexError`.
+ECMAScript regular expressions (the syntax of JavaScript), applied to the characters of the text, as strings are: `.` and character classes such as `[^a]` match whole characters, so `regex.find(".", "é")` is `"é"`. Shorthand classes (`\w`, `\d`, `\s`, `\b`) and case-insensitive matching cover ASCII only. On Windows, characters outside the Basic Multilingual Plane (such as most emoji) are matched as two units. Patterns are compiled once and cached per thread. Invalid patterns raise `RegexError`.
 
 | Function | Result |
 |---|---|

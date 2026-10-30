@@ -146,4 +146,4 @@ The installed compiler locates its runtime archive in `../lib`; the C++ linker t
 
 ## VS Code
 
-The [Flywheel extension](../fw-vscode/README.md) supplies syntax highlighting, snippets, and editing support for `.fw` / `.fly` files. `flywheel lsp` provides diagnostics and formatting to editors with a generic LSP client.
+The [Flywheel VS Code extension](https://github.com/fwlang/vscode-flywheel) supplies syntax highlighting, snippets, and editing support for `.fw` / `.fly` files. `flywheel lsp` provides diagnostics and formatting to editors with a generic LSP client.

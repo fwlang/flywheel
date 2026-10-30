@@ -257,7 +257,7 @@ struct Server {
         };
         if (method == "initialize")
             reply("{\"capabilities\":{\"textDocumentSync\":1,\"documentFormattingProvider\":true},"
-                  "\"serverInfo\":{\"name\":\"flywheel\",\"version\":\"0.1.0\"}}");
+                  "\"serverInfo\":{\"name\":\"flywheel\",\"version\":\"" FW_VERSION "\"}}");
         else if (method == "shutdown")
             reply("null");
         else if (method == "exit")

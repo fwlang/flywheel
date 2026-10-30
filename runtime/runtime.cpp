@@ -205,6 +205,56 @@ struct SharedLock {
             held->unlock();
     }
 };
+// While other threads exist, operations on arrays, maps, sets, instances, and cells lock the
+// object, using one of a fixed set of locks chosen by its address. A thread holds at most one of
+// these locks (re-entering it is free), never runs Flywheel code or formats values under it,
+// and releases values it displaces only after unlocking, because releasing a thread.task joins
+// its thread.
+struct alignas(64) Stripe { // one cache line per lock, so threads on different locks don't contend
+    std::atomic<bool> locked{false};
+    void lock() {
+        while (locked.exchange(true, std::memory_order_acquire))
+            for (int spins = 0; locked.load(std::memory_order_relaxed); ++spins)
+                if (spins > 64)
+                    std::this_thread::yield();
+    }
+    void unlock() {
+        locked.store(false, std::memory_order_release);
+    }
+};
+Stripe &objectStripe(const Object *p) {
+    static Stripe stripes[1024];
+    auto h = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p)) * 0x9e3779b97f4a7c15ULL;
+    return stripes[h >> 54];
+}
+// The stripe this thread holds. Guards are scoped, so one nested inside a guard on the same
+// stripe does nothing; the outer guard keeps the lock until it ends.
+thread_local Stripe *heldStripe = nullptr;
+struct ObjectGuard {
+    Stripe *held = nullptr;
+    bool outer = false;
+    explicit ObjectGuard(const Object *p) {
+        if (!p || activeThreads.load(std::memory_order_acquire) == 0)
+            return;
+        auto &stripe = objectStripe(p);
+        if (heldStripe == &stripe)
+            return;
+        stripe.lock();
+        held = &stripe;
+        if (!heldStripe) {
+            heldStripe = held;
+            outer = true;
+        }
+    }
+    ObjectGuard(const ObjectGuard &) = delete;
+    ~ObjectGuard() {
+        if (!held)
+            return;
+        if (outer)
+            heldStripe = nullptr;
+        held->unlock();
+    }
+};
 // Weak cells are read and cleared under this lock so a weak read never races with the
 // target's destruction (see fw_weak_get).
 std::mutex &weakMutex() {
@@ -427,6 +477,15 @@ Slot &slot(Object *p, int64_t index) {
         fail("index out of bounds", "IndexError");
     return p->slots[static_cast<size_t>(index)];
 }
+// Copies of a collection's items and keys, read under its lock, to walk without holding it.
+std::vector<Slot> itemsOf(Object *p) {
+    ObjectGuard guard(p);
+    return p->slots;
+}
+std::vector<Slot> keysOf(Object *p) {
+    ObjectGuard guard(p);
+    return p->keys;
+}
 } // namespace
 extern "C" {
 void *fw_frame() {
@@ -557,6 +616,7 @@ int64_t fw_length(Object *p) {
     try {
         if (!p)
             fail("null length");
+        ObjectGuard guard(p);
         return static_cast<int64_t>(p->kind == Object::String ? utf8Length(p->text) : p->slots.size());
     } catch (const NativeFailure &e) {
         recordFailure(e.type, e.message);
@@ -583,6 +643,7 @@ Object *fw_new(Frame *f, int64_t count, int64_t kind) {
 }
 int64_t fw_get_int(Object *p, int64_t index) {
     try {
+        ObjectGuard guard(p);
         return slot(p, index).integer;
     } catch (const NativeFailure &e) {
         recordFailure(e.type, e.message);
@@ -594,6 +655,7 @@ int64_t fw_get_int(Object *p, int64_t index) {
 }
 double fw_get_real(Object *p, int64_t index) {
     try {
+        ObjectGuard guard(p);
         return slot(p, index).real;
     } catch (const NativeFailure &e) {
         recordFailure(e.type, e.message);
@@ -605,6 +667,7 @@ double fw_get_real(Object *p, int64_t index) {
 }
 Object *fw_get_object(Object *p, int64_t index) {
     try {
+        ObjectGuard guard(p);
         return slot(p, index).object;
     } catch (const NativeFailure &e) {
         recordFailure(e.type, e.message);
@@ -616,6 +679,7 @@ Object *fw_get_object(Object *p, int64_t index) {
 }
 void fw_set_int(Object *p, int64_t index, int64_t value, int64_t kind) {
     try {
+        ObjectGuard guard(p);
         auto &target = slot(p, index);
         target.integer = value;
         target.kind = static_cast<Slot::Kind>(kind & 0xff);
@@ -631,6 +695,7 @@ void fw_set_int(Object *p, int64_t index, int64_t value, int64_t kind) {
 }
 void fw_set_real(Object *p, int64_t index, double value) {
     try {
+        ObjectGuard guard(p);
         auto &target = slot(p, index);
         target.real = value;
         target.kind = Slot::Real;
@@ -644,17 +709,130 @@ void fw_set_real(Object *p, int64_t index, double value) {
 }
 void fw_set_object(Object *p, int64_t index, Object *value) {
     try {
-        auto &s = slot(p, index);
-        retain(value);
-        release(s.object);
-        s.object = value;
-        s.kind = Slot::Reference;
+        Object *previous;
+        {
+            ObjectGuard guard(p);
+            auto &s = slot(p, index);
+            retain(value);
+            previous = std::exchange(s.object, value);
+            s.kind = Slot::Reference;
+        }
+        release(previous);
     } catch (const NativeFailure &e) {
         recordFailure(e.type, e.message);
         return;
     } catch (const std::exception &e) {
         recordFailure("RuntimeError", e.what());
         return;
+    }
+}
+// Reads an object slot and keeps it in the frame in one step, so another thread cannot release
+// the value between the read and the retain.
+Object *fw_get_kept(Frame *f, Object *p, int64_t index) {
+    try {
+        Object *value;
+        {
+            ObjectGuard guard(p);
+            value = slot(p, index).object;
+            retain(value);
+        }
+        return own(f, value);
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
+}
+// push and pop each change an array in one locked step; `kind` is encoded as for fw_set_int.
+void fw_array_push_int(Object *p, int64_t value, int64_t kind) {
+    try {
+        Slot s;
+        s.integer = value;
+        s.kind = static_cast<Slot::Kind>(kind & 0xff);
+        if (s.kind == Slot::Enum)
+            s.real = static_cast<double>(kind >> 8);
+        ObjectGuard guard(p);
+        p->slots.push_back(std::move(s));
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+    }
+}
+void fw_array_push_real(Object *p, double value) {
+    try {
+        Slot s;
+        s.real = value;
+        s.kind = Slot::Real;
+        ObjectGuard guard(p);
+        p->slots.push_back(std::move(s));
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+    }
+}
+void fw_array_push_object(Object *p, Object *value) {
+    try {
+        Slot s;
+        s.kind = Slot::Reference;
+        retain(value);
+        s.object = value;
+        ObjectGuard guard(p);
+        p->slots.push_back(std::move(s));
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+    }
+}
+}
+namespace {
+Slot popSlot(Object *p) {
+    ObjectGuard guard(p);
+    if (p->slots.empty())
+        fail("pop from empty array", "IndexError");
+    Slot last = std::move(p->slots.back());
+    p->slots.pop_back();
+    return last;
+}
+} // namespace
+extern "C" {
+int64_t fw_array_pop_int(Object *p) {
+    try {
+        return popSlot(p).integer;
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
+}
+double fw_array_pop_real(Object *p) {
+    try {
+        return popSlot(p).real;
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
+    }
+}
+// The array's reference to the popped value moves to the frame.
+Object *fw_array_pop_object(Frame *f, Object *p) {
+    try {
+        auto last = popSlot(p);
+        return own(f, std::exchange(last.object, nullptr));
+    } catch (const NativeFailure &e) {
+        recordFailure(e.type, e.message);
+        return {};
+    } catch (const std::exception &e) {
+        recordFailure("RuntimeError", e.what());
+        return {};
     }
 }
 Object *fw_element(Frame *f, Object *tag) {
@@ -919,6 +1097,7 @@ void fw_panic(const char *message, const char *type) {
 extern "C" {
 int64_t fw_contains_int(Object *p, int64_t item) {
     try {
+        ObjectGuard guard(p);
         for (auto &s : p->slots)
             if (s.integer == item)
                 return 1;
@@ -933,6 +1112,7 @@ int64_t fw_contains_int(Object *p, int64_t item) {
 }
 int64_t fw_contains_real(Object *p, double item) {
     try {
+        ObjectGuard guard(p);
         for (auto &s : p->slots)
             if (s.real == item)
                 return 1;
@@ -947,6 +1127,7 @@ int64_t fw_contains_real(Object *p, double item) {
 }
 int64_t fw_contains_object(Object *p, Object *item) {
     try {
+        ObjectGuard guard(p);
         for (auto &s : p->slots)
             if (fw_equal(s.object, item))
                 return 1;
@@ -1551,6 +1732,7 @@ Object *fw_map_new(Frame *frame, int64_t objects) {
 }
 int64_t fw_map_index(Object *p, int64_t integer, Object *object, int64_t insert) {
     try {
+        ObjectGuard guard(p);
         auto index = findKey(p, integer, object);
         if (index >= 0)
             return index;
@@ -1577,6 +1759,7 @@ int64_t fw_map_index(Object *p, int64_t integer, Object *object, int64_t insert)
 }
 int64_t fw_map_has(Object *p, int64_t integer, Object *object) {
     try {
+        ObjectGuard guard(p);
         return findKey(p, integer, object) >= 0;
     } catch (const NativeFailure &e) {
         recordFailure(e.type, e.message);
@@ -1588,6 +1771,8 @@ int64_t fw_map_has(Object *p, int64_t integer, Object *object) {
 }
 int64_t fw_map_remove(Object *p, int64_t integer, Object *object) {
     try {
+        Slot key, value; // released after unlocking
+        ObjectGuard guard(p);
         auto i = findKey(p, integer, object);
         if (i < 0)
             return 0;
@@ -1597,6 +1782,8 @@ int64_t fw_map_remove(Object *p, int64_t integer, Object *object) {
                 index.strings.erase(p->keys[static_cast<size_t>(i)].object->text);
         } else
             index.integers.erase(p->keys[static_cast<size_t>(i)].integer);
+        key = std::move(p->keys[static_cast<size_t>(i)]);
+        value = std::move(p->slots[static_cast<size_t>(i)]);
         p->keys.erase(p->keys.begin() + i);
         p->slots.erase(p->slots.begin() + i);
         for (auto j = static_cast<size_t>(i); j < p->keys.size(); ++j)
@@ -1614,7 +1801,7 @@ int64_t fw_map_remove(Object *p, int64_t integer, Object *object) {
 Object *fw_map_keys(Frame *frame, Object *p) {
     try {
         auto keys = new Object(Object::Array);
-        keys->slots = p->keys;
+        keys->slots = keysOf(p);
         return own(frame, keys);
     } catch (const NativeFailure &e) {
         recordFailure(e.type, e.message);
@@ -1626,6 +1813,7 @@ Object *fw_map_keys(Frame *frame, Object *p) {
 }
 int64_t fw_array_append(Object *p) {
     try {
+        ObjectGuard guard(p);
         p->slots.emplace_back();
         return static_cast<int64_t>(p->slots.size() - 1);
     } catch (const NativeFailure &e) {
@@ -1638,8 +1826,11 @@ int64_t fw_array_append(Object *p) {
 }
 void fw_array_pop(Object *p) {
     try {
+        Slot last; // released after unlocking
+        ObjectGuard guard(p);
         if (p->slots.empty())
             fail("pop from empty array", "IndexError");
+        last = std::move(p->slots.back());
         p->slots.pop_back();
     } catch (const NativeFailure &e) {
         recordFailure(e.type, e.message);
@@ -1651,8 +1842,10 @@ void fw_array_pop(Object *p) {
 }
 void fw_collection_clear(Object *p) {
     try {
-        p->slots.clear();
-        p->keys.clear();
+        std::vector<Slot> slots, keys; // released after unlocking
+        ObjectGuard guard(p);
+        slots.swap(p->slots);
+        keys.swap(p->keys);
         if (p->extra)
             p->extra->keyHashes.clear();
         p->index.reset();
@@ -1790,6 +1983,7 @@ extern "C" Object *fw_try_read(Frame *frame, Object *path) {
     }
 }
 
+#include "stack.inc"
 #include "collections.inc"
 #include "strings.inc"
 

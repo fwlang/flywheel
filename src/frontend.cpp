@@ -484,6 +484,11 @@ std::string Parser::type() {
             r += "," + type();
         expect("]");
         r += "]";
+    } else if (accept("(")) {
+        // Parentheses group a type, so suffixes can apply to a function type:
+        // (function() returns int)[] is an array of functions.
+        r = type();
+        expect(")");
     } else if (peek().text == "function" && peek(1).text == "(") {
         // function(A, B) returns R is stored as function<R,A,B>.
         take();

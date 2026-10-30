@@ -59,4 +59,4 @@ Local variable and type information is not emitted yet, so debuggers show source
 - diagnostics on open, change, and save, checking unsaved buffers (including unsaved imported modules that are open in the editor) with the full compiler front end; and
 - whole-document formatting with the formatter above.
 
-Configure an editor's generic LSP client to start `flywheel lsp` for `.fw` and `.fly` files. The VS Code extension in `fw-vscode` currently provides syntax highlighting and snippets; it does not yet launch the server. The compiler reports the first error it finds, so the server publishes one diagnostic at a time.
+Configure an editor's generic LSP client to start `flywheel lsp` for `.fw` and `.fly` files. The [VS Code extension](https://github.com/fwlang/vscode-flywheel) currently provides syntax highlighting and snippets; it does not yet launch the server. The compiler reports the first error it finds, so the server publishes one diagnostic at a time.

@@ -45,6 +45,12 @@ std::string displayName(const std::string &text) {
         }
         result += text[i++];
     }
+    // `int` is the source spelling of i64.
+    auto word = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; };
+    for (auto at = result.find("i64"); at != std::string::npos; at = result.find("i64", at + 1))
+        if ((at == 0 || !word(result[at - 1])) &&
+            (at + 3 == result.size() || !word(result[at + 3])))
+            result.replace(at, 3, "int");
     // function<R,A,B> is spelled function(A, B) returns R in source and diagnostics.
     for (auto at = result.find("function<"); at != std::string::npos;
          at = result.find("function<", at + 1)) {
@@ -71,6 +77,9 @@ std::string displayName(const std::string &text) {
         spelled += ")";
         if (parts[0] != "void")
             spelled += " returns " + parts[0];
+        // Suffixes after a function type need grouping: (function() returns int)[].
+        if (end < result.size() && (result[end] == '[' || result[end] == '?'))
+            spelled = "(" + spelled + ")";
         result.replace(at, end - at, spelled);
     }
     return result;
@@ -1214,16 +1223,27 @@ end
         error("unknown field '" + name + "' on " + t.name);
     }
     Val get(Val obj, llvm::Value *index, Ty t) {
-        if (t.object()) {
-            auto object = objectCall("fw_get_object", {obj.v, index});
-            return {borrowed ? object : objectCall("fw_keep", {frame, object}), t};
-        }
+        if (t.object())
+            return {borrowed ? objectCall("fw_get_object", {obj.v, index})
+                             : objectCall("fw_get_kept", {frame, obj.v, index}),
+                    t};
         if (t.real()) {
             auto x = call("fw_get_real", b.getDoubleTy(), {obj.v, index});
             return {b.CreateFPCast(x, ll(t)), t};
         }
         auto x = call("fw_get_int", b.getInt64Ty(), {obj.v, index});
         return {b.CreateIntCast(x, ll(t), !t.unsigned_()), t};
+    }
+    // The slot kind of an integer-like value, as fw_set_int and fw_array_push_int take it.
+    llvm::Value *slotKind(Ty t) {
+        return i64(t.name == "bool"   ? 3
+                   : t.name == "char" ? 5
+                   : t.enumeration()  ? 6 | (enumIds.at(t.name) << 8)
+                   : t.unsigned_()    ? 1
+                                      : 0);
+    }
+    llvm::Value *slotInteger(Val x) {
+        return b.CreateIntCast(x.v, b.getInt64Ty(), x.t.name != "bool" && !x.t.unsigned_());
     }
     void set(Val obj, llvm::Value *index, Val x) {
         if (x.t.classReference())
@@ -1234,14 +1254,19 @@ end
             call("fw_set_real", b.getVoidTy(),
                  {obj.v, index, b.CreateFPCast(x.v, b.getDoubleTy())});
         else
-            call("fw_set_int", b.getVoidTy(),
-                 {obj.v, index,
-                  b.CreateIntCast(x.v, b.getInt64Ty(), x.t.name != "bool" && !x.t.unsigned_()),
-                  i64(x.t.name == "bool"   ? 3
-                      : x.t.name == "char" ? 5
-                      : x.t.enumeration()  ? 6 | (enumIds.at(x.t.name) << 8)
-                      : x.t.unsigned_()    ? 1
-                                           : 0)});
+            call("fw_set_int", b.getVoidTy(), {obj.v, index, slotInteger(x), slotKind(x.t)});
+    }
+    // Appends in one runtime call, so a push is atomic for other threads.
+    void push(Val array, Val x) {
+        if (x.t.classReference())
+            x = convert(x, constructorType(x.t.name.substr(6)));
+        if (x.t.object())
+            call("fw_array_push_object", b.getVoidTy(), {array.v, x.v});
+        else if (x.t.real())
+            call("fw_array_push_real", b.getVoidTy(),
+                 {array.v, b.CreateFPCast(x.v, b.getDoubleTy())});
+        else
+            call("fw_array_push_int", b.getVoidTy(), {array.v, slotInteger(x), slotKind(x.t)});
     }
     Val receiver() {
         auto v = lookup("$inst");
@@ -2507,8 +2532,18 @@ Val Compiler::value(Expr &e, Ty expected) {
                     tuple = true;
             }
         }
-        if (items.empty() && !expected.sequence() && !expected.tuple())
+        if (items.empty() && !expected.sequence() && !expected.tuple()) {
+            // `function() returns int[]` is a function returning an array; point at the grouping.
+            if (expected.function() && expected.parts()[0].array()) {
+                auto parts = expected.parts();
+                std::string grouped = "function<" + parts[0].name.substr(0, parts[0].name.size() - 2);
+                for (size_t i = 1; i < parts.size(); ++i)
+                    grouped += "," + parts[i].name;
+                error("[] is not a " + expected.name +
+                      "; for an array of functions, group the function type: (" + grouped + ">)[]");
+            }
             error("empty arrays require an expected array type");
+        }
         Ty t;
         if (tuple) {
             t.name = "[";
@@ -3386,18 +3421,21 @@ Val Compiler::invoke(Expr &e, Ty expected) {
         if (obj.t.array() && methodName == "push") {
             if (e.args.size() != 2)
                 error("push expects one value");
-            auto v = convert(value(*e.args[1], obj.t.item()), obj.t.item());
-            auto index = call("fw_array_append", b.getInt64Ty(), {obj.v});
-            set(obj, index, v);
+            push(obj, convert(value(*e.args[1], obj.t.item()), obj.t.item()));
             return {};
         }
         if (obj.t.array() && methodName == "pop") {
             if (e.args.size() != 1)
                 error("pop expects no arguments");
-            auto length = call("fw_length", b.getInt64Ty(), {obj.v});
-            auto v = get(obj, b.CreateSub(length, i64(1)), obj.t.item());
-            call("fw_array_pop", b.getVoidTy(), {obj.v});
-            return v;
+            auto t = obj.t.item();
+            if (t.object())
+                return {objectCall("fw_array_pop_object", {frame, obj.v}), t};
+            if (t.real())
+                return {b.CreateFPCast(call("fw_array_pop_real", b.getDoubleTy(), {obj.v}), ll(t)),
+                        t};
+            return {b.CreateIntCast(call("fw_array_pop_int", b.getInt64Ty(), {obj.v}), ll(t),
+                                    !t.unsigned_()),
+                    t};
         }
         if (methodName == "clear") {
             if (e.args.size() != 1)

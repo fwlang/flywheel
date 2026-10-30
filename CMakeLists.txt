@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.24)
 project(Flywheel VERSION 0.1.0 LANGUAGES C CXX)
+# Pre-release tag of this version; empty for a final release. `flywheel --version` reports both.
+set(FLYWHEEL_PRERELEASE "beta.1")
+if(FLYWHEEL_PRERELEASE)
+  set(FLYWHEEL_VERSION "${PROJECT_VERSION}-${FLYWHEEL_PRERELEASE}")
+else()
+  set(FLYWHEEL_VERSION "${PROJECT_VERSION}")
+endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(LLVM REQUIRED CONFIG)
@@ -46,7 +53,7 @@ if(NOT MSVC AND NOT FLYWHEEL_LINKER STREQUAL "default")
   endif()
 endif()
 message(STATUS "flywheel build links with: ${FW_CXX_PATH} ${FW_LINKER_FLAG}")
-target_compile_definitions(flywheel PRIVATE FW_CXX="${FW_CXX_PATH}" FW_LINKER_FLAG="${FW_LINKER_FLAG}" FW_RUNTIME="$<TARGET_FILE:flywheel_runtime>" FW_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests")
+target_compile_definitions(flywheel PRIVATE FW_VERSION="${FLYWHEEL_VERSION}" FW_CXX="${FW_CXX_PATH}" FW_LINKER_FLAG="${FW_LINKER_FLAG}" FW_RUNTIME="$<TARGET_FILE:flywheel_runtime>" FW_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests")
 add_dependencies(flywheel flywheel_runtime)
 # `flywheel run` JIT-loads the program and resolves runtime calls against a copy of the runtime
 # linked into the compiler. Other platforms link a temporary executable instead.
