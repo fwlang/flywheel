@@ -176,7 +176,7 @@ A handler takes no arguments or one `web.request`, and returns `element`, `fragm
 
 `web.request` has `method`, `path` (percent-decoded), `query`, `headers` (lower-cased names; repeats joined with `, `), `body`, `params`, and `form` (parsed from `application/x-www-form-urlencoded` bodies). `web.response` has `status` (100..599), `body`, and `headers`. `web.text`, `web.html` (accepts markup), `web.json` (a string or `json.value`), and `web.redirect` (sets `location`, default status 302) build responses with an optional status.
 
-`web.tls(certificate_file, key_file, port, host)` serves that port over HTTPS using PEM files and returns its `https://` URL; register routes on the same port afterwards. TLS uses the system OpenSSL 3 library (`libssl`), loaded when `web.tls` is first called, so programs that do not use TLS do not depend on it.
+`web.tls(certificate_file, key_file, port, host)` serves that port over HTTPS using PEM files and returns its `https://` URL; register routes on the same port afterwards. TLS (1.2 and 1.3) uses the Mbed TLS library built into the runtime; RSA and EC keys are supported, and a key that does not match the certificate raises `FileError`.
 
 The runtime enters its request loop after top-level startup code completes, or explicitly with `web.wait()`. One thread multiplexes every listener and connection with non-blocking sockets, so slow or idle clients do not hold up others. HTTP/1.1 connections stay open for further requests (`Connection: keep-alive`) until the client closes them, asks to close, or stays idle for 15 seconds. Request bodies may use `Content-Length` or `Transfer-Encoding: chunked`. Headers are limited to 64 KiB and bodies to 8 MiB.
 
@@ -191,7 +191,7 @@ Handlers run one at a time on the serving thread by default. `web.workers(n)` (c
 | `web.delete(url, headers = {})`, `web.head(url, headers = {})` | DELETE, HEAD |
 | `web.fetch(method, url, body = "", headers = {}, timeout = 30.0)` | any method, with a timeout in seconds |
 
-Each returns a `web.response` with `status`, `body`, and `headers` (lower-cased names). Any status, including 404 and 500, is a response; connection, TLS, and protocol failures raise `HttpError`. Redirects are followed (up to 10; 303, and 301/302 after POST, continue as GET; credentials are not sent to another host). Chunked and gzip/deflate-encoded bodies are decoded. `https://` uses the system OpenSSL 3 library with certificate and host-name verification against OpenSSL's default trust store (`SSL_CERT_FILE` / `SSL_CERT_DIR` override it). Headers are `map<string, string>`; `User-Agent: Flywheel` and `Accept-Encoding: gzip, deflate` are sent unless given.
+Each returns a `web.response` with `status`, `body`, and `headers` (lower-cased names). Any status, including 404 and 500, is a response; connection, TLS, and protocol failures raise `HttpError`. Redirects are followed (up to 10; 303, and 301/302 after POST, continue as GET; credentials are not sent to another host). Chunked and gzip/deflate-encoded bodies are decoded. `https://` uses the built-in Mbed TLS library with certificate and host-name verification against the system's root certificates: the Windows root store, or the distribution's CA bundle on Linux (`SSL_CERT_FILE` / `SSL_CERT_DIR` override it). Headers are `map<string, string>`; `User-Agent: Flywheel` and `Accept-Encoding: gzip, deflate` are sent unless given.
 
 ```flywheel
 import web
@@ -241,7 +241,7 @@ Levels run from 0 (stored) to 9. The implementation is built in (no zlib depende
 
 ## sqlite
 
-`sqlite.open(path)` opens (or creates) a database and returns a `sqlite.database`; `":memory:"` is a private in-memory database. It uses the system SQLite 3 library (`libsqlite3`), loaded on first use.
+`sqlite.open(path)` opens (or creates) a database and returns a `sqlite.database`; `":memory:"` is a private in-memory database. SQLite 3 is built into the runtime, so no system library is needed.
 
 | Method | Behavior |
 |---|---|

@@ -1048,7 +1048,29 @@ EP Parser::outer() {
         return (peek(n).text == "-" || peek(n).text == "+") && peek(n).spaced &&
                !peek(n + 1).spaced;
     };
-    if (callable && (attachedSign(1) || peek(1).text == "not" ||
+    // `print (1+2)*3` passes `(1+2)*3`: a spaced '(' whose group is followed by a binary operator
+    // opens the argument rather than an argument list. `print (a, b)` and `print(1+2)*3` are calls.
+    auto groupedOperand = [&] {
+        if (peek(1).text != "(" || !peek(1).spaced || peek(1).kind == "string" ||
+            peek(1).kind == "markup")
+            return false;
+        int depth = 0;
+        for (size_t n = 1;; ++n) {
+            const auto &t = peek(n);
+            if (t.kind == "eof")
+                return false;
+            if (t.kind == "string" || t.kind == "char" || t.kind == "markup")
+                continue;
+            if (t.text == "(" || t.text == "[" || t.text == "{")
+                ++depth;
+            else if ((t.text == ")" || t.text == "]" || t.text == "}") && --depth == 0) {
+                const auto &next = peek(n + 1);
+                return (next.kind == "op" || next.kind == "id") && precedence(next.text) > 0;
+            }
+        }
+    };
+    bool grouped = callable && groupedOperand();
+    if (callable && (attachedSign(1) || peek(1).text == "not" || grouped ||
                      (peek(1).text == "[" && peek(1).spaced))) {
         auto t = take();
         e = node("name", t.text, t.loc);
@@ -1057,7 +1079,7 @@ EP Parser::outer() {
     auto k = peek().kind;
     if ((e->kind == "name" || e->kind == "member") &&
         (k == "id" || k == "int" || k == "real" || k == "string" || k == "char" || k == "markup" ||
-         peek().text == "[" || (callable && attachedSign(0)))) {
+         peek().text == "[" || grouped || (callable && attachedSign(0)))) {
         auto n = node("call", "", e->loc);
         n->args.push_back(std::move(e));
         do {

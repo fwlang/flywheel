@@ -2179,6 +2179,7 @@ extern "C" Object *fw_try_read(Frame *frame, Object *path) {
 
 #include "desktop.inc"
 
+#include "tls.inc"
 #include "web.inc"
 #include "stdlib.inc"
 #include "library.inc"

@@ -1,6 +1,6 @@
 # Desktop windows
 
-The native `desktop` library displays Flywheel markup in a window using [webview/webview](https://github.com/webview/webview), backed by GTK/WebKitGTK on Linux and WebView2 on Windows. It does not run a local HTTP server or require Python. Windows can run Flywheel event handlers, expose Flywheel functions to page JavaScript, update live, and run several at once.
+The native `desktop` library displays Flywheel markup in a window, using GTK/WebKitGTK directly on Linux and WebView2 (through [webview/webview](https://github.com/webview/webview)) on Windows. It does not run a local HTTP server or require Python. Windows can run Flywheel event handlers, expose Flywheel functions to page JavaScript, update live, and run several at once.
 
 ```flywheel
 import desktop
@@ -73,10 +73,8 @@ build/flywheel run examples/desktop_demo.fw
 
 The `FLYWHEEL_DESKTOP` CMake setting accepts `AUTO` (default), `ON`, or `OFF`. `AUTO` builds the backend when native development dependencies are available. `ON` makes missing build dependencies a configuration error. `OFF` retains the window API, but `run` raises `DesktopError` unless a compatible backend is provided. Command-line programs do not load the GUI backend.
 
-The build downloads webview **0.12.0** from its official source archive and verifies its SHA-256. For an offline build, provide an existing checkout with `-DFETCHCONTENT_SOURCE_DIR_WEBVIEW=/path/to/webview`. The adapter works around the pinned version's GTK size-setting result bug: GTK applies valid dimensions but reports `Invalid hint`. Only that exact false error is ignored.
-
-- **Linux:** install GTK and WebKitGTK development packages. Debian/Ubuntu: `libgtk-3-dev libwebkit2gtk-4.1-dev`; Arch Linux: `gtk3 webkit2gtk-4.1`. Running a window needs a graphical session.
-- **Windows:** use the native C++ toolchain; upstream CMake obtains the WebView2 SDK. End users need the WebView2 runtime installed. This path is untested.
+- **Linux:** install GTK and WebKitGTK development packages; the backend (`runtime/desktop_gtk.cpp`) uses them directly and the build downloads nothing. The first of `webkit2gtk-4.1` (GTK 3), `webkitgtk-6.0` (GTK 4), or `webkit2gtk-4.0` found by pkg-config is used. Debian/Ubuntu: `libgtk-3-dev libwebkit2gtk-4.1-dev`; Arch Linux: `gtk3 webkit2gtk-4.1`. Running a window needs a graphical session.
+- **Windows:** use the native C++ toolchain. The build downloads webview **0.12.0** from its official source archive, verifies its SHA-256, and its CMake obtains the WebView2 SDK; for an offline build, provide an existing checkout with `-DFETCHCONTENT_SOURCE_DIR_WEBVIEW=/path/to/webview`. End users need the WebView2 runtime installed. This path is untested.
 
 `cmake --install build --prefix /chosen/prefix` installs the backend beside the runtime archive in `lib`. The compiler records its path in generated applications; `FLYWHEEL_DESKTOP_BACKEND` overrides it. The backend exports the versioned entry point `fw_desktop_run_v2`, separate from the core runtime ABI.
 

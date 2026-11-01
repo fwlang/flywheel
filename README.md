@@ -6,8 +6,6 @@ Flywheel is currently in its **beta** phase: version **2.3 (beta-3)** (`flywheel
 
 ## Build
 
-Requirements: CMake 3.24+, a C++20 toolchain, LLVM development libraries **21–23**, and Python 3 for the development test harness. LLVM 21.1.8 and 23.1.3 have been tested on Linux. A native linker and C++ runtime development files are required to build Flywheel programs. On Linux, `flywheel run` JIT-compiles the program in memory and needs no linker; `flywheel build` links through the configured C++ compiler and uses mold or lld when available (override with `-DFLYWHEEL_LINKER=mold|lld|default`).
-
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DLLVM_DIR="$(llvm-config --cmakedir)"
@@ -15,7 +13,15 @@ cmake --build build --parallel 2
 ctest --test-dir build --output-on-failure
 ```
 
-On Windows, configure from an x64 Visual Studio developer shell using an LLVM development package built for MSVC; `LLVM_DIR` points to the package directory containing `LLVMConfig.cmake`. CI builds on Ubuntu and Windows with conda-forge's LLVM package. Only Linux has been run in this workspace; macOS is not currently a supported target.
+### Dependencies
+
+| | Linux | Windows |
+|---|---|---|
+| Build | CMake 3.24+, C++20 compiler, LLVM 21–23 dev libraries | Same, from an x64 Visual Studio developer shell with an MSVC build of LLVM |
+| `flywheel build` | System linker and C++ runtime (mold/lld used if found); `flywheel run` needs none | MSVC linker |
+| Desktop windows (optional) | GTK + WebKitGTK dev packages, e.g. `libgtk-3-dev libwebkit2gtk-4.1-dev` | Downloaded at build time; users need the WebView2 runtime |
+
+SQLite 3.54.1 and Mbed TLS 4.1.1 (HTTPS) are compiled into the runtime, so programs need no system SQLite or OpenSSL. Configuring downloads them once from pinned, hash-checked releases; for an offline build, set `FETCHCONTENT_SOURCE_DIR_SQLITE` and `FETCHCONTENT_SOURCE_DIR_MBEDTLS` to extracted copies. The HTTPS client trusts the system's root certificates (the Windows store, or the distribution's CA bundle on Linux). Python 3 is optional and only runs the test suite. macOS is not supported. See [desktop windows](docs/desktop.md) for backend options.
 
 ## Use
 

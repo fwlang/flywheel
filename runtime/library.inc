@@ -1326,58 +1326,11 @@ Url parseUrl(const std::string &text) {
         fail("URL has no host ('" + text + "')", "HttpError");
     return url;
 }
-// Client-side OpenSSL functions, from the library tls() loads.
-struct TlsClient {
-    void *(*clientMethod)() = nullptr;
-    int (*defaultPaths)(void *) = nullptr;
-    void (*setVerify)(void *, int, void *) = nullptr;
-    long (*control)(void *, int, long, void *) = nullptr;
-    int (*setHost)(void *, const char *) = nullptr;
-    int (*connect)(void *) = nullptr;
-    long (*verifyResult)(const void *) = nullptr;
-    void *context = nullptr;
-};
-TlsClient &tlsClient() {
-    static TlsClient api;
-    static std::mutex mutex;
-    std::lock_guard<std::mutex> lock(mutex);
-    if (api.context)
-        return api;
-    auto &base = tls();
-    auto bind = [&](auto &target, const char *name) {
-#ifdef _WIN32
-        auto found = reinterpret_cast<void *>(
-            GetProcAddress(static_cast<HMODULE>(base.library), name));
-#else
-        auto found = dlsym(base.library, name);
-#endif
-        if (!found)
-            fail(std::string("OpenSSL is missing ") + name, "HttpError");
-        target = reinterpret_cast<std::remove_reference_t<decltype(target)>>(found);
-    };
-    bind(api.clientMethod, "TLS_client_method");
-    bind(api.defaultPaths, "SSL_CTX_set_default_verify_paths");
-    bind(api.setVerify, "SSL_CTX_set_verify");
-    bind(api.control, "SSL_ctrl");
-    bind(api.setHost, "SSL_set1_host");
-    bind(api.connect, "SSL_connect");
-    bind(api.verifyResult, "SSL_get_verify_result");
-    auto context = base.newContext(api.clientMethod());
-    if (!context)
-        fail("cannot create a TLS client context", "HttpError");
-    api.defaultPaths(context);
-    api.setVerify(context, 1 /* SSL_VERIFY_PEER */, nullptr);
-    api.context = context;
-    return api;
-}
 struct ClientConnection {
     Socket socket = invalidSocket;
-    void *ssl = nullptr;
+    std::unique_ptr<TlsSession> ssl;
     ~ClientConnection() {
-        if (ssl) {
-            tls().shutdown(ssl);
-            tls().freeSession(ssl);
-        }
+        ssl.reset(); // close_notify before the socket closes
         if (socket != invalidSocket)
             closeSocket(socket);
     }
@@ -1385,7 +1338,7 @@ struct ClientConnection {
         size_t done = 0;
         while (done < data.size()) {
             auto chunk = static_cast<int>(std::min<size_t>(data.size() - done, 1 << 20));
-            int n = ssl ? tls().write(ssl, data.data() + done, chunk)
+            int n = ssl ? ssl->write(data.data() + done, static_cast<size_t>(chunk))
                         : static_cast<int>(::send(socket, data.data() + done, chunk, 0));
             if (n <= 0)
                 fail("connection failed while sending the request", "HttpError");
@@ -1395,13 +1348,13 @@ struct ClientConnection {
     // Reads more bytes into `buffer`; false at the end of the stream.
     bool receive(std::string &buffer) {
         char chunk[16384];
-        int n = ssl ? tls().read(ssl, chunk, sizeof chunk)
+        int n = ssl ? ssl->read(chunk, sizeof chunk)
                     : static_cast<int>(::recv(socket, chunk, sizeof chunk, 0));
         if (n > 0) {
             buffer.append(chunk, static_cast<size_t>(n));
             return true;
         }
-        if (n == 0 || (ssl && tls().error(ssl, n) == tlsZeroReturn))
+        if (n == 0)
             return false;
         // An HTTP/1.0-style server may close without a TLS close_notify; treat as the end.
         if (ssl)
@@ -1447,21 +1400,7 @@ HttpResult httpOnce(const std::string &method, const Url &url, const std::string
                  socketMessage(code),
              "HttpError");
     if (url.scheme == "https") {
-        auto &client = tlsClient();
-        connection.ssl = tls().newSession(client.context);
-        if (!connection.ssl)
-            fail("cannot create a TLS session", "HttpError");
-        tls().setDescriptor(connection.ssl, static_cast<int>(connection.socket));
-        client.control(connection.ssl, 55 /* SSL_CTRL_SET_TLSEXT_HOSTNAME */, 0,
-                       const_cast<char *>(url.host.c_str()));
-        client.setHost(connection.ssl, url.host.c_str());
-        if (client.connect(connection.ssl) != 1) {
-            auto verify = client.verifyResult(connection.ssl);
-            fail("TLS handshake with " + url.host + " failed" +
-                     (verify ? " (certificate verification error " + std::to_string(verify) + ")"
-                             : ""),
-                 "HttpError");
-        }
+        connection.ssl = tlsConnect(connection.socket, url.host);
     }
     bool ipv6 = url.host.find(':') != std::string::npos;
     std::string host = ipv6 ? "[" + url.host + "]" : url.host;
@@ -1623,83 +1562,95 @@ extern "C" void fw_http_fetch(Frame *frame, Object *method, Object *url, Object 
     });
 }
 
-// sqlite: SQLite 3 databases through the system library (libsqlite3), loaded on first use ---
+// sqlite: SQLite 3 databases, compiled into the runtime (cmake/Bundled.cmake) -------------
+#include <sqlite3.h>
 namespace {
+// The SQLite calls used below, over untyped connection and statement handles.
 struct Sqlite {
-    void *library = nullptr;
-    int (*open)(const char *, void **, int, const char *) = nullptr;
-    int (*close)(void *) = nullptr;
-    const char *(*message)(void *) = nullptr;
-    int (*prepare)(void *, const char *, int, void **, const char **) = nullptr;
-    int (*finalize)(void *) = nullptr;
-    int (*step)(void *) = nullptr;
-    int (*bindInt)(void *, int, int64_t) = nullptr;
-    int (*bindDouble)(void *, int, double) = nullptr;
-    int (*bindText)(void *, int, const char *, int, intptr_t) = nullptr;
-    int (*bindBlob)(void *, int, const void *, int, intptr_t) = nullptr;
-    int (*bindNull)(void *, int) = nullptr;
-    int (*parameterCount)(void *) = nullptr;
-    int (*columnCount)(void *) = nullptr;
-    const char *(*columnName)(void *, int) = nullptr;
-    int (*columnType)(void *, int) = nullptr;
-    int64_t (*columnInt)(void *, int) = nullptr;
-    double (*columnDouble)(void *, int) = nullptr;
-    const unsigned char *(*columnText)(void *, int) = nullptr;
-    int (*columnBytes)(void *, int) = nullptr;
-    int (*changes)(void *) = nullptr;
-    int64_t (*lastInsert)(void *) = nullptr;
-    int (*busyTimeout)(void *, int) = nullptr;
+    static sqlite3 *db(void *p) {
+        return static_cast<sqlite3 *>(p);
+    }
+    static sqlite3_stmt *statement(void *p) {
+        return static_cast<sqlite3_stmt *>(p);
+    }
+    static sqlite3_destructor_type destructor(intptr_t d) {
+        return reinterpret_cast<sqlite3_destructor_type>(d);
+    }
+    static int open(const char *path, void **out, int flags, const char *vfs) {
+        sqlite3 *handle = nullptr;
+        int status = sqlite3_open_v2(path, &handle, flags, vfs);
+        *out = handle;
+        return status;
+    }
+    static int close(void *p) {
+        return sqlite3_close_v2(db(p));
+    }
+    static const char *message(void *p) {
+        return sqlite3_errmsg(db(p));
+    }
+    static int prepare(void *p, const char *sql, int size, void **out, const char **tail) {
+        sqlite3_stmt *handle = nullptr;
+        int status = sqlite3_prepare_v2(db(p), sql, size, &handle, tail);
+        *out = handle;
+        return status;
+    }
+    static int finalize(void *p) {
+        return sqlite3_finalize(statement(p));
+    }
+    static int step(void *p) {
+        return sqlite3_step(statement(p));
+    }
+    static int bindInt(void *p, int i, int64_t value) {
+        return sqlite3_bind_int64(statement(p), i, value);
+    }
+    static int bindDouble(void *p, int i, double value) {
+        return sqlite3_bind_double(statement(p), i, value);
+    }
+    static int bindText(void *p, int i, const char *text, int size, intptr_t d) {
+        return sqlite3_bind_text(statement(p), i, text, size, destructor(d));
+    }
+    static int bindBlob(void *p, int i, const void *data, int size, intptr_t d) {
+        return sqlite3_bind_blob(statement(p), i, data, size, destructor(d));
+    }
+    static int bindNull(void *p, int i) {
+        return sqlite3_bind_null(statement(p), i);
+    }
+    static int parameterCount(void *p) {
+        return sqlite3_bind_parameter_count(statement(p));
+    }
+    static int columnCount(void *p) {
+        return sqlite3_column_count(statement(p));
+    }
+    static const char *columnName(void *p, int i) {
+        return sqlite3_column_name(statement(p), i);
+    }
+    static int columnType(void *p, int i) {
+        return sqlite3_column_type(statement(p), i);
+    }
+    static int64_t columnInt(void *p, int i) {
+        return sqlite3_column_int64(statement(p), i);
+    }
+    static double columnDouble(void *p, int i) {
+        return sqlite3_column_double(statement(p), i);
+    }
+    static const unsigned char *columnText(void *p, int i) {
+        return sqlite3_column_text(statement(p), i);
+    }
+    static int columnBytes(void *p, int i) {
+        return sqlite3_column_bytes(statement(p), i);
+    }
+    static int changes(void *p) {
+        return sqlite3_changes(db(p));
+    }
+    static int64_t lastInsert(void *p) {
+        return sqlite3_last_insert_rowid(db(p));
+    }
+    static int busyTimeout(void *p, int milliseconds) {
+        return sqlite3_busy_timeout(db(p), milliseconds);
+    }
 };
 Sqlite &sqlite() {
     static Sqlite api;
-    static std::mutex mutex;
-    std::lock_guard<std::mutex> lock(mutex);
-    if (api.library)
-        return api;
-#ifdef _WIN32
-    for (auto name : {"sqlite3.dll", "winsqlite3.dll"})
-        if ((api.library = reinterpret_cast<void *>(LoadLibraryA(name))))
-            break;
-    auto symbol = [&](const char *name) {
-        return reinterpret_cast<void *>(GetProcAddress(static_cast<HMODULE>(api.library), name));
-    };
-#else
-    for (auto name : {"libsqlite3.so.0", "libsqlite3.dylib", "libsqlite3.so"})
-        if ((api.library = dlopen(name, RTLD_NOW | RTLD_LOCAL)))
-            break;
-    auto symbol = [&](const char *name) { return dlsym(api.library, name); };
-#endif
-    if (!api.library)
-        fail("sqlite requires the SQLite 3 library (libsqlite3), which could not be loaded",
-             "DatabaseError");
-    auto bind = [&](auto &target, const char *name) {
-        auto found = symbol(name);
-        if (!found)
-            fail(std::string("SQLite is missing ") + name, "DatabaseError");
-        target = reinterpret_cast<std::remove_reference_t<decltype(target)>>(found);
-    };
-    bind(api.open, "sqlite3_open_v2");
-    bind(api.close, "sqlite3_close_v2");
-    bind(api.message, "sqlite3_errmsg");
-    bind(api.prepare, "sqlite3_prepare_v2");
-    bind(api.finalize, "sqlite3_finalize");
-    bind(api.step, "sqlite3_step");
-    bind(api.bindInt, "sqlite3_bind_int64");
-    bind(api.bindDouble, "sqlite3_bind_double");
-    bind(api.bindText, "sqlite3_bind_text");
-    bind(api.bindBlob, "sqlite3_bind_blob");
-    bind(api.bindNull, "sqlite3_bind_null");
-    bind(api.parameterCount, "sqlite3_bind_parameter_count");
-    bind(api.columnCount, "sqlite3_column_count");
-    bind(api.columnName, "sqlite3_column_name");
-    bind(api.columnType, "sqlite3_column_type");
-    bind(api.columnInt, "sqlite3_column_int64");
-    bind(api.columnDouble, "sqlite3_column_double");
-    bind(api.columnText, "sqlite3_column_text");
-    bind(api.columnBytes, "sqlite3_column_bytes");
-    bind(api.changes, "sqlite3_changes");
-    bind(api.lastInsert, "sqlite3_last_insert_rowid");
-    bind(api.busyTimeout, "sqlite3_busy_timeout");
     return api;
 }
 struct DatabaseResource : NativeResource {

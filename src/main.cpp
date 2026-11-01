@@ -195,8 +195,9 @@ int compileProgram(const std::string &command, const std::string &filename,
              : fs::absolute(output.empty() ? fs::path(filename).stem().string() + suffix : output);
     std::vector<std::string> link;
 #ifdef _MSC_VER
+    // Bcrypt (entropy) and Crypt32 (root certificates) serve the bundled Mbed TLS.
     link = {"/nologo", "/MD", object.string(), runtime.string(), "/Fe:" + binary.string(), "/link",
-            "Ws2_32.lib"};
+            "Ws2_32.lib", "Bcrypt.lib", "Crypt32.lib"};
     if (options.debug)
         link.insert(link.begin() + 2, "/Zi");
 #else
@@ -207,7 +208,12 @@ int compileProgram(const std::string &command, const std::string &filename,
         link.push_back("-g");
 #endif
 #if defined(_WIN32) && !defined(_MSC_VER)
-    link.push_back("-lws2_32");
+    for (auto library : {"-lws2_32", "-lbcrypt", "-lcrypt32"})
+        link.push_back(library);
+#endif
+#if !defined(_MSC_VER) && !defined(__APPLE__)
+    // Drop the parts of the runtime (SQLite, TLS, ...) a program does not use.
+    link.push_back("-Wl,--gc-sections");
 #endif
 #if !defined(_WIN32) && !defined(__APPLE__)
     link.push_back("-ldl");

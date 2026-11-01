@@ -5,7 +5,6 @@
 #include <condition_variable>
 #include <deque>
 #ifndef _WIN32
-#include <dlfcn.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <poll.h>
@@ -54,81 +53,16 @@ struct HttpRoute {
         release(page);
     }
 };
-// TLS uses the system OpenSSL 3 library, loaded on first use so programs without TLS have
-// no dependency on it.
-struct Tls {
-    void *library = nullptr;
-    void *(*serverMethod)() = nullptr;
-    void *(*newContext)(void *) = nullptr;
-    void (*freeContext)(void *) = nullptr;
-    int (*useChain)(void *, const char *) = nullptr;
-    int (*useKey)(void *, const char *, int) = nullptr;
-    int (*checkKey)(void *) = nullptr;
-    long (*contextControl)(void *, int, long, void *) = nullptr;
-    void *(*newSession)(void *) = nullptr;
-    void (*freeSession)(void *) = nullptr;
-    int (*setDescriptor)(void *, int) = nullptr;
-    int (*accept)(void *) = nullptr;
-    int (*read)(void *, void *, int) = nullptr;
-    int (*write)(void *, const void *, int) = nullptr;
-    int (*error)(const void *, int) = nullptr;
-    int (*shutdown)(void *) = nullptr;
-};
-Tls &tls() {
-    static Tls api;
-    if (api.library)
-        return api;
-#ifdef _WIN32
-    for (auto name : {"libssl-3-x64.dll", "libssl-3.dll"})
-        if ((api.library = reinterpret_cast<void *>(LoadLibraryA(name))))
-            break;
-    auto symbol = [&](const char *name) {
-        return reinterpret_cast<void *>(GetProcAddress(static_cast<HMODULE>(api.library), name));
-    };
-#else
-    for (auto name : {"libssl.so.3", "libssl.3.dylib", "libssl.so"})
-        if ((api.library = dlopen(name, RTLD_NOW | RTLD_LOCAL)))
-            break;
-    auto symbol = [&](const char *name) { return dlsym(api.library, name); };
-#endif
-    if (!api.library)
-        fail("TLS requires the OpenSSL 3 library (libssl), which could not be loaded");
-    auto bind = [&](auto &target, const char *name) {
-        auto found = symbol(name);
-        if (!found)
-            fail(std::string("OpenSSL is missing ") + name);
-        target = reinterpret_cast<std::remove_reference_t<decltype(target)>>(found);
-    };
-    bind(api.serverMethod, "TLS_server_method");
-    bind(api.newContext, "SSL_CTX_new");
-    bind(api.freeContext, "SSL_CTX_free");
-    bind(api.useChain, "SSL_CTX_use_certificate_chain_file");
-    bind(api.useKey, "SSL_CTX_use_PrivateKey_file");
-    bind(api.checkKey, "SSL_CTX_check_private_key");
-    bind(api.contextControl, "SSL_CTX_ctrl");
-    bind(api.newSession, "SSL_new");
-    bind(api.freeSession, "SSL_free");
-    bind(api.setDescriptor, "SSL_set_fd");
-    bind(api.accept, "SSL_accept");
-    bind(api.read, "SSL_read");
-    bind(api.write, "SSL_write");
-    bind(api.error, "SSL_get_error");
-    bind(api.shutdown, "SSL_shutdown");
-    return api;
-}
-constexpr int tlsWantRead = 2, tlsWantWrite = 3, tlsZeroReturn = 6;
 struct HttpServer {
     SocketOwner socket;
     int port = 0;
     std::string host;
-    void *tlsContext = nullptr;
+    // The current TLS configuration is the last; earlier ones stay alive for the sessions
+    // that use them.
+    std::vector<std::unique_ptr<TlsServerConfig>> tls;
     std::vector<std::unique_ptr<HttpRoute>> routes;
     explicit HttpServer(SocketOwner &&socket, int port, std::string host)
         : socket(std::move(socket)), port(port), host(std::move(host)) {}
-    ~HttpServer() {
-        if (tlsContext)
-            tls().freeContext(tlsContext);
-    }
 };
 // One accepted client. Requests on a keep-alive connection are answered in order; reads and
 // writes never block, so slow clients do not stall other connections.
@@ -136,18 +70,12 @@ struct HttpConnection {
     SocketOwner socket;
     HttpServer *server;
     std::string input, output;
-    void *session = nullptr;
+    std::unique_ptr<TlsSession> session; // declared after socket: closed before it
     bool handshaken = false, closeAfterWrite = false, dead = false;
     bool busy = false; // a worker is handling this connection's current request
     std::chrono::steady_clock::time_point active = std::chrono::steady_clock::now();
     HttpConnection(SocketOwner &&socket, HttpServer *server)
         : socket(std::move(socket)), server(server) {}
-    ~HttpConnection() {
-        if (session) {
-            tls().shutdown(session);
-            tls().freeSession(session);
-        }
-    }
 };
 struct ParsedRequest;
 struct HttpResponse;
@@ -671,11 +599,9 @@ bool receiveAvailable(HttpConnection &c) {
     while (true) {
         int n;
         if (c.session) {
-            n = tls().read(c.session, buffer, sizeof(buffer));
-            if (n <= 0) {
-                auto code = tls().error(c.session, n);
-                return code == tlsWantRead || code == tlsWantWrite;
-            }
+            n = c.session->read(buffer, sizeof(buffer));
+            if (n <= 0)
+                return n == tlsAgain;
         } else {
             n = static_cast<int>(recv(c.socket.value, buffer, sizeof(buffer), 0));
             if (n < 0)
@@ -694,11 +620,9 @@ bool sendPending(HttpConnection &c) {
         auto chunk = static_cast<int>(std::min<size_t>(c.output.size(), 65536));
         int n;
         if (c.session) {
-            n = tls().write(c.session, c.output.data(), chunk);
-            if (n <= 0) {
-                auto code = tls().error(c.session, n);
-                return code == tlsWantRead || code == tlsWantWrite;
-            }
+            n = c.session->write(c.output.data(), static_cast<size_t>(chunk));
+            if (n <= 0)
+                return n == tlsAgain;
         } else {
 #ifdef MSG_NOSIGNAL
             constexpr int flags = MSG_NOSIGNAL;
@@ -864,12 +788,11 @@ bool serveLoop(HttpRuntime &state) {
                 setsockopt(client.value, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, sizeof(noSignal));
 #endif
                 auto connection = std::make_unique<HttpConnection>(std::move(client), &server);
-                if (server.tlsContext) {
-                    connection->session = tls().newSession(server.tlsContext);
+                if (!server.tls.empty()) {
+                    connection->session =
+                        tlsAccept(*server.tls.back(), connection->socket.value);
                     if (!connection->session)
                         continue;
-                    tls().setDescriptor(connection->session,
-                                        static_cast<int>(connection->socket.value));
                 }
                 state.connections.push_back(std::move(connection));
             }
@@ -879,12 +802,11 @@ bool serveLoop(HttpRuntime &state) {
             auto &c = *state.connections[i];
             auto events = i + listeners < entries.size() ? entries[i + listeners].revents : 0;
             if (c.session && !c.handshaken && events) {
-                int result = tls().accept(c.session);
+                int result = c.session->handshake();
                 if (result == 1)
                     c.handshaken = true;
                 else {
-                    auto code = tls().error(c.session, result);
-                    if (code != tlsWantRead && code != tlsWantWrite)
+                    if (result == tlsFailed)
                         c.dead = true;
                     continue;
                 }
@@ -971,7 +893,7 @@ HttpServer &listener(int64_t port, const std::string &host) {
 }
 std::string serverUrl(const HttpServer &server) {
     auto host = server.host.find(':') != std::string::npos ? "[" + server.host + "]" : server.host;
-    return std::string(server.tlsContext ? "https" : "http") + "://" + host + ":" +
+    return std::string(!server.tls.empty() ? "https" : "http") + "://" + host + ":" +
            std::to_string(server.port);
 }
 Object *addRoute(Frame *frame, const std::string &method, const std::string &route,
@@ -1089,19 +1011,7 @@ extern "C" Object *fw_web_tls(Frame *frame, Object *certificate, Object *key, in
                               Object *host) {
     return nativeBoundary([&] {
         auto &server = listener(port, host->text);
-        auto &api = tls();
-        if (server.tlsContext)
-            api.freeContext(server.tlsContext);
-        server.tlsContext = api.newContext(api.serverMethod());
-        if (!server.tlsContext)
-            fail("cannot create TLS context");
-        // SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER
-        api.contextControl(server.tlsContext, 33, 3, nullptr);
-        if (api.useChain(server.tlsContext, certificate->text.c_str()) != 1)
-            fail("cannot load TLS certificate '" + certificate->text + "'", "FileError");
-        if (api.useKey(server.tlsContext, key->text.c_str(), 1) != 1 ||
-            api.checkKey(server.tlsContext) != 1)
-            fail("cannot load TLS private key '" + key->text + "'", "FileError");
+        server.tls.push_back(tlsServerConfig(certificate->text, key->text));
         return string(frame, serverUrl(server));
     });
 }

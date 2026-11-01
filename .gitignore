@@ -8,3 +8,6 @@ FLYWHEEL.md
 STATUS.md
 build.sh
 .vscode
+vscode-fw/
+pulley/
+.danny

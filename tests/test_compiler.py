@@ -241,6 +241,16 @@ POSITIVE.update(
             "once\n1\n2\n",
         ),
         "array_alias": ("int[] a = [1]\nvar b = a\nb[0] = 4\nprint a[0]", "4\n"),
+        # SQLite is compiled into the runtime; this needs no system library.
+        "sqlite_bundled": (
+            'import sqlite\nvar db = sqlite.open(":memory:")\n'
+            'db.execute("create table t (id integer primary key, name text, score real)")\n'
+            'print db.execute("insert into t (name, score) values (?, ?), (?, ?)", "ann", 1.5, "bo", null)\n'
+            'print db.last_insert_id()\nprint db.query("select * from t where id >= ? order by id", 1)\n'
+            'try\n    db.execute("select * from missing")\ncatch DatabaseError e\n    print e.message\nend',
+            '2\n2\n[{"id":1,"name":"ann","score":1.5},{"id":2,"name":"bo","score":null}]\n'
+            "no such table: missing\n",
+        ),
     }
 )
 
@@ -1569,6 +1579,10 @@ print person_constructor("Named").name
 
 POSITIVE.update(
     {
+        "outer_call_grouped_operand": (
+            "print (1+2)*3\nprint (1, 2)\nprint (2)\nprint (1+2) * 3, 4\nvar x = 5\nprint (x - 1) * (x + 1)\nprint (1 == 1) and true",
+            "9\n1 2\n2\n9 4\n24\ntrue\n",
+        ),
         "integer_division_any_numeric": (
             "print 7 // 2\nprint -7 // 2\nprint 7.5 // 2.0\nprint -7.9 // 2\nprint typeof(7.5 // 2)\nvar x = 10\nx //= 3\nprint x",
             "3\n-3\n3\n-3\nint\n3\n",
@@ -2707,6 +2721,23 @@ print web.route("POST", "/echo", echo, 0, "::1")
             for _ in range(2):
                 https.request("GET", "/")
                 self.assertEqual(https.getresponse().read(), b"hi")
+            # The HTTP client verifies the certificate against SSL_CERT_FILE and the host name.
+            client = self.root / "client.fw"
+            client.write_text(
+                f'import web\nprint web.get("https://localhost:{port(secure)}/").body\n'
+                f'try\n    web.get("https://127.0.0.1:{port(secure)}/")\n'
+                "catch HttpError e\n    print e.message\nend\n",
+                encoding="utf-8",
+            )
+            env = dict(os.environ, SSL_CERT_FILE=str(self.root / "cert.pem"))
+            result = subprocess.run(
+                [COMPILER, "run", str(client)], cwd=self.root, env=env,
+                capture_output=True, text=True, encoding="utf-8", timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            got, refused = result.stdout.splitlines()
+            self.assertEqual(got, "hi")
+            self.assertIn("TLS handshake with 127.0.0.1 failed", refused)
 
     def test_tooling(self):
         tests = self.root / "suite"
