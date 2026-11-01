@@ -40,6 +40,8 @@ if(NOT _fw_desktop_mode STREQUAL "OFF" AND _fw_desktop_available)
     FetchContent_MakeAvailable(webview)
     add_library(flywheel_desktop SHARED ${PROJECT_SOURCE_DIR}/runtime/desktop_webview.cpp)
     target_link_libraries(flywheel_desktop PRIVATE webview::core)
+    # Keep <windows.h> from defining min/max macros that break std::min/std::max.
+    target_compile_definitions(flywheel_desktop PRIVATE NOMINMAX)
     install(FILES "${webview_SOURCE_DIR}/LICENSE" DESTINATION share/licenses/flywheel RENAME webview-LICENSE)
     set(_fw_desktop_engine "webview 0.12.0")
   endif()

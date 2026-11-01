@@ -31,7 +31,8 @@ struct fw_desktop_host_v2 {
 // Copies `message` into the caller's error buffer and returns the failure status.
 inline int fw_desktop_failure(const char *message, char *error, size_t capacity) {
     if (capacity) {
-        auto length = std::min(std::strlen(message), capacity - 1);
+        // Parenthesized so <windows.h>'s min macro (pulled in by webview.h) cannot expand here.
+        auto length = (std::min)(std::strlen(message), capacity - 1);
         std::memcpy(error, message, length);
         error[length] = '\0';
     }
