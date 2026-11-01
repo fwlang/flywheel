@@ -1,6 +1,6 @@
-# cmake -DAR=... -DOUTPUT=archive -DINPUTS=a|b|c [-DMSVC=1] [-DAPPLE=1] -P MergeArchives.cmake
+# cmake -DAR=... -DOUTPUT=archive "-DINPUTS=a;b;c" [-DMSVC=1] [-DAPPLE=1] -P MergeArchives.cmake
 # Appends the members of each INPUTS archive to OUTPUT, in place.
-string(REPLACE "|" ";" INPUTS "${INPUTS}")
+# INPUTS is a CMake list. Don't separate it with "|": cmd.exe treats that as a pipe on Windows.
 set(merged "${OUTPUT}.merged")
 file(REMOVE "${merged}")
 if(MSVC)

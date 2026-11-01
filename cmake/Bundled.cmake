@@ -68,6 +68,6 @@ add_custom_command(TARGET flywheel_runtime POST_BUILD
   COMMAND ${CMAKE_COMMAND}
     -DAR=${CMAKE_AR} -DMSVC=${MSVC} -DAPPLE=${APPLE}
     -DOUTPUT=$<TARGET_FILE:flywheel_runtime>
-    "-DINPUTS=$<TARGET_FILE:mbedtls>|$<TARGET_FILE:mbedx509>|$<TARGET_FILE:tfpsacrypto>"
+    "-DINPUTS=$<TARGET_FILE:mbedtls>$<SEMICOLON>$<TARGET_FILE:mbedx509>$<SEMICOLON>$<TARGET_FILE:tfpsacrypto>"
     -P ${PROJECT_SOURCE_DIR}/cmake/MergeArchives.cmake
   VERBATIM)
