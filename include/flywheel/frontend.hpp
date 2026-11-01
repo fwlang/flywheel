@@ -52,7 +52,13 @@ struct Param {
     Location loc;
     bool isPrivate = false, readonly = false; // class fields only
 };
+// Function and Class declare noexcept moves because MSVC's std::map move constructor is not
+// noexcept. Without these, std::vector<Function> would copy on reallocation, and copying fails
+// on the unique_ptrs inside (error "'std::construct_at': no matching overloaded function").
 struct Function {
+    Function() = default;
+    Function(Function &&) noexcept = default;
+    Function &operator=(Function &&) noexcept = default;
     std::string name, result, owner;
     Location loc;
     std::vector<Param> params;
@@ -64,6 +70,9 @@ struct Function {
     std::map<std::string, std::string> typeBounds;
 };
 struct Class {
+    Class() = default;
+    Class(Class &&) noexcept = default;
+    Class &operator=(Class &&) noexcept = default;
     std::string name, base;
     Location loc;
     std::vector<Param> fields;
