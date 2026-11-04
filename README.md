@@ -2,7 +2,7 @@
 
 A C++20 compiler that turns Flywheel source into LLVM IR, native object files, and executables. Native markup and components become compiled element construction with escaped HTML serialization. Programs require neither Python nor a runtime interpreter.
 
-Flywheel is currently in its **beta** phase: version **2.3 (beta-3)** (`flywheel --version`).
+Flywheel is currently in its **beta** phase: version **2.8 (beta-8)** (`flywheel --version`).
 
 ## Build
 
@@ -32,6 +32,10 @@ build/flywheel build examples/core.fly -O3 -o core
 build/flywheel check examples/demo.fly --emit-ir demo.ll
 build/flywheel desktop my_app.fw           # show the element the file returns in a window
 build/flywheel serve my_app.fw --port 8080 # serve it at http://127.0.0.1:8080/
+build/flywheel export report.fw report.html # write the value the file returns
+build/flywheel debug app.fw                # print the returned value and run time
+build/flywheel run -s 'print 6 * 7'        # run code given on the command line
+build/flywheel run https://example.com/hello.fw  # or ssh://, sftp://, file://, ...
 build/flywheel build -g app.fw -o app      # DWARF lines and locals for gdb/lldb
 build/flywheel run --race app.fw           # stop on data races between threads
 build/flywheel test --coverage             # run test_*.fw / *_test.fw files, report lines
@@ -41,7 +45,7 @@ build/flywheel repl                        # interactive session
 build/flywheel lsp                         # language server for editors
 ```
 
-`run` compiles and executes the program, returning its exit status; a top-level `return 3` ends the program with status 3. `desktop` and `serve` run a program whose top level returns an element or fragment, and show it in a native window or serve it over HTTP ([details](docs/tooling.md#pages-desktop-and-serve)). `check` runs the front end and verifies generated LLVM IR without linking. Optimization levels `-O0` through `-O3` are accepted. `flywheel selftest` runs the compiler's own regression suite. See [tooling](docs/tooling.md).
+`run` compiles and executes the program, returning its exit status; a top-level `return 3` ends the program with status 3. `desktop` and `serve` run a program whose top level returns an element or fragment, and show it in a native window or serve it over HTTP ([details](docs/tooling.md#pages-desktop-and-serve)). `export` writes the value a program returns at top level (any value: text, markup, or JSON) to a file, and `debug` prints it with the run time. Source files can be URLs (`https`, `http`, `ftp`, `ftps`, `sftp`, `ssh`, `scp`, `file`), and `-s CODE` runs code instead of a file. `check` runs the front end and verifies generated LLVM IR without linking. Optimization levels `-O0` through `-O3` are accepted. `flywheel selftest` runs the compiler's own regression suite. See [tooling](docs/tooling.md).
 
 ## A tour
 
@@ -137,9 +141,19 @@ var named = desktop.window "my-window"  # outer call without parentheses
 var same = desktop.window("my-window")
 ```
 
+## Native code
+
+`import c name`, `import cxx name` (or `import++ name`), `import rust name`, and `import zig name` compile a C, C++, Rust, or Zig source file and call its functions directly; C++ exceptions and Rust panics become catchable `NativeError`s. See [native imports](docs/modules.md#native-imports-c-c-rust-and-zig).
+
+```flywheel
+import rust fast          # fast.rs: pub fn fib(n: u64) -> u64 { ... }
+import++ "text.cpp" as text
+print fast.fib(30), text.reverse("flywheel")
+```
+
 ## Libraries
 
-Native modules cover strings, math, files and paths, regular expressions, time and dates, JSON (indexing, encoding any value, typed decoding into nested classes), terminal and file streams, child processes with captured output, timeouts, pipes, environment and working directory, TCP sockets, threads with channels and mutexes, cycle collection, HTTP/HTTPS servers with keep-alive, chunked uploads, and optional handler worker threads, an HTTP/HTTPS client, hashing and HMAC, secure random numbers, base64/hex/URL encodings, UUIDs, gzip/zlib/zip compression, SQLite databases, TOML and YAML parsing, HTML parsing, and desktop windows with event handlers, JavaScript bindings, live updates, and multiple windows. Library modules written in Flywheel add CSV, URLs, logging, command-line arguments, big integers, and exact decimals. See the [library reference](stdlib/README.md), [input and processes](docs/input-processes.md), [concurrency](docs/concurrency.md), and [desktop windows](docs/desktop.md).
+Native modules cover strings, math, files and paths, regular expressions, time and dates, JSON (indexing, encoding any value, typed decoding into nested classes, files, and `<json>` literals), running other Flywheel files (`flywheel.run`), terminal and file streams, child processes with captured output, timeouts, pipes, environment and working directory, TCP sockets, threads with channels and mutexes, cycle collection, HTTP/HTTPS servers with keep-alive, chunked uploads, and optional handler worker threads, an HTTP/HTTPS client, hashing and HMAC, secure random numbers, base64/hex/URL encodings, UUIDs, gzip/zlib/zip compression, SQLite databases, TOML and YAML parsing, HTML parsing, and desktop windows with event handlers, JavaScript bindings, live updates, and multiple windows. Library modules written in Flywheel add CSV, URLs, logging, command-line arguments, big integers, and exact decimals. See the [library reference](stdlib/README.md), [input and processes](docs/input-processes.md), [concurrency](docs/concurrency.md), and [desktop windows](docs/desktop.md).
 
 ```flywheel
 import html.*
@@ -158,7 +172,7 @@ Values are reference counted with atomic counts and freed deterministically; a s
 
 ## Modules and errors
 
-Local `.fw` / `.fly` imports resolve first, then installed packages (`.flywheel-modules`, then the installation's `modules` directory), then library and native modules. Packages are installed by [Pulley](../pulley/README.md) (`pulley` / `ppm`) from Distrobase registries; the `flywheel` command has no package commands. Top-level declarations are public by default; `private` hides implementation names. Dependency initialization runs once, and import cycles and wildcard collisions are diagnosed. See [modules](docs/modules.md). Typed `try`/`catch`/`finally`, `Result<T,E>`, and typed library errors are described in [error handling](docs/errors.md).
+Local `.fw` / `.fly` imports resolve first, then installed packages (`.flywheel-modules`, then the installation's `modules` directory), then library and native modules. Packages are installed by [Pulley](../pulley/README.md) (`pulley` / `ppm`) from Distrobase registries; the `flywheel` command has no package commands. Top-level declarations are public by default; `private` hides implementation names. Dependency initialization runs once, and import cycles and wildcard collisions are diagnosed. See [modules](docs/modules.md). Typed `try`/`catch`/`finally` (`then` is another spelling of `finally`), errors named by strings (`throw "Name" "message"`, `catch "Name" e`), `assert condition "message"`, `Result<T,E>`, and typed library errors are described in [error handling](docs/errors.md). Imports also take strings, file paths, and URLs: `import "https://example.com/lib.fw"`.
 
 ## Development and measurements
 

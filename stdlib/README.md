@@ -7,11 +7,12 @@ Libraries are compiler-resolved declarations backed by C++ runtime functions; no
 | core (implicit) | `print`, `input`, `typeof`, `len`, casts, `string(value)`, strings, collections, `Result` |
 | `collections` | `range` |
 | `desktop` | native windows with events and JavaScript bindings — [desktop](../docs/desktop.md) |
+| `flywheel` | run other Flywheel files and get their return values — [flywheel](#flywheel) |
 | `fs` | files, directories, and paths |
 | `gc` | cycle collection — [runtime](../docs/runtime.md#cycle-collection) |
 | `html`, `svg` | tag sets (`import html.*`, `import svg.*`), rendering, tree queries — [HTML tools](../docs/html-dom.md) |
 | `io` | stream-style terminal I/O and files — [input and processes](../docs/input-processes.md) |
-| `json` | parsing, querying, encoding, typed decoding |
+| `json` | parsing, querying, encoding, typed decoding, files, `<json>` literals |
 | `math` | numeric functions and random numbers |
 | `net` | TCP sockets and name resolution |
 | `os` | environment, arguments, child processes — [input and processes](../docs/input-processes.md) |
@@ -90,6 +91,12 @@ Paths are UTF-8 strings and are returned with `/` separators. Failures raise `Fi
 | `parse(text, pattern = "%Y-%m-%dT%H:%M:%SZ")` | seconds, reading the text as UTC |
 | `date(seconds)`, `local_date(seconds)` | a `time.datetime` with `year`, `month`, `day`, `hour`, `minute`, `second`, `weekday` (0 = Sunday), `yearday` |
 | `from_date(year, month, day, hour = 0, minute = 0, second = 0.0)` | seconds for a UTC calendar time |
+| `delay(seconds)`, `sleep_ms(milliseconds)` | pause the calling thread (`delay` is `sleep`) |
+| `millis()` | integer milliseconds from the steady clock |
+| `elapsed(start)` | seconds since `start`, a `monotonic()` reading |
+| `unix()` | integer seconds since the Unix epoch |
+| `today()`, `clock()` | the local date (`2026-11-04`) and time (`14:05:09`) |
+| `timestamp()` | the current UTC time as ISO 8601 (`2026-11-04T13:05:09Z`) |
 
 ## regex
 
@@ -111,6 +118,22 @@ ECMAScript regular expressions (the syntax of JavaScript), applied to the charac
 
 `json.encode(value, indent = 0)` encodes any value: numbers, bools, strings, chars and enum names as strings, null, optional values, arrays, tuples, and sets as arrays, maps as objects (non-string keys are stringified), class instances as objects in field order, `Result` as `{"ok": ...}` or `{"error": ...}`, errors as `{"type", "message"}`, `json.value` as itself, and markup as its HTML string. Functions, weak references, resources, and cycles raise `JsonError`. `indent > 0` pretty-prints.
 
+`json.load(path)` reads and parses a JSON file, and `json.dump(value, path, indent = 0)` writes `json.encode(value, indent)` to one. `json.loads(text)` and `json.dumps(value, indent = 0)` are other names for `json.parse` and `json.encode`.
+
+A `<json>...</json>` literal is a `json.value` written in place. Its contents are raw JSON, checked at compile time; braces and quotes inside are JSON, not interpolation:
+
+```flywheel
+import json
+var config = <json>{"name": "demo", "ports": [8000, 8001], "debug": false}</json>
+print json.as_int(config["ports"][0])
+class Config
+    string name
+    int[] ports
+    bool debug
+end
+Config typed = json.decode(config)   # convert to a Flywheel object
+```
+
 `json.decode(text)` converts JSON into the type the result is assigned to; `json.decode<T>(text)` names it explicitly. The argument may be a string or a `json.value`. `Class.from_json(text)` is the same for a class. Decoding supports every scalar, `char`, enums (by name), optional types (`null` becomes null), arrays, `tuple<T>`, fixed tuples, sets, maps with string, integer, bool, char, or enum keys, nested and generic classes, and `json.value`. Class fields are read by name; missing fields use their declared default, or null for optional fields, and are otherwise an error. Extra fields are ignored. Decoding builds instances field by field without running `init`.
 
 ```flywheel
@@ -126,6 +149,26 @@ class Person
 end
 Person p = json.decode("{{\"name\": \"Ann\", \"homes\": [{{\"city\": \"Oslo\"}}]}}")
 print json.encode(p)
+```
+
+## flywheel
+
+Runs other Flywheel programs with the compiler that built the current program (set `FLYWHEEL_COMPILER` to use another; `flywheel` on `PATH` is the fallback), so the `flywheel` command need not be installed. Each function waits for the program and returns its top-level return value as a `json.value` (see [return values](../docs/tooling.md#return-values-export-and-debug)), or JSON `null` when it returns nothing. A program that fails to compile or ends with an uncaught error raises `ProcessError`; its messages go to the terminal. Relative paths start at the working directory, and the file may be a URL.
+
+| Function | Runs |
+|---|---|
+| `run(file, string[] args = [])` | `flywheel run`; a top-level `return` hands back its value instead of exiting |
+| `desktop(file, string[] args = [])` | `flywheel desktop`, returning when the window closes |
+| `serve(file, port = 8000, host = "127.0.0.1")` | `flywheel serve` |
+| `debug(file, string[] args = [])` | `flywheel debug`, which also prints the value and run time |
+| `export(file, output, string[] args = [])` | `flywheel export`, writing the value to `output` |
+
+```flywheel
+import flywheel
+import json
+var stats = flywheel.run("stats.fw", ["2026"])
+print json.as_int(stats["total"])
+flywheel.export("report.fw", "report.html")
 ```
 
 ## net

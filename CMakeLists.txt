@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
-project(Flywheel VERSION 2.3 LANGUAGES C CXX)
+project(Flywheel VERSION 2.8 LANGUAGES C CXX)
 # Pre-release tag of this version; empty for a final release. `flywheel --version` reports both.
-set(FLYWHEEL_PRERELEASE "beta-3")
+set(FLYWHEEL_PRERELEASE "beta-8")
 if(FLYWHEEL_PRERELEASE)
   set(FLYWHEEL_VERSION "${PROJECT_VERSION} (${FLYWHEEL_PRERELEASE})")
 else()
@@ -31,7 +31,7 @@ add_custom_command(
   DEPENDS ${FW_LIBRARY_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedStdlib.cmake
   COMMENT "Embedding Flywheel library modules")
 add_executable(flywheel src/frontend.cpp src/modules.cpp src/compiler.cpp src/format.cpp src/lsp.cpp
-               src/package.cpp src/docs.cpp src/main.cpp "${CMAKE_CURRENT_BINARY_DIR}/library_modules.cpp")
+               src/package.cpp src/docs.cpp src/native.cpp src/remote.cpp src/main.cpp "${CMAKE_CURRENT_BINARY_DIR}/library_modules.cpp")
 target_include_directories(flywheel PRIVATE include)
 target_include_directories(flywheel SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
 separate_arguments(LLVM_DEFINITION_LIST NATIVE_COMMAND ${LLVM_DEFINITIONS})

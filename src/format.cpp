@@ -141,7 +141,8 @@ std::string format(const std::string &source) {
                    stack.back().kind == "match") {
             level = stack.size();
             stack.push_back({"case", line[first]->depth});
-        } else if (isKeyword && (keyword == "else" || keyword == "catch" || keyword == "finally"))
+        } else if (isKeyword && (keyword == "else" || keyword == "catch" || keyword == "finally" ||
+                                 (keyword == "then" && line.size() == first + 1)))
             level = stack.empty() ? 0 : stack.size() - 1;
         int base = closed >= 0 ? closed : stack.empty() ? 0 : stack.back().depth;
         // An opening delimiter carries the depth inside it; the line itself starts one level out.

@@ -68,6 +68,9 @@ struct Function {
     std::vector<std::string> typeParams;
     // Constraints on type parameters (`T implements Comparable`), by parameter name.
     std::map<std::string, std::string> typeBounds;
+    // Functions of a natively imported C, C++, Rust, or Zig module: the C symbol of the generated
+    // shim that the compiler calls instead of emitting a body (see src/native.cpp).
+    std::string foreign;
 };
 struct Class {
     Class() = default;
@@ -100,6 +103,40 @@ struct ElementFamily {
     Location loc;
     std::map<std::string, FamilyTag> tags;
 };
+// A C, C++, Rust, or Zig source imported with `import c/cxx/rust/zig name`: the functions found in
+// it and the generated shim that exposes them to Flywheel through C symbols.
+struct ForeignFunction {
+    std::string name, result;                // Flywheel types: int, double, bool, string, void
+    std::vector<std::string> params;         // Flywheel parameter types
+    std::vector<std::string> nativeParams;   // the source's own parameter types
+    std::string nativeResult, symbol;
+};
+struct ForeignModule {
+    std::string language, source, shim, key; // key: hash identifying the source and shim
+    std::vector<ForeignFunction> functions;
+};
+// Reads the functions of a foreign source file (language: c, cxx, rust, zig) and generates its shim.
+ForeignModule scanForeign(const std::string &language, const std::string &path);
+// Compiles foreign modules into link inputs. `shared` builds shared libraries for the in-process
+// JIT; otherwise objects or static libraries for linking. Results are cached by content.
+struct ForeignBuild {
+    std::vector<std::string> inputs, flags;
+};
+ForeignBuild buildForeign(const std::vector<ForeignModule> &modules, bool shared);
+// Sources named by URL (https://, http://, ftp://, ftps://, sftp://, scp://, ssh://, file://).
+bool isUrl(const std::string &text);
+// Downloads a URL's contents (file:// reads the local file); throws std::runtime_error.
+std::string fetchUrl(const std::string &url);
+// Like fetchUrl, but returns false instead of throwing when the resource does not exist.
+bool tryFetchUrl(const std::string &url, std::string &contents);
+// A directory under Flywheel's cache (XDG_CACHE_HOME, ~/.cache, or %LOCALAPPDATA%), created.
+std::string cacheDirectory(const std::string &kind);
+// A short stable hash (hex) of text, for cache keys and generated symbol names.
+std::string contentHash(const std::string &text);
+// The local path of a file:// URL, or "" for other text.
+std::string fileUrlPath(const std::string &url);
+// Stores `contents` in the download cache under the URL's file name and returns the local path.
+std::string cacheDownload(const std::string &url, const std::string &contents);
 struct Program {
     std::vector<Function> functions;
     std::vector<Class> classes;
@@ -109,6 +146,9 @@ struct Program {
     std::vector<SP> body;
     std::map<std::string, EP> components;
     std::map<std::string, std::string> imports;
+    // Native imports by alias: "c", "cxx", "rust", or "zig" (absent for Flywheel modules).
+    std::map<std::string, std::string> importKinds;
+    std::vector<ForeignModule> foreign; // merged program: every natively imported module
     std::vector<std::string> importOrder;
     std::map<std::string, Location> importLocations;
     bool html = false;
@@ -161,9 +201,12 @@ struct Options {
     // What a top-level `return` of an element or fragment does: "desktop" shows it in a window,
     // "serve" serves it over HTTP at serveHost:servePort, "check" only type-checks it. Empty
     // (run and build) rejects markup; a top-level `return` of an int exits with that status.
+    // "value" (export, debug, flywheel.run) accepts a return of any value and exits with 0.
     std::string entry, serveHost = "127.0.0.1";
     int64_t servePort = 8000;
     std::string *objectData = nullptr; // receives the object file in memory when set
+    // The compiler executable, which the `flywheel` module runs (flywheel.run and friends).
+    std::string compilerPath;
 };
 void compile(Program &program, const std::string &filename, const Options &options);
 // Re-indents source by block structure (4 spaces), keeping multi-line tokens unchanged.

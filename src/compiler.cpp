@@ -107,7 +107,7 @@ const std::set<std::string> errorTypes = {
     "Error",         "RuntimeError",   "FileError",    "IndexError",  "KeyError",
     "NumericError",  "AssertionError", "JsonError",    "ResultError", "CastError",
     "SelectorError", "InputError",     "ProcessError", "DesktopError", "RegexError",
-    "NetworkError",  "ValueError",     "HttpError",    "DatabaseError"};
+    "NetworkError",  "ValueError",     "HttpError",    "DatabaseError", "NativeError"};
 // Enum type names; enum values are i64 member indices.
 std::set<std::string> &enumNames() {
     static std::set<std::string> names;
@@ -783,7 +783,7 @@ end
             "fw_error_pending", "fw_error_matches", "fw_throw",         "fw_error_report",
             "fw_error_value",   "fw_error_take",    "fw_error_restore", "fw_web_shutdown",
             "fw_class_id",      "fw_enum_register", "fw_register_class", "fw_set_args",
-            "fw_gc_collect",    "fw_gc_pending"};
+            "fw_gc_collect",    "fw_gc_pending",    "fw_error_matches_name", "fw_foreign_cstr"};
         if (!safe.count(name))
             checkError();
         return resultValue;
@@ -1899,16 +1899,30 @@ end
     void topLevelReturn(Stmt &s) {
         Val x = s.expr ? value(*s.expr) : Val{};
         bool page = x.t.name == "element" || x.t.name == "fragment";
+        // flywheel export / debug and the flywheel module ("value") take any value.
+        bool anyValue = pageEntry == "value";
+        if (anyValue && s.expr &&
+            (x.t.classReference() || x.t.name == "void" || x.t.name.rfind("fn:", 0) == 0 ||
+             x.t.name.rfind("module:", 0) == 0 || x.t.function() || x.t.weak()))
+            error("a top-level return cannot return " + displayName(x.t.name));
         if (page && pageEntry.empty())
             error("a top-level return of " + x.t.name +
                   " needs `flywheel desktop` or `flywheel serve`; `run` and `build` expect an "
                   "int exit status");
-        if (!page && s.expr && !x.t.integer())
+        if (!anyValue && !page && s.expr && !x.t.integer())
             error("top-level return expects an int exit status" +
-                  std::string(pageEntry.empty() ? "" : ", element, or fragment"));
+                  std::string(pageEntry.empty() ? "" : ", element, or fragment") +
+                  "; `flywheel export` and `flywheel debug` take any value");
         llvm::Value *status = b.getInt32(0);
-        if (s.expr && !page)
+        if (s.expr && !page && !anyValue)
             status = b.CreateIntCast(x.v, b.getInt32Ty(), !x.t.unsigned_());
+        if (s.expr) {
+            // Records the value for export, debug, and flywheel.run (when FW_RETURN_FILE is set).
+            Val box{objectCall("fw_new", {frame, i64(1), i64(2)}), Ty{"Error"}};
+            set(box, i64(0), x);
+            call("fw_return_record", b.getVoidTy(),
+                 {frame, box.v, b.CreateGlobalString(displayName(x.t.name))});
+        }
         pageReturned = pageReturned || page;
         if (!finalizers.empty() && page) {
             auto anchor = allocate(x.t, "return.root");
@@ -2112,6 +2126,8 @@ end
     std::optional<Val> sequenceTool(Val sequence, const std::string &method, Expr &call);
     std::optional<Val> mathCall(const std::string &name, std::vector<Val> &args);
     std::optional<Val> stdlibCall(const std::string &name, std::vector<Val> &args, Ty expected);
+    void foreignBody(Signature &sig);
+    std::string compilerPath; // for the flywheel module
     Val unwrapForBinding(Val v);
     Val expectError(Expr &e);
     std::optional<Val> resourceMethod(Val receiver, const std::string &method, Expr &e);
@@ -2211,7 +2227,7 @@ end
         static const std::set<std::string> modules = {
             "desktop", "html", "math", "fs",          "os", "json",  "web", "time",
             "testing", "core", "io",   "collections", "net", "regex", "thread", "gc",
-            "svg",     "crypto", "encoding", "uuid", "compress", "sqlite", "toml", "yaml"};
+            "svg",     "crypto", "encoding", "uuid", "compress", "sqlite", "toml", "yaml", "flywheel"};
         for (auto &[alias, name] : p.imports) {
             if (!modules.count(name))
                 error("module '" + name +
@@ -2331,6 +2347,7 @@ end
     }
     void run(const Options &opts) {
         desktopBackend = opts.desktopBackend;
+        compilerPath = opts.compilerPath;
         pageEntry = opts.entry;
         serveHost = opts.serveHost;
         servePort = opts.servePort;
@@ -2652,6 +2669,8 @@ Val Compiler::value(Expr &e, Ty expected) {
         return {llvm::ConstantPointerNull::get(b.getPtrTy()), Ty{"null"}};
     if (e.kind == "string")
         return literal(e.text);
+    if (e.kind == "json") // <json>...</json>, validated by the parser
+        return {objectCall("fw_json_parse", {frame, literal(e.text).v}), Ty{"json.value"}};
     if (e.kind == "format") {
         // `{value:spec}` in an interpolated string.
         auto x = unwrap(value(*e.args[0]));
@@ -2760,6 +2779,8 @@ Val Compiler::value(Expr &e, Ty expected) {
         }
         if (errorTypes.count(obj.t.name) && e.text == "message")
             return {objectCall("fw_error_message", {frame, obj.v}), Ty{"string"}};
+        if (errorTypes.count(obj.t.name) && e.text == "name")
+            return {objectCall("fw_error_name", {frame, obj.v}), Ty{"string"}};
         if (classes.count(obj.t.name) && !hasField(obj.t.name, e.text) &&
             !resolveMethod(obj.t.name, e.text).empty())
             return boundMethod(obj, e.text);
@@ -4336,6 +4357,21 @@ void Compiler::statement(Stmt &s) {
     if (s.kind != "declare" || s.expr)
         countLine(s.loc);
     debugLocation();
+    if (s.kind == "throw" && s.target) {
+        // throw "Name" "message"
+        auto name = value(*s.expr), message = value(*s.target);
+        if (name.t.name != "string" || message.t.name != "string")
+            error("throw with a name expects two strings: throw \"Name\" \"message\"");
+        auto payload = objectCall("fw_error_named", {frame, name.v, message.v});
+        call("fw_throw", b.getVoidTy(), {b.CreateGlobalString("Error"), payload});
+        auto target = errorHandler();
+        releaseProtected(target.depth);
+        if (target.target != failure)
+            releaseScopes(target.depth);
+        call("fw_sweep", b.getVoidTy(), {frame});
+        b.CreateBr(target.target);
+        return;
+    }
     if (s.kind == "throw") {
         auto x = value(*s.expr);
         if (x.t.classReference() || x.t.name == "void" || x.t.nullable() ||
@@ -4380,12 +4416,19 @@ void Compiler::statement(Stmt &s) {
         }
         b.SetInsertPoint(dispatch);
         for (size_t i = 0; i < s.catches.size(); ++i) {
-            auto t = type(s.catchTypes[i]);
+            // catch "Name" matches by name: a builtin error type, or any error thrown with that
+            // name or of a class with that name, bound as Error.
+            auto &spelled = s.catchTypes[i];
+            bool byName = spelled.size() > 1 && spelled.front() == '"';
+            auto name = byName ? spelled.substr(1, spelled.size() - 2) : "";
+            auto t = byName ? Ty{errorTypes.count(name) ? name : "Error"} : type(spelled);
             if (t.name == "void")
                 error("catch cannot use void");
             auto match = llvm::BasicBlock::Create(ctx, "catch.body", current);
             auto next = llvm::BasicBlock::Create(ctx, "catch.next", current);
-            auto test = call("fw_error_matches", b.getInt64Ty(), {b.CreateGlobalString(t.name)});
+            auto test = byName && t.name == "Error"
+                            ? call("fw_error_matches_name", b.getInt64Ty(), {b.CreateGlobalString(name)})
+                            : call("fw_error_matches", b.getInt64Ty(), {b.CreateGlobalString(t.name)});
             b.CreateCondBr(b.CreateICmpNE(test, i64(0)), match, next);
             b.SetInsertPoint(match);
             scopes.emplace_back();
@@ -4802,6 +4845,40 @@ void Compiler::statement(Stmt &s) {
     }
     error("unsupported statement '" + s.kind + "'");
 }
+// A natively imported function (see src/native.cpp): converts the arguments to the shim's ABI
+// (int64_t, double, const char *), calls it, and converts the result back.
+void Compiler::foreignBody(Signature &sig) {
+    std::vector<llvm::Value *> values;
+    for (size_t i = 0; i < sig.ast->params.size(); ++i) {
+        Val v{current->getArg(static_cast<unsigned>(i)), type(sig.ast->params[i].type)};
+        if (v.t.name == "string")
+            values.push_back(call("fw_foreign_cstr", b.getPtrTy(), {v.v}));
+        else if (v.t.name == "bool")
+            values.push_back(b.CreateZExt(v.v, b.getInt64Ty()));
+        else
+            values.push_back(v.v);
+    }
+    auto result = sig.result;
+    llvm::Type *abi = result.name == "double"   ? b.getDoubleTy()
+                      : result.name == "void"   ? b.getVoidTy()
+                      : result.name == "string" ? static_cast<llvm::Type *>(b.getPtrTy())
+                                                : b.getInt64Ty();
+    auto r = call(sig.ast->foreign, abi, values);
+    if (result.name == "void") {
+        call("fw_drop", b.getVoidTy(), {frame});
+        b.CreateRetVoid();
+        return;
+    }
+    llvm::Value *out = r;
+    if (result.name == "bool")
+        out = b.CreateICmpNE(r, i64(0));
+    else if (result.name == "string") {
+        out = objectCall("fw_foreign_string", {frame, r});
+        call("fw_retain", b.getVoidTy(), {out});
+    }
+    call("fw_drop", b.getVoidTy(), {frame});
+    b.CreateRet(out);
+}
 void Compiler::buildFunction(Signature &sig, bool inference) {
     if (sig.building)
         error("recursive functions require an explicit 'returns T'");
@@ -4842,7 +4919,10 @@ void Compiler::buildFunction(Signature &sig, bool inference) {
             error("required parameters cannot follow default parameters");
         bind(param.name, {current->getArg(index++), type(param.type)});
     }
-    block(sig.ast->body, false);
+    if (!sig.ast->foreign.empty())
+        foreignBody(sig);
+    else
+        block(sig.ast->body, false);
     bool fallsThrough = !terminated();
     if (fallsThrough) {
         if (!inference && sig.result.name != "void")
@@ -4961,7 +5041,8 @@ std::optional<Val> Compiler::stdlibCall(const std::string &name, std::vector<Val
     auto function = name.substr(dot + 1);
     static const std::set<std::string> modules = {
         "fs",     "time",     "regex", "io",       "json",   "os",  "net",
-        "gc",     "thread",   "crypto", "encoding", "uuid", "compress", "sqlite", "toml", "yaml"};
+        "gc",     "thread",   "crypto", "encoding", "uuid", "compress", "sqlite", "toml", "yaml",
+        "flywheel"};
     if (!modules.count(module))
         return std::nullopt;
     auto arity = [&](size_t low, size_t high) {
@@ -4990,6 +5071,51 @@ std::optional<Val> Compiler::stdlibCall(const std::string &name, std::vector<Val
             error(name + " expects string[]");
         return args[i].v;
     };
+    if (module == "flywheel") {
+        // flywheel.run(file, args), desktop(file, args), serve(file, port, host), debug(file, args),
+        // export(file, output, args): runs the compiler on a file and returns its top-level return
+        // value as a json.value (null without one).
+        auto list = [&](size_t i) -> llvm::Value * {
+            if (i < args.size())
+                return stringList(i);
+            return objectCall("fw_new", {frame, i64(0), i64(1)});
+        };
+        auto options = [&](std::vector<llvm::Value *> items) {
+            Val array{objectCall("fw_new", {frame, i64(static_cast<int64_t>(items.size())), i64(1)}),
+                      Ty{"string[]"}};
+            for (size_t i = 0; i < items.size(); ++i)
+                set(array, i64(static_cast<int64_t>(i)), {items[i], Ty{"string"}});
+            return array.v;
+        };
+        auto invoke = [&](const std::string &command, llvm::Value *flags, llvm::Value *arguments) {
+            return object("fw_flywheel_invoke",
+                          {b.CreateGlobalString(compilerPath), literal(command).v, str(0), flags,
+                           arguments},
+                          Ty{"json.value"});
+        };
+        if (function == "run" || function == "desktop" || function == "debug") {
+            arity(1, 2);
+            return invoke(function, options({}), list(1));
+        }
+        if (function == "serve") {
+            arity(1, 3);
+            std::vector<llvm::Value *> flags;
+            if (args.size() >= 2) {
+                if (!args[1].t.integer())
+                    error("flywheel.serve expects an int port");
+                flags = {literal("--port").v, stringify(args[1]).v};
+            }
+            if (args.size() == 3)
+                flags.insert(flags.end(), {literal("--host").v, str(2)});
+            return invoke(function, options(flags), list(99));
+        }
+        if (function == "export") {
+            arity(2, 3);
+            return invoke(function, options({literal("-o").v, str(1)}), list(2));
+        }
+        error("flywheel has no function '" + function +
+              "' (run, desktop, serve, debug, and export)");
+    }
     if (module == "fs") {
         static const std::map<std::string, int> paths = {{"basename", 0}, {"dirname", 1},
                                                          {"extension", 2}, {"stem", 3},
@@ -5047,6 +5173,39 @@ std::optional<Val> Compiler::stdlibCall(const std::string &name, std::vector<Val
         return std::nullopt;
     }
     if (module == "time") {
+        if (function == "delay" || function == "sleep_ms") {
+            arity(1, 1);
+            auto seconds = real(0);
+            if (function == "sleep_ms")
+                seconds = b.CreateFDiv(seconds, llvm::ConstantFP::get(b.getDoubleTy(), 1000.0));
+            call("fw_sleep", b.getVoidTy(), {seconds});
+            return Val{};
+        }
+        if (function == "millis") {
+            arity(0, 0);
+            auto now = call("fw_clock", b.getDoubleTy(), {});
+            return Val{b.CreateFPToSI(b.CreateFMul(now, llvm::ConstantFP::get(b.getDoubleTy(), 1000.0)),
+                                      b.getInt64Ty()),
+                       Ty{"i64"}};
+        }
+        if (function == "elapsed") {
+            arity(1, 1);
+            return Val{b.CreateFSub(call("fw_clock", b.getDoubleTy(), {}), real(0)), Ty{"double"}};
+        }
+        if (function == "unix") {
+            arity(0, 0);
+            return Val{b.CreateFPToSI(call("fw_time_now", b.getDoubleTy(), {}), b.getInt64Ty()),
+                       Ty{"i64"}};
+        }
+        if (function == "today" || function == "clock" || function == "timestamp") {
+            arity(0, 0);
+            auto now = call("fw_time_now", b.getDoubleTy(), {});
+            auto pattern = function == "today" ? "%Y-%m-%d"
+                           : function == "clock" ? "%H:%M:%S"
+                                                 : "%Y-%m-%dT%H:%M:%SZ";
+            return object("fw_time_format", {now, literal(pattern).v, i64(function != "timestamp")},
+                          Ty{"string"});
+        }
         if (function == "now") {
             arity(0, 0);
             return Val{call("fw_time_now", b.getDoubleTy(), {}), Ty{"double"}};
@@ -5266,15 +5425,34 @@ std::optional<Val> Compiler::stdlibCall(const std::string &name, std::vector<Val
             arity(1, 1);
             return flag("fw_json_is_null", {json(0)});
         }
-        if (function == "encode") {
-            arity(1, 2);
+        if (function == "loads") {
+            arity(1, 1);
+            return object("fw_json_parse", {str(0)}, Ty{"json.value"});
+        }
+        if (function == "load") {
+            // json.load(path): reads and parses a JSON file.
+            arity(1, 1);
+            auto text = object("fw_read", {str(0)}, Ty{"string"});
+            return object("fw_json_parse", {text.v}, Ty{"json.value"});
+        }
+        if (function == "encode" || function == "dumps" || function == "dump") {
+            // json.dumps(value, indent = 0) is json.encode; json.dump(value, path, indent = 0)
+            // writes the encoding to a file.
+            bool file = function == "dump";
+            arity(file ? 2 : 1, file ? 3 : 2);
             if (args[0].t.classReference() || args[0].t.name.rfind("fn:", 0) == 0 ||
                 args[0].t.function() || args[0].t.name == "void")
                 error("json.encode cannot encode " + displayName(args[0].t.name));
             Val box{objectCall("fw_new", {frame, i64(1), i64(2)}), Ty{"Error"}};
             set(box, i64(0), args[0]);
-            return object("fw_json_encode", {box.v, args.size() == 2 ? integer(1) : i64(0)},
-                          Ty{"string"});
+            size_t indent = file ? 2 : 1;
+            auto encoded = object("fw_json_encode",
+                                  {box.v, args.size() > indent ? integer(indent) : i64(0)},
+                                  Ty{"string"});
+            if (!file)
+                return encoded;
+            call("fw_write", b.getVoidTy(), {str(1), encoded.v});
+            return Val{};
         }
         if (function == "decode" || function.rfind("decode<", 0) == 0) {
             arity(1, 1);

@@ -1,6 +1,7 @@
 #include "flywheel/frontend.hpp"
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <functional>
 #include <set>
 
@@ -180,6 +181,118 @@ size_t markupEnd(const std::string &s, size_t p) {
         p = q;
     }
     throw Error({}, "unterminated markup literal");
+}
+// Validates the JSON text of a `<json>...</json>` literal; returns an error description or "".
+std::string jsonProblem(const std::string &s) {
+    size_t p = 0;
+    std::function<std::string(int)> value;
+    auto space = [&] {
+        while (p < s.size() && (s[p] == ' ' || s[p] == '\t' || s[p] == '\n' || s[p] == '\r'))
+            ++p;
+    };
+    auto string = [&]() -> std::string {
+        for (++p; p < s.size(); ++p) {
+            auto c = static_cast<unsigned char>(s[p]);
+            if (c == '"') {
+                ++p;
+                return "";
+            }
+            if (c < 0x20)
+                return "control character in string";
+            if (c == '\\') {
+                if (++p == s.size())
+                    break;
+                if (s[p] == 'u') {
+                    for (int i = 0; i < 4; ++i)
+                        if (++p >= s.size() || !std::isxdigit(static_cast<unsigned char>(s[p])))
+                            return "invalid \\u escape";
+                } else if (std::string("\"\\/bfnrt").find(s[p]) == std::string::npos)
+                    return "invalid escape in string";
+            }
+        }
+        return "unterminated string";
+    };
+    value = [&](int depth) -> std::string {
+        if (depth > 512)
+            return "nesting is too deep";
+        space();
+        if (p == s.size())
+            return "expected a value";
+        char c = s[p];
+        if (c == '{' || c == '[') {
+            char close = c == '{' ? '}' : ']';
+            ++p;
+            space();
+            if (p < s.size() && s[p] == close) {
+                ++p;
+                return "";
+            }
+            while (true) {
+                space();
+                if (c == '{') {
+                    if (p == s.size() || s[p] != '"')
+                        return "expected a string key";
+                    if (auto problem = string(); !problem.empty())
+                        return problem;
+                    space();
+                    if (p == s.size() || s[p] != ':')
+                        return "expected ':' after key";
+                    ++p;
+                }
+                if (auto problem = value(depth + 1); !problem.empty())
+                    return problem;
+                space();
+                if (p < s.size() && s[p] == ',') {
+                    ++p;
+                    continue;
+                }
+                if (p < s.size() && s[p] == close) {
+                    ++p;
+                    return "";
+                }
+                return std::string("expected ',' or '") + close + "'";
+            }
+        }
+        if (c == '"')
+            return string();
+        for (const char *word : {"true", "false", "null"})
+            if (s.compare(p, std::strlen(word), word) == 0) {
+                p += std::strlen(word);
+                return "";
+            }
+        size_t begin = p;
+        if (s[p] == '-')
+            ++p;
+        auto digits = [&] {
+            size_t start = p;
+            while (p < s.size() && std::isdigit(static_cast<unsigned char>(s[p])))
+                ++p;
+            return p > start;
+        };
+        if (p < s.size() && s[p] == '0')
+            ++p;
+        else if (!digits())
+            return p == begin ? "unexpected character '" + std::string(1, c) + "'"
+                              : "invalid number";
+        if (p < s.size() && s[p] == '.') {
+            ++p;
+            if (!digits())
+                return "invalid number";
+        }
+        if (p < s.size() && (s[p] == 'e' || s[p] == 'E')) {
+            ++p;
+            if (p < s.size() && (s[p] == '+' || s[p] == '-'))
+                ++p;
+            if (!digits())
+                return "invalid number";
+        }
+        return "";
+    };
+    auto problem = value(0);
+    space();
+    if (problem.empty() && p != s.size())
+        problem = "unexpected text after the value";
+    return problem;
 }
 EP node(std::string kind, std::string text, Location l) {
     auto e = std::make_unique<Expr>();
@@ -393,6 +506,16 @@ std::vector<Token> lex(const std::string &source) {
                                         (out.back().text == "array" || out.back().text == "tuple" ||
                                          out.back().text == "map" || out.back().text == "set" ||
                                          out.back().text == "Result" || out.back().text == "weak"));
+        // <json>...</json> holds raw JSON text: braces and quotes inside are JSON, not markup.
+        if (c == '<' && !genericType && source.compare(p, 6, "<json>") == 0 &&
+            (expected || markupArgumentStart(source, p))) {
+            auto close = source.find("</json>", p + 6);
+            if (close == std::string::npos)
+                throw Error(loc, "unterminated <json> literal: expected </json>");
+            emit("json", source.substr(p + 6, close - p - 6), close + 7);
+            expected = false;
+            continue;
+        }
         if (c == '<' && !genericType && (expected || markupArgumentStart(source, p)) &&
             p + 1 < source.size() && (start(source[p + 1]) || source[p + 1] == '>')) {
             auto end = markupEnd(source, p);
@@ -486,14 +609,16 @@ Token Parser::take() {
     return t;
 }
 bool Parser::accept(const std::string &s) {
-    if (peek().text == s && peek().kind != "string" && peek().kind != "markup") {
+    if (peek().text == s && peek().kind != "string" && peek().kind != "markup" &&
+        peek().kind != "json") {
         take();
         return true;
     }
     return false;
 }
 Token Parser::expect(const std::string &s) {
-    if (peek().text != s || peek().kind == "string" || peek().kind == "markup")
+    if (peek().text != s || peek().kind == "string" || peek().kind == "markup" ||
+        peek().kind == "json")
         throw Error(peek().loc, "expected '" + s + "', got '" + peek().text + "'");
     return take();
 }
@@ -880,7 +1005,12 @@ EP Parser::prefix() {
     EP e;
     if (t.kind == "markup")
         e = markup();
-    else if (t.kind == "string") {
+    else if (t.kind == "json") {
+        take();
+        if (auto problem = jsonProblem(t.text); !problem.empty())
+            throw Error(t.loc, "invalid JSON in <json> literal: " + problem);
+        e = node("json", t.text, t.loc);
+    } else if (t.kind == "string") {
         take();
         e = stringExpr(t);
     } else if (t.kind == "int" || t.kind == "real") {
@@ -1099,7 +1229,8 @@ std::vector<SP> Parser::block() {
     std::vector<SP> out;
     newlines();
     while (peek().kind != "eof" && peek().text != "end" && peek().text != "else" &&
-           peek().text != "catch" && peek().text != "finally" && peek().text != "case") {
+           peek().text != "catch" && peek().text != "finally" && peek().text != "case" &&
+           !(peek().text == "then" && peek().kind == "id")) {
         out.push_back(statement());
         for (auto &extra : pending)
             out.push_back(std::move(extra));
@@ -1126,10 +1257,67 @@ SP Parser::statement() {
     auto s = std::make_unique<Stmt>();
     s->loc = peek().loc;
     if (accept("throw")) {
+        // `throw value`, or `throw "Name" "message"`: an error named by a string.
         s->kind = "throw";
         s->expr = expression();
+        if (peek().kind != "nl" && peek().kind != "eof") {
+            accept(",");
+            s->target = expression();
+        }
         finish();
         return s;
+    }
+    if (peek().text == "assert" && peek().kind == "id") {
+        // `assert condition "message"` (or `assert condition, "message"`) raises AssertionError
+        // with the message when the condition is false. It becomes
+        // `if not (condition) then throw AssertionError(message) end`.
+        static const std::set<std::string> notKeyword = {"=",  "+=", "-=", "*=", "/=", "//=",
+                                                         "%=", ".",  "[",  ")",  ","};
+        if (!notKeyword.count(peek(1).text) || peek(1).kind != "op") {
+            auto loc = take().loc;
+            EP condition, message;
+            auto saved = pos;
+            if (peek().text == "(" && peek().kind == "op") {
+                // assert(condition, "message")
+                try {
+                    take();
+                    condition = expression();
+                    if (accept(","))
+                        message = expression();
+                    expect(")");
+                    if (peek().kind != "nl" && peek().kind != "eof")
+                        throw Error(peek().loc, "not a call");
+                } catch (const Error &) {
+                    pos = saved;
+                    condition.reset();
+                    message.reset();
+                }
+            }
+            if (!condition) {
+                condition = expression();
+                if (peek().kind != "nl" && peek().kind != "eof") {
+                    accept(",");
+                    message = expression();
+                }
+            }
+            finish();
+            if (!message)
+                message = node("string", "assertion failed", loc);
+            auto negated = node("unary", "not", loc);
+            condition->grouped = true;
+            negated->args.push_back(std::move(condition));
+            auto raise = std::make_unique<Stmt>();
+            raise->kind = "throw";
+            raise->loc = loc;
+            raise->expr = node("call", "", loc);
+            raise->expr->args.push_back(node("name", "AssertionError", loc));
+            raise->expr->args.push_back(std::move(message));
+            s->kind = "if";
+            s->loc = loc;
+            s->expr = std::move(negated);
+            s->body.push_back(std::move(raise));
+            return s;
+        }
     }
     if (accept("try")) {
         s->kind = "try";
@@ -1141,6 +1329,22 @@ SP Parser::statement() {
                 throw Error(peek().loc, "catch-all must be the last catch clause");
             auto saved = pos;
             std::string t, name;
+            if (peek().kind == "string") {
+                // catch "Name" [binding]: matches errors by type name, including errors thrown
+                // with `throw "Name" "message"`. The type is kept quoted for the compiler.
+                auto quoted = take();
+                if (quoted.text.empty() || quoted.text.find_first_of("{}\\\"") != std::string::npos)
+                    throw Error(quoted.loc, "catch expects a plain error name such as \"ValueError\"");
+                t = "\"" + quoted.text + "\"";
+                name = peek().kind == "id" ? identifier().text : "$caught";
+                if (quoted.text == "Error")
+                    catchAll = true;
+                s->catchTypes.push_back(t);
+                s->catchNames.push_back(name);
+                finish();
+                s->catches.push_back(block());
+                continue;
+            }
             try {
                 t = type();
                 name = identifier().text;
@@ -1156,12 +1360,13 @@ SP Parser::statement() {
             finish();
             s->catches.push_back(block());
         }
-        if (accept("finally")) {
+        // `then` is another spelling of `finally`.
+        if (accept("finally") || accept("then")) {
             finish();
             s->finalizer = block();
         }
         if (s->catches.empty() && s->finalizer.empty())
-            throw Error(s->loc, "try requires catch or finally");
+            throw Error(s->loc, "try requires catch, finally, or then");
         expect("end");
         finish();
         return s;
@@ -1466,22 +1671,85 @@ Program Parser::parse() {
         if ((hidden || visible) && peek().text == "import")
             throw Error(peek().loc, "visibility applies to declarations, not imports");
         if (accept("import")) {
-            auto name = identifier().text;
-            bool wildcard = false;
-            while (accept(".")) {
-                if (accept("*")) {
+            // Native sources: `import cxx name` (also `import++ name`), `import c name`,
+            // `import rust name`, `import zig name`. A module named c, cxx, rust, or zig is
+            // imported with a string: `import "c"`.
+            std::string kind;
+            if (peek().text == "+" && peek().kind == "op" && !peek().spaced &&
+                peek(1).text == "+" && !peek(1).spaced) {
+                take();
+                take();
+                kind = "cxx";
+            } else if ((peek().text == "c" || peek().text == "cxx" || peek().text == "rust" ||
+                        peek().text == "zig") &&
+                       peek().kind == "id" && (peek(1).kind == "id" || peek(1).kind == "string") &&
+                       peek(1).text != "as")
+                kind = take().text;
+            std::string name;
+            bool wildcard = false, path = false;
+            auto nameLoc = peek().loc;
+            if (peek().kind == "string") {
+                // `import "helpers"` is `import helpers`; a string can also name a file
+                // (`import "lib/util.fw"`) or a URL (`import "https://example.com/util.fw"`).
+                name = take().text;
+                if (name.size() > 2 && name.compare(name.size() - 2, 2, ".*") == 0) {
                     wildcard = true;
-                    break;
+                    name.resize(name.size() - 2);
                 }
-                name += "." + identifier().text;
+                bool dotted = !name.empty();
+                for (size_t i = 0; i < name.size() && dotted; ++i) {
+                    auto c = static_cast<unsigned char>(name[i]);
+                    bool first = i == 0 || name[i - 1] == '.';
+                    dotted = c >= 0x80 || std::isalpha(c) || c == '_' ||
+                             (!first && (std::isdigit(c) || c == '.') &&
+                              !(c == '.' && i + 1 == name.size()));
+                }
+                for (auto extension : {".fw", ".fly", ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp",
+                                       ".hh", ".hxx", ".rs", ".zig"}) {
+                    auto n = std::strlen(extension);
+                    if (name.size() > n && name.compare(name.size() - n, n, extension) == 0)
+                        dotted = false;
+                }
+                path = !dotted;
+                if (name.empty())
+                    throw Error(nameLoc, "import needs a module name");
+                if (path && wildcard)
+                    throw Error(nameLoc, "wildcard imports need a module name, not a path");
+            } else {
+                name = identifier().text;
+                while (accept(".")) {
+                    if (accept("*")) {
+                        wildcard = true;
+                        break;
+                    }
+                    name += "." + identifier().text;
+                }
             }
-            std::string alias = name.substr(
-                name.find_last_of('.') == std::string::npos ? 0 : name.find_last_of('.') + 1);
+            if (!kind.empty() && wildcard)
+                throw Error(nameLoc, "native imports cannot be wildcards");
+            std::string alias;
+            if (path) {
+                // The file name without its extension: "https://x.org/lib/util.fw" is `util`.
+                auto base = name.substr(0, name.find_first_of("?#"));
+                while (!base.empty() && (base.back() == '/' || base.back() == '\\'))
+                    base.pop_back();
+                base = base.substr(base.find_last_of("/\\") == std::string::npos
+                                       ? 0
+                                       : base.find_last_of("/\\") + 1);
+                alias = base.substr(0, base.find('.'));
+            } else
+                alias = name.substr(
+                    name.find_last_of('.') == std::string::npos ? 0 : name.find_last_of('.') + 1);
             if (accept("as")) {
                 if (wildcard)
                     throw Error(peek().loc, "wildcard imports cannot have an alias");
                 alias = identifier().text;
-            }
+            } else if (alias.empty() || identifierEnd(alias, 0) != alias.size() ||
+                       std::isdigit(static_cast<unsigned char>(alias[0])))
+                throw Error(nameLoc, "cannot name the module imported from \"" + name +
+                                         "\"; add `as name`");
+            if (!kind.empty())
+                p.importKinds[alias] = kind;
             if (wildcard)
                 p.wildcards.insert(alias);
             if (wildcard && name == "html")
@@ -1732,6 +2000,7 @@ Function clone(const Function &f) {
     out.isPrivate = f.isPrivate;
     out.typeParams = f.typeParams;
     out.typeBounds = f.typeBounds;
+    out.foreign = f.foreign;
     return out;
 }
 Class clone(const Class &c) {

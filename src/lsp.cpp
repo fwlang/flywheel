@@ -688,7 +688,8 @@ class Navigator {
                              "then", "else", "end", "while", "for", "in", "do", "return",
                              "match", "case", "try", "catch", "finally", "throw", "defer",
                              "import", "private", "readonly", "inst", "true", "false", "null",
-                             "and", "or", "not", "print", "returns", "break", "continue"})
+                             "and", "or", "not", "print", "returns", "break", "continue",
+                             "assert"})
             if (seen.insert(keyword).second)
                 out.push_back({keyword, "keyword"});
         return out;
@@ -700,11 +701,13 @@ class Navigator {
                     "basename", "dirname", "extension", "stem", "absolute", "normalize", "cwd",
                     "temp_dir"}},
             {"time", {"monotonic", "sleep", "now", "format", "format_local", "parse", "date",
-                      "local_date", "from_date"}},
+                      "local_date", "from_date", "delay", "sleep_ms", "millis", "elapsed",
+                      "unix", "today", "clock", "timestamp"}},
             {"regex", {"matches", "contains", "find", "find_all", "groups", "replace", "split"}},
             {"json", {"parse", "encode", "decode", "stringify", "get", "at", "has", "length",
                       "keys", "items", "is_null", "kind", "as_string", "as_int", "as_double",
-                      "as_bool"}},
+                      "as_bool", "load", "loads", "dump", "dumps"}},
+            {"flywheel", {"run", "desktop", "serve", "debug", "export"}},
             {"math", {"sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "hypot",
                       "exp", "log", "log10", "log2", "pow", "floor", "ceil", "round", "trunc",
                       "abs", "min", "max", "clamp", "random", "random_int", "seed", "is_nan",

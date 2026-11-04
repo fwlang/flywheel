@@ -1553,7 +1553,11 @@ std::string jsonQuote(const std::string &s) {
     }
     return out + '"';
 }
-std::string jsonRender(const Json &j) {
+// Renders JSON compactly, or pretty-printed with `indent` spaces per level.
+std::string jsonRender(const Json &j, int indent = 0, int depth = 0) {
+    auto line = [&](int level) {
+        return indent > 0 ? "\n" + std::string(static_cast<size_t>(indent * level), ' ') : std::string();
+    };
     switch (j.kind) {
     case Json::Null:
         return "null";
@@ -1563,22 +1567,27 @@ std::string jsonRender(const Json &j) {
     case Json::Text:
         return jsonQuote(j.text);
     case Json::List: {
+        if (j.items.empty())
+            return "[]";
         std::string out = "[";
+        bool first = true;
         for (auto &v : j.items) {
-            if (out.size() > 1)
-                out += ',';
-            out += jsonRender(*v);
+            out += (first ? "" : ",") + line(depth + 1) + jsonRender(*v, indent, depth + 1);
+            first = false;
         }
-        return out + "]";
+        return out + line(depth) + "]";
     }
     case Json::Dictionary: {
+        if (j.fields.empty())
+            return "{}";
         std::string out = "{";
+        bool first = true;
         for (auto &[key, v] : j.fields) {
-            if (out.size() > 1)
-                out += ',';
-            out += jsonQuote(key) + ":" + jsonRender(*v);
+            out += (first ? "" : ",") + line(depth + 1) + jsonQuote(key) + (indent > 0 ? ": " : ":") +
+                   jsonRender(*v, indent, depth + 1);
+            first = false;
         }
-        return out + "}";
+        return out + line(depth) + "}";
     }
     }
     fail("invalid JSON value", "JsonError");

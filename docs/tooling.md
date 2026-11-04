@@ -127,6 +127,50 @@ return <html>
 
 Both commands accept the options of `run` and pass arguments after `--` to the program. A top-level `return` of an integer still exits with that status, so a program can stop before showing a page. A program that ends without returning markup is an error: at compile time if it has no such `return`, otherwise at run time. `run` and `build` reject a top-level return of markup; `check` and the language server accept it.
 
+## Return values: export and debug
+
+`flywheel export file.fw output [arguments...]` runs a program and writes its top-level return value to `output`. Unlike `run`, any value may be returned. Strings are written as they are, and markup as its HTML; every other value is written as JSON (numbers, bools, arrays, maps, class instances, `Result`, `json.value`; see `json.encode` in the [library reference](../stdlib/README.md#json)). Arguments after the output file (or after `--`) are passed to the program. A program that returns nothing is an error, and a program that fails exits with its status without writing the file.
+
+```sh
+flywheel export report.fw report.html
+flywheel export totals.fw totals.json 2026 november
+```
+
+`flywheel debug file.fw` runs a program and then prints its return value, type, and run time (excluding compilation) on one line to standard error:
+
+```text
+$ flywheel debug totals.fw -- 2026
+[debug] returned map<string,int> {"days":30,"total":412} in 1.84 ms
+$ flywheel debug -s 'throw "Oops" "bad"'
+Flywheel runtime error: Oops: bad
+[debug] no return value, exit status 1 in 1.62 ms
+```
+
+Values longer than 120 characters are shortened. Both commands accept the options of `run`.
+
+The [`flywheel` module](../stdlib/README.md#flywheel) does the same from inside a program: `flywheel.run("other.fw")` runs another file and returns its top-level return value instead of exiting.
+
+## Source code and URLs
+
+`-s CODE` (or `--source CODE`) runs code given on the command line instead of a file, with every command that takes a source file. Imports resolve from the working directory, and diagnostics name the code `<source>`:
+
+```sh
+flywheel run -s 'print 6 * 7'
+flywheel debug -s 'import math
+return math.sqrt(2.0)'
+flywheel export -s 'import html.*
+return <p>generated</p>' page.html
+```
+
+The source file may also be a URL: `https://`, `http://`, `ftp://`, `ftps://`, and `sftp://` are downloaded with `curl`; `ssh://[user@]host[:port]/path` and `scp://` read the file with `ssh` (a path starting `/~/` is relative to the remote home directory); `file://` names a local file. `ws://` and `wss://` are rejected: a WebSocket is a stream of messages, not a file. Modules that a program fetched by URL imports are fetched from beside it (`import helpers` in `https://example.com/app/main.fw` loads `https://example.com/app/helpers.fw`), except names of library and native modules and installed packages, which resolve as usual.
+
+```sh
+flywheel run https://example.com/tools/hello.fw
+flywheel build ssh://me@server/~/projects/app/main.fw -o app
+```
+
+Downloads run on every compile. Only run code from sources you trust: a program fetched by URL runs with your permissions, like a local one.
+
 ## Interactive sessions
 
 `flywheel repl` reads statements, expressions, and declarations. An expression on its own is printed. Multi-line input (such as a function) continues until the block is complete. Each input is added to a session program that is compiled and run again from the start; only output produced by the new input is shown, and inputs that fail are dropped. Because earlier statements run again, side effects such as writing files or reading input repeat. `:show` lists the session, `:reset` clears it, and `:quit` ends it.

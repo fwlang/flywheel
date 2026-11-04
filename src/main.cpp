@@ -9,6 +9,7 @@
 #include <optional>
 #include <set>
 #include <llvm/Config/llvm-config.h>
+#include <llvm/Support/DynamicLibrary.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/Program.h>
 #ifdef FW_JIT
@@ -93,7 +94,14 @@ std::string desktopPath(const fs::path &runtime) {
 // Runs a compiled object without linking it: the runtime is part of this executable and its fw_*
 // symbols are exported for the JIT. The program runs in a child process, so traps and crashes
 // behave as they would in a built executable. Returns nullopt when the JIT is unavailable.
-std::optional<int> runInProcess(const std::string &object, std::vector<std::string> arguments) {
+std::optional<int> runInProcess(const std::string &object, std::vector<std::string> arguments,
+                                const std::vector<std::string> &libraries) {
+    // Native imports are shared libraries, loaded globally so the JIT resolves their symbols.
+    for (auto &library : libraries) {
+        std::string error;
+        if (llvm::sys::DynamicLibrary::LoadLibraryPermanently(library.c_str(), &error))
+            throw std::runtime_error("cannot load native module " + library + ": " + error);
+    }
     auto jit = llvm::orc::LLJITBuilder().create();
     std::optional<llvm::orc::ExecutorAddr> entry;
     if (jit) {
@@ -147,11 +155,19 @@ std::optional<int> runInProcess(const std::string &object, std::vector<std::stri
 // Compiles `load()` and runs it (run, desktop, serve), links it (build), or only checks it
 // (check). `load` is called again when the in-process JIT is unavailable, because compilation
 // consumes a program.
+// `runSeconds`, when set, receives how long the program ran (not counting compilation).
 int compileProgram(const std::string &command, const std::string &filename,
                    const std::function<fw::Program()> &load, const fw::Options &base,
                    const std::string &output, const std::vector<std::string> &programArguments,
-                   const char *argv0) {
+                   const char *argv0, double *runSeconds = nullptr) {
     auto program = load();
+    auto timed = [&](auto &&run) {
+        auto start = std::chrono::steady_clock::now();
+        auto status = run();
+        if (runSeconds)
+            *runSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        return status;
+    };
     if (command == "check") {
         auto options = base;
         options.entry = "check";
@@ -169,14 +185,16 @@ int compileProgram(const std::string &command, const std::string &filename,
         std::string object;
         auto jit = options;
         jit.objectData = &object;
+        auto libraries = fw::buildForeign(program.foreign, true).inputs;
         fw::compile(program, filename, jit);
         std::vector<std::string> arguments{filename};
         arguments.insert(arguments.end(), programArguments.begin(), programArguments.end());
-        if (auto status = runInProcess(object, arguments))
+        if (auto status = timed([&] { return runInProcess(object, arguments, libraries); }))
             return *status;
         program = load();
     }
 #endif
+    auto foreign = fw::buildForeign(program.foreign, false);
     Temp temp;
 #ifdef _WIN32
     auto object = temp.path / "program.obj";
@@ -218,16 +236,115 @@ int compileProgram(const std::string &command, const std::string &filename,
 #if !defined(_WIN32) && !defined(__APPLE__)
     link.push_back("-ldl");
 #endif
+    // Native imports: their objects or static libraries, and the system libraries they need.
+#ifdef _MSC_VER
+    auto at = std::find(link.begin(), link.end(), "/link");
+    link.insert(at, foreign.inputs.begin(), foreign.inputs.end());
+    for (auto &flag : foreign.flags)
+        if (flag.size() > 4 && flag.compare(flag.size() - 4, 4, ".lib") == 0)
+            link.push_back(flag);
+#else
+    link.insert(link.begin() + 2, foreign.inputs.begin(), foreign.inputs.end());
+    link.insert(link.end(), foreign.flags.begin(), foreign.flags.end());
+#endif
     int linked = execute(FW_CXX, link);
     if (linked)
         return linked;
     if (runs)
-        return execute(binary.string(), programArguments);
+        return timed([&] { return execute(binary.string(), programArguments); });
     return 0;
 }
+// The virtual file holding --source code; diagnostics name it <source>.
+std::string &sourceFile() {
+    static std::string path;
+    return path;
+}
 void reportError(const fw::Error &e, const std::string &filename) {
-    std::cerr << (e.loc.file.empty() ? filename : e.loc.file) << ':' << e.loc.line << ':'
-              << e.loc.column << ": error: " << e.what() << '\n';
+    auto file = e.loc.file.empty() ? filename : e.loc.file;
+    if (!sourceFile().empty() && file == sourceFile())
+        file = "<source>";
+    std::cerr << file << ':' << e.loc.line << ':' << e.loc.column << ": error: " << e.what()
+              << '\n';
+}
+// Decodes a JSON string literal ("a\nb" -> a, newline, b); nullopt if the text is not one.
+std::optional<std::string> jsonString(const std::string &json) {
+    if (json.size() < 2 || json.front() != '"' || json.back() != '"')
+        return std::nullopt;
+    std::string out;
+    auto utf8 = [&](unsigned v) {
+        if (v < 0x80)
+            out += char(v);
+        else if (v < 0x800)
+            out += char(0xc0 | (v >> 6)), out += char(0x80 | (v & 63));
+        else if (v < 0x10000)
+            out += char(0xe0 | (v >> 12)), out += char(0x80 | ((v >> 6) & 63)),
+                out += char(0x80 | (v & 63));
+        else
+            out += char(0xf0 | (v >> 18)), out += char(0x80 | ((v >> 12) & 63)),
+                out += char(0x80 | ((v >> 6) & 63)), out += char(0x80 | (v & 63));
+    };
+    for (size_t i = 1; i + 1 < json.size(); ++i) {
+        char c = json[i];
+        if (c != '\\') {
+            out += c;
+            continue;
+        }
+        if (++i + 1 >= json.size())
+            return std::nullopt;
+        switch (json[i]) {
+        case 'n': out += '\n'; break;
+        case 't': out += '\t'; break;
+        case 'r': out += '\r'; break;
+        case 'b': out += '\b'; break;
+        case 'f': out += '\f'; break;
+        case 'u': {
+            if (i + 4 >= json.size())
+                return std::nullopt;
+            unsigned v = std::stoul(json.substr(i + 1, 4), nullptr, 16);
+            i += 4;
+            if (v >= 0xd800 && v < 0xdc00 && i + 6 < json.size() && json[i + 1] == '\\' &&
+                json[i + 2] == 'u') {
+                unsigned low = std::stoul(json.substr(i + 3, 4), nullptr, 16);
+                v = 0x10000 + ((v - 0xd800) << 10) + (low - 0xdc00);
+                i += 6;
+            }
+            utf8(v);
+            break;
+        }
+        default: out += json[i];
+        }
+    }
+    return out;
+}
+// A recorded top-level return: "type\njson" (see fw_return_record), or nullopt.
+std::optional<std::pair<std::string, std::string>> readReturn(const fs::path &path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+        return std::nullopt;
+    std::ostringstream text;
+    text << in.rdbuf();
+    auto all = text.str();
+    auto newline = all.find('\n');
+    if (newline == std::string::npos)
+        return std::nullopt;
+    return std::make_pair(all.substr(0, newline), all.substr(newline + 1));
+}
+void setEnvironment(const char *name, const std::string &value) {
+#ifdef _WIN32
+    _putenv_s(name, value.c_str());
+#else
+    setenv(name, value.c_str(), 1);
+#endif
+}
+std::string duration(double seconds) {
+    char buffer[32];
+    if (seconds < 1e-3)
+        std::snprintf(buffer, sizeof buffer, "%.0f us", seconds * 1e6);
+    else if (seconds < 1)
+        std::snprintf(buffer, sizeof buffer, "%.2f ms", seconds * 1e3);
+    else
+        std::snprintf(buffer, sizeof buffer, "%.3f s", seconds);
+    return buffer;
 }
 bool testFile(const fs::path &path) {
     auto name = path.filename().string(), extension = path.extension().string();
@@ -532,6 +649,10 @@ int main(int argc, char **argv) {
         "Usage: flywheel {build|run|check} source.fw [-O0..3] [-g] [--race] [-o output] "
         "[--emit-ir file.ll] [-- program arguments]\n"
         "       flywheel desktop source.fw [options] [-- program arguments]\n"
+        "       flywheel export source.fw output [program arguments]\n"
+        "       flywheel debug source.fw [options] [-- program arguments]\n"
+        "       (source.fw may be a path or an https://, http://, ftp://, ftps://, sftp://,\n"
+        "        ssh://, scp://, or file:// URL; -s CODE / --source CODE runs code instead)\n"
         "       flywheel serve source.fw [--port N] [--host H] [options] [-- program arguments]\n"
         "       flywheel test [files or directories] [-O0..3] [--coverage] [--race]\n"
         "       flywheel fmt [--check] files...\n"
@@ -612,19 +733,34 @@ int main(int argc, char **argv) {
         return status;
     }
     if (command != "build" && command != "run" && command != "check" && command != "test" &&
-        command != "desktop" && command != "serve") {
+        command != "desktop" && command != "serve" && command != "export" && command != "debug") {
         std::cerr << (command.rfind("-", 0) == 0 ? usage : "unknown command: " + command + "\n");
         return 2;
     }
-    std::string filename, output;
+    std::string filename, output, returnFile;
+    std::optional<std::string> source; // --source code
     std::vector<std::string> programArguments, testPaths; // after `--`: arguments for run
+    std::vector<std::string> positionals;
     fw::Options options;
+    options.compilerPath = llvm::sys::fs::getMainExecutable(argv[0], &anchor);
     try {
         for (int i = 2; i < argc; ++i) {
             std::string arg = argv[i];
             if (arg == "--") {
                 programArguments.assign(argv + i + 1, argv + argc);
                 break;
+            }
+            if ((arg == "-s" || arg == "--source") && i + 1 < argc && command != "test") {
+                source = argv[++i];
+                continue;
+            }
+            if (arg.rfind("--source=", 0) == 0 && command != "test") {
+                source = arg.substr(9);
+                continue;
+            }
+            if (arg == "--return-file" && i + 1 < argc && command != "test") {
+                returnFile = argv[++i];
+                continue;
             }
             if (arg.size() == 3 && arg.substr(0, 2) == "-O" && arg[2] >= '0' && arg[2] <= '3')
                 options.optimization = arg[2] - '0';
@@ -652,21 +788,96 @@ int main(int argc, char **argv) {
             } else if (!arg.empty() && arg[0] != '-') {
                 if (command == "test")
                     testPaths.push_back(arg);
-                else if (filename.empty())
-                    filename = arg;
                 else
-                    throw std::runtime_error("unexpected argument: " + arg);
+                    positionals.push_back(arg);
             } else
                 throw std::runtime_error("unknown or incomplete option: " + arg);
         }
         if (command == "test")
             return runTests(testPaths, options, argv[0]);
-        if (filename.empty()) {
+        // Positionals: the source file (unless --source), then for export the output file, then
+        // (export only) program arguments.
+        size_t next = 0;
+        if (!source && next < positionals.size())
+            filename = positionals[next++];
+        if (command == "export" && output.empty() && next < positionals.size())
+            output = positionals[next++];
+        if (next < positionals.size()) {
+            if (command != "export")
+                throw std::runtime_error("unexpected argument: " + positionals[next] +
+                                         " (pass program arguments after --)");
+            programArguments.insert(programArguments.begin(), positionals.begin() + next,
+                                    positionals.end());
+        }
+        if ((filename.empty() && !source) || (command == "export" && output.empty())) {
             std::cerr << usage;
             return 2;
         }
-        return compileProgram(command, filename, [&] { return fw::loadProgram(filename); },
-                              options, output, programArguments, argv[0]);
+        std::map<std::string, std::string> overlay;
+        if (source) {
+            filename = "[source].fw";
+            sourceFile() = fs::weakly_canonical(fs::absolute(filename)).string();
+            overlay[sourceFile()] = *source;
+        }
+        auto load = [&] {
+            return source ? fw::loadProgram(filename, overlay) : fw::loadProgram(filename);
+        };
+        if (source && command == "build" && output.empty())
+            output = "program";
+        // export and debug run the program and capture its top-level return value; so do run,
+        // desktop, and serve with --return-file (the flywheel module uses it).
+        bool captures = command == "export" || command == "debug" || !returnFile.empty();
+        if (captures && command != "build" && command != "check") {
+            if (command != "desktop" && command != "serve")
+                options.entry = "value";
+            std::optional<Temp> temp;
+            fs::path record = returnFile;
+            if (record.empty()) {
+                temp.emplace();
+                record = temp->path / "return.txt";
+            }
+            std::error_code ignored;
+            fs::remove(record, ignored);
+            setEnvironment("FW_RETURN_FILE", record.string());
+            double seconds = 0;
+            auto runCommand = command == "export" || command == "debug" ? "run" : command;
+            int status = compileProgram(runCommand, filename, load, options, "", programArguments,
+                                        argv[0], &seconds);
+            setEnvironment("FW_RETURN_FILE", "");
+            auto value = readReturn(record);
+            if (command == "debug") {
+                std::cerr << "[debug] ";
+                if (value) {
+                    auto shown = value->second;
+                    if (shown.size() > 120)
+                        shown = shown.substr(0, 117) + "...";
+                    std::cerr << "returned " << value->first << " " << shown;
+                } else
+                    std::cerr << "no return value";
+                if (status != 0)
+                    std::cerr << ", exit status " << status;
+                std::cerr << " in " << duration(seconds) << '\n';
+            }
+            if (command == "export") {
+                if (!value) {
+                    if (status == 0)
+                        std::cerr << "flywheel: " << (source ? "<source>" : filename)
+                                  << " returned no value to export\n";
+                    return status ? status : 1;
+                }
+                std::ofstream out(output, std::ios::binary);
+                if (auto text = jsonString(value->second))
+                    out << *text;
+                else
+                    out << value->second << '\n';
+                if (!out) {
+                    std::cerr << "flywheel: cannot write " << output << '\n';
+                    return 1;
+                }
+            }
+            return status;
+        }
+        return compileProgram(command, filename, load, options, output, programArguments, argv[0]);
     } catch (const fw::Error &e) {
         reportError(e, filename);
         return 1;

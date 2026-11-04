@@ -127,7 +127,7 @@ The block is the enclosing `if`, loop, `try`, or function body, so a `defer` ins
 
 ## Top-level return
 
-`return` outside functions ends the program after running pending `finally` blocks. `return` alone exits with status 0 and `return n` with integer status `n`. Under `flywheel desktop` and `flywheel serve`, the main file returns an `element` or `fragment` to display; see [pages](tooling.md#pages-desktop-and-serve). Only the main file may return at top level, not imported modules.
+`return` outside functions ends the program after running pending `finally` blocks. `return` alone exits with status 0 and `return n` with integer status `n`. Under `flywheel desktop` and `flywheel serve`, the main file returns an `element` or `fragment` to display; see [pages](tooling.md#pages-desktop-and-serve). `flywheel export` and `flywheel debug` (and the `flywheel` module) accept a top-level return of any value; see [return values](tooling.md#return-values-export-and-debug). Only the main file may return at top level, not imported modules.
 
 ## Collections and control flow
 

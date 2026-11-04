@@ -164,7 +164,7 @@ void encodeObject(Object *object, std::string &out, int indent, int depth,
         out += jsonQuote(object->text);
         return;
     case Object::JsonValue:
-        out += jsonRender(*object->json);
+        out += jsonRender(*object->json, indent, depth);
         return;
     case Object::Box:
         encodeSlot(itemsOf(object).at(0), out, indent, depth, active);
@@ -1175,7 +1175,26 @@ Object *fw_json_encode(Frame *frame, Object *box, int64_t indent) {
 }
 
 // os -------------------------------------------------------------------------------------------
+// The file a top-level `return` records its value in (flywheel export, debug, and the flywheel
+// module set FW_RETURN_FILE). It is read once and removed from the environment so child
+// processes of the program do not inherit it.
+std::string &returnFile() {
+    static std::string path = [] {
+        auto value = std::getenv("FW_RETURN_FILE");
+        std::string text = value ? value : "";
+        if (value) {
+#ifdef _WIN32
+            _putenv_s("FW_RETURN_FILE", "");
+#else
+            unsetenv("FW_RETURN_FILE");
+#endif
+        }
+        return text;
+    }();
+    return path;
+}
 void fw_set_args(int64_t count, char **values) {
+    returnFile();
     guardStack(true);
     auto &arguments = programArguments();
     arguments.clear();
@@ -1412,5 +1431,144 @@ void fw_net_close(Object *object) {
             closeSocket(resource->socket);
         resource->socket = invalidSocket;
     });
+}
+}
+
+namespace {
+std::filesystem::path utf8Path(const std::string &text) {
+    return std::filesystem::path(std::u8string(text.begin(), text.end()));
+}
+// "$m0$Shape" -> "Shape": the source spelling of a mangled type name.
+std::string sourceTypeName(const std::string &type) {
+    std::string out;
+    for (size_t i = 0; i < type.size();) {
+        if (type.compare(i, 8, "$native$") == 0) {
+            i += 8;
+            continue;
+        }
+        if (type.compare(i, 2, "$m") == 0) {
+            size_t end = i + 2;
+            while (end < type.size() && std::isdigit(static_cast<unsigned char>(type[end])))
+                ++end;
+            if (end > i + 2 && end < type.size() && type[end] == '$') {
+                i = end + 1;
+                continue;
+            }
+        }
+        out += type[i++];
+    }
+    return out;
+}
+} // namespace
+extern "C" {
+// throw "Name" "message": an error whose type is the given name.
+Object *fw_error_named(Frame *frame, Object *name, Object *message) {
+    return nativeBoundary([&]() -> Object * {
+        if (name->text.empty())
+            fail("throw needs a non-empty error name", "ValueError");
+        auto p = new Object(Object::ErrorValue);
+        p->text = message->text;
+        p->errorType = name->text;
+        return own(frame, p);
+    });
+}
+// error.name: the type name of a caught error, as written in source.
+Object *fw_error_name(Frame *frame, Object *error) {
+    return nativeBoundary([&] {
+        return string(frame, sourceTypeName(error->kind == Object::ErrorValue ? error->errorType
+                                                                              : std::string("Error")));
+    });
+}
+// catch "Name": the pending error's type, as written in source, is Name.
+int64_t fw_error_matches_name(const char *name) {
+    return pendingError.value &&
+           (std::string(name) == "Error" || sourceTypeName(pendingError.type) == name);
+}
+// A top-level `return` records its value (as "type\njson") when FW_RETURN_FILE is set.
+void fw_return_record(Frame *frame, Object *box, const char *type) {
+    nativeBoundary([&] {
+        if (returnFile().empty())
+            return;
+        std::string json;
+        if (box) {
+            std::set<Object *> active;
+            encodeSlot(itemsOf(box).at(0), json, 0, 0, active);
+        }
+        (void)frame;
+        std::ofstream out(utf8Path(returnFile()), std::ios::binary);
+        out << sourceTypeName(type) << '\n' << json;
+        if (!out)
+            fail("cannot write the return value to " + returnFile(), "FileError");
+    });
+}
+// flywheel.run / desktop / serve / debug / export: runs the compiler on a file and returns the
+// file's top-level return value as a json.value (null when it returns nothing).
+Object *fw_flywheel_invoke(Frame *frame, const char *compiled, Object *command, Object *file,
+                           Object *options, Object *arguments) {
+    return nativeBoundary([&]() -> Object * {
+        std::string compiler = "flywheel";
+        if (auto chosen = std::getenv("FLYWHEEL_COMPILER"); chosen && *chosen)
+            compiler = chosen;
+        else if (compiled && *compiled && std::filesystem::exists(utf8Path(compiled)))
+            compiler = compiled;
+        auto directory = std::filesystem::temp_directory_path();
+        std::filesystem::path record;
+        for (int i = 0;; ++i) {
+            record = directory / ("flywheel-return-" +
+                                  std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+                                  "-" + std::to_string(i) + ".txt");
+            if (!std::filesystem::exists(record))
+                break;
+        }
+        std::vector<std::string> argv = {compiler, command->text};
+        for (auto &slot : itemsOf(options))
+            argv.push_back(slot.object->text);
+        argv.push_back(file->text);
+        argv.insert(argv.end(), {"--return-file", record.string()});
+        auto items = itemsOf(arguments);
+        if (!items.empty()) {
+            argv.push_back("--");
+            for (auto &slot : items)
+                argv.push_back(slot.object->text);
+        }
+        for (auto &a : argv)
+            processArgument(a);
+        flushProcessOutput();
+        auto status = runProcess(argv);
+        std::ifstream in(record, std::ios::binary);
+        std::string recorded;
+        if (in) {
+            std::ostringstream text;
+            text << in.rdbuf();
+            recorded = text.str();
+            in.close();
+            std::error_code ignored;
+            std::filesystem::remove(record, ignored);
+        }
+        auto newline = recorded.find('\n');
+        if (newline == std::string::npos) {
+            if (status != 0)
+                fail("flywheel " + command->text + " " + file->text + " failed with status " +
+                         std::to_string(status),
+                     "ProcessError");
+            return fw_json_parse(frame, string(frame, "null"));
+        }
+        return fw_json_parse(frame, string(frame, recorded.substr(newline + 1)));
+    });
+}
+// Native (C, C++, Rust, Zig) imports: strings cross as NUL-terminated UTF-8; results are malloc'd
+// by the shim and freed here.
+const char *fw_foreign_cstr(Object *text) {
+    return text->text.c_str();
+}
+Object *fw_foreign_string(Frame *frame, char *text) {
+    return nativeBoundary([&] {
+        std::string copy = text ? text : "";
+        std::free(text);
+        return string(frame, std::move(copy));
+    });
+}
+void fw_foreign_fail(const char *message) {
+    recordFailure("NativeError", message && *message ? message : "native function failed");
 }
 }

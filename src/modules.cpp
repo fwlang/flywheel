@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <cstring>
 #include <sstream>
 
 namespace fw {
@@ -12,7 +13,7 @@ const std::set<std::string> native = {"desktop", "core",    "html",        "fs",
                                       "os",      "time",    "json",        "web",  "testing",
                                       "collections", "io",  "net",         "regex", "thread",
                                       "gc",      "svg",     "crypto",      "encoding", "uuid",
-                                      "compress", "sqlite", "toml", "yaml"};
+                                      "compress", "sqlite", "toml", "yaml", "flywheel"};
 // Types that native modules export, spelled module.type in source.
 const std::map<std::string, std::set<std::string>> nativeTypes = {
     {"json", {"value"}},
@@ -35,9 +36,44 @@ struct Unit {
 };
 // Embedded library modules load from this virtual directory.
 const fs::path libraryDirectory = fs::path("/") / "<flywheel>" / "lib";
+// The URL's directory, with a trailing '/': "https://x.org/a/b.fw" -> "https://x.org/a/".
+std::string urlDirectory(const std::string &url) {
+    auto end = url.find_first_of("?#");
+    auto path = url.substr(0, end);
+    auto slash = path.rfind('/');
+    auto scheme = path.find("://");
+    if (slash == std::string::npos || slash < scheme + 3)
+        return path + "/";
+    return path.substr(0, slash + 1);
+}
+// An import string that names a file or URL rather than a dotted module name.
+bool pathImport(const std::string &name) {
+    if (name.find_first_of("/\\:") != std::string::npos)
+        return true;
+    for (auto extension : {".fw", ".fly"})
+        if (name.size() > std::strlen(extension) &&
+            name.compare(name.size() - std::strlen(extension), std::strlen(extension), extension) == 0)
+            return true;
+    return false;
+}
+// Source file extensions of natively imported languages, in search order.
+std::vector<std::string> foreignExtensions(const std::string &language) {
+    if (language == "c")
+        return {".c", ".h"};
+    if (language == "cxx")
+        return {".cpp", ".cc", ".cxx", ".c++", ".hpp", ".hh", ".hxx", ".h"};
+    if (language == "rust")
+        return {".rs"};
+    return {".zig"};
+}
+std::string languageName(const std::string &language) {
+    return language == "cxx" ? "C++" : language == "c" ? "C" : language == "rust" ? "Rust" : "Zig";
+}
 class Loader {
     fs::path root;
+    std::string rootUrl; // the entry file's URL directory when it was named by URL
     std::map<std::string, std::string> packages; // package name -> directory
+    std::map<std::string, std::string> downloads; // URL -> contents, fetched once per load
     std::set<std::string> variants; // qualified Enum.Member classes of enums with data
     const std::map<std::string, std::string> *overlay = nullptr;
     std::map<std::string, std::unique_ptr<Unit>> units;
@@ -211,7 +247,9 @@ class Loader {
                 for (auto &v : s.patterns[i])
                     pattern(u, *v, locals, bound[i]);
             for (size_t i = 0; i < s.catches.size(); ++i) {
-                s.catchTypes[i] = type(u, s.catchTypes[i], s.loc);
+                // `catch "Name"` matches by name at run time; it is not a type reference.
+                if (s.catchTypes[i].rfind("\"", 0) != 0)
+                    s.catchTypes[i] = type(u, s.catchTypes[i], s.loc);
                 auto catchLocals = locals;
                 catchLocals.insert(s.catchNames[i]);
                 if (i < bound.size())
@@ -249,8 +287,109 @@ class Loader {
         else
             f.owner = u.own.at(f.owner);
     }
-    Unit &load(fs::path path) {
-        auto canonical = fs::weakly_canonical(path).string();
+    // A native C, C++, Rust, or Zig source: its functions become a module of foreign functions.
+    Unit &loadForeign(const std::string &language, const std::string &file, Location loc) {
+        auto canonical = fs::weakly_canonical(fs::path(file)).string();
+        auto key = language + ":" + canonical;
+        if (units.count(key))
+            return *units.at(key);
+        ForeignModule module;
+        try {
+            module = scanForeign(language, canonical);
+        } catch (const std::exception &e) {
+            throw Error(loc, e.what());
+        }
+        auto owned = std::make_unique<Unit>();
+        auto &u = *owned;
+        u.path = canonical;
+        u.prefix = "$m" + std::to_string(units.size()) + "$";
+        units[key] = std::move(owned);
+        for (auto &f : module.functions) {
+            if (u.own.count(f.name))
+                continue; // overloads: the first definition wins
+            u.own[f.name] = u.prefix + f.name;
+            Function fn;
+            fn.name = u.prefix + f.name;
+            fn.result = f.result;
+            fn.loc = {1, 1, canonical};
+            fn.foreign = f.symbol;
+            for (size_t i = 0; i < f.params.size(); ++i) {
+                Param param;
+                param.name = "arg" + std::to_string(i);
+                param.type = f.params[i];
+                param.loc = fn.loc;
+                fn.params.push_back(std::move(param));
+            }
+            merged.functions.push_back(std::move(fn));
+        }
+        merged.foreign.push_back(std::move(module));
+        return u;
+    }
+    // Finds the source file of `import <language> name`: a dotted name searches the importing
+    // file's directory and the entry directory with the language's extensions; a string names a
+    // path or URL (downloaded to the cache).
+    std::string foreignSource(Unit &u, const std::string &language, const std::string &name,
+                              Location loc) {
+        bool remoteUnit = isUrl(u.path);
+        if (isUrl(name) || (remoteUnit && pathImport(name))) {
+            auto url = isUrl(name) ? name : urlDirectory(u.path) + name;
+            if (auto local = fileUrlPath(url); !local.empty())
+                return local;
+            try {
+                return cacheDownload(url, fetch(url));
+            } catch (const std::exception &e) {
+                throw Error(loc, e.what());
+            }
+        }
+        auto relative = name;
+        bool hasExtension = false;
+        for (auto &extension : foreignExtensions(language))
+            if (relative.size() > extension.size() &&
+                relative.compare(relative.size() - extension.size(), extension.size(), extension) == 0)
+                hasExtension = true;
+        if (!pathImport(name) && !hasExtension)
+            std::replace(relative.begin(), relative.end(), '.', '/');
+        std::vector<std::string> extensions = {""};
+        if (!hasExtension)
+            extensions = foreignExtensions(language);
+        std::vector<fs::path> bases;
+        if (fs::path(relative).is_absolute())
+            bases = {fs::path()};
+        else if (remoteUnit) {
+            // Remote modules find native sources next to them by URL.
+            for (auto &extension : extensions) {
+                auto url = urlDirectory(u.path) + relative + extension;
+                std::string contents;
+                if (tryFetchUrl(url, contents))
+                    return cacheDownload(url, contents);
+            }
+        } else
+            bases = {fs::path(u.path).parent_path(), root};
+        for (auto &base : bases)
+            for (auto &extension : extensions) {
+                auto candidate = base.empty() ? fs::path(relative + extension)
+                                              : base / (relative + extension);
+                if (fs::is_regular_file(candidate))
+                    return candidate.string();
+            }
+        throw Error(loc, languageName(language) + " source for '" + name + "' not found (searched " +
+                             (hasExtension ? relative : relative + foreignExtensions(language)[0]) +
+                             (remoteUnit ? " next to " + u.path : " next to the importing file") +
+                             ")");
+    }
+    const std::string &fetch(const std::string &url) {
+        auto it = downloads.find(url);
+        if (it == downloads.end())
+            it = downloads.emplace(url, fetchUrl(url)).first;
+        return it->second;
+    }
+    static std::string canonicalLocation(const std::string &location) {
+        return isUrl(location) ? location : fs::weakly_canonical(fs::path(location)).string();
+    }
+    Unit &load(const std::string &location) {
+        bool remote = isUrl(location);
+        fs::path path = remote ? fs::path() : fs::path(location);
+        auto canonical = remote ? location : fs::weakly_canonical(path).string();
         if (std::find(stack.begin(), stack.end(), canonical) != stack.end()) {
             std::string message = "import cycle: ";
             for (auto &s : stack)
@@ -260,11 +399,17 @@ class Loader {
         if (units.count(canonical))
             return *units.at(canonical);
         std::ostringstream text;
-        bool library = path.parent_path() == libraryDirectory;
+        bool library = !remote && path.parent_path() == libraryDirectory;
         if (auto it = overlay ? overlay->find(canonical) : decltype(overlay->end()){};
             overlay && it != overlay->end())
             text << it->second;
-        else if (library)
+        else if (remote) {
+            try {
+                text << fetch(location);
+            } catch (const std::exception &e) {
+                throw Error({1, 1, canonical}, e.what());
+            }
+        } else if (library)
             text << libraryModules().at(path.stem().string());
         else {
             std::ifstream input(canonical, std::ios::binary);
@@ -330,14 +475,89 @@ class Loader {
             auto &name = u.program.imports.at(alias);
             auto importLoc = u.program.importLocations.at(alias);
             importLoc.file = u.path;
+            if (auto kind = u.program.importKinds.find(alias); kind != u.program.importKinds.end()) {
+                if (library)
+                    throw Error(importLoc, "library modules cannot import native sources");
+                auto &dependency =
+                    loadForeign(kind->second, foreignSource(u, kind->second, name, importLoc),
+                                importLoc);
+                u.modules[alias] = &dependency;
+                continue;
+            }
+            std::string found;
+            if (pathImport(name)) {
+                // A file path or URL: relative paths start at the importing file (or its URL).
+                if (library)
+                    throw Error(importLoc, "library modules cannot import files");
+                std::string target = name;
+                if (!isUrl(name) && remote && !fs::path(name).is_absolute())
+                    target = urlDirectory(location) + name;
+                if (auto local = fileUrlPath(target); !local.empty())
+                    target = local;
+                std::vector<std::string> extensions = {""};
+                auto stem = target.substr(0, target.find_first_of("?#"));
+                if (fs::path(stem).extension().empty())
+                    extensions = {".fw", ".fly"};
+                for (auto &extension : extensions) {
+                    auto candidate = target + extension;
+                    if (isUrl(candidate)) {
+                        std::string contents;
+                        if (downloads.count(candidate) || tryFetchUrl(candidate, contents)) {
+                            downloads.emplace(candidate, contents);
+                            found = candidate;
+                            break;
+                        }
+                        continue;
+                    }
+                    std::vector<fs::path> bases = {fs::path()};
+                    if (!fs::path(candidate).is_absolute())
+                        bases = {path.parent_path(), root};
+                    for (auto &base : bases) {
+                        auto file = base.empty() ? fs::path(candidate) : base / candidate;
+                        if (fs::is_regular_file(file)) {
+                            found = file.string();
+                            break;
+                        }
+                    }
+                    if (!found.empty())
+                        break;
+                }
+                if (found.empty())
+                    throw Error(importLoc, "cannot find module file '" + name + "'");
+                if (canonicalLocation(found) == u.path)
+                    throw Error(importLoc, "module '" + name + "' imports itself");
+            }
             auto relative = name;
             std::replace(relative.begin(), relative.end(), '.',
                          static_cast<char>(fs::path::preferred_separator));
-            fs::path found;
             // Library modules import only other library and native modules.
             std::vector<fs::path> bases;
-            if (!library)
+            if (!library && !remote && found.empty())
                 bases = {path.parent_path(), root};
+            // A module loaded by URL finds its sibling modules by URL (the entry's directory
+            // too), except names of library and native modules, which are never fetched.
+            if (remote && found.empty() && !native.count(name) && !libraryModules().count(name) &&
+                !packages.count(name.substr(0, name.find('.')))) {
+                auto slashed = name;
+                std::replace(slashed.begin(), slashed.end(), '.', '/');
+                std::vector<std::string> directories = {urlDirectory(location)};
+                if (!rootUrl.empty() && rootUrl != directories[0])
+                    directories.push_back(rootUrl);
+                for (auto &directory : directories) {
+                    for (auto extension : {".fw", ".fly"}) {
+                        auto candidate = directory + slashed + extension;
+                        std::string contents;
+                        if (candidate != u.path &&
+                            (downloads.count(candidate) || tryFetchUrl(candidate, contents))) {
+                            downloads.emplace(candidate, contents);
+                            found = candidate;
+                            break;
+                        }
+                    }
+                    if (!found.empty())
+                        break;
+                }
+            }
             for (auto base : bases) {
                 for (auto extension : {".fw", ".fly"}) {
                     auto candidate = base / (relative + extension);
@@ -349,7 +569,7 @@ class Loader {
                                 continue;
                             throw Error(importLoc, "module '" + name + "' imports itself");
                         }
-                        found = candidate;
+                        found = candidate.string();
                         break;
                     }
                 }
@@ -367,7 +587,7 @@ class Loader {
                         directory / (rest.empty() ? packageMain(directory.string(), head)
                                                   : rest + extension);
                     if (fs::is_regular_file(candidate)) {
-                        found = candidate;
+                        found = candidate.string();
                         break;
                     }
                 }
@@ -375,7 +595,7 @@ class Loader {
                     throw Error(importLoc, "package '" + head + "' has no module '" + name + "'");
             }
             if (found.empty() && libraryModules().count(name))
-                found = libraryDirectory / (name + ".fw");
+                found = (libraryDirectory / (name + ".fw")).string();
             if (!found.empty()) {
                 auto &dependency = load(found);
                 u.modules[alias] = &dependency;
@@ -393,7 +613,7 @@ class Loader {
                         if (dependency.program.components.count(publicName))
                             u.tags[publicName] = qualified;
                     }
-            } else if (native.count(name)) {
+            } else if (native.count(name) && !pathImport(name)) {
                 if (u.program.wildcards.count(alias) && name != "html" && name != "svg")
                     throw Error(importLoc,
                                 "native wildcard imports are supported only for html and svg");
@@ -466,9 +686,19 @@ class Loader {
     explicit Loader(const std::map<std::string, std::string> *overlay = nullptr)
         : overlay(overlay) {}
     Program run(const std::string &file) {
-        root = fs::absolute(file).parent_path();
-        packages = packageRoots(fs::absolute(file).string());
-        load(fs::absolute(file));
+        if (isUrl(file) && fileUrlPath(file).empty()) {
+            // A program named by URL: its imports resolve by URL; packages from the working
+            // directory.
+            rootUrl = urlDirectory(file);
+            root = fs::current_path();
+            packages = packageRoots((fs::current_path() / "main.fw").string());
+            load(file);
+            return std::move(merged);
+        }
+        auto local = isUrl(file) ? fileUrlPath(file) : file;
+        root = fs::absolute(local).parent_path();
+        packages = packageRoots(fs::absolute(local).string());
+        load(fs::absolute(local).string());
         return std::move(merged);
     }
 };

@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1192,7 +1193,7 @@ NEGATIVE.update(
             'import html.*\ncomponent C = <p>{attr v}</p>\nvar a = <C v={1} />\nvar b = <C v="two" />',
             "inconsistent component",
         ),
-        "exceptions": ("try\nend", "try requires catch or finally"),
+        "exceptions": ("try\nend", "try requires catch, finally, or then"),
     }
 )
 TRAPS.update(
@@ -2319,6 +2320,50 @@ MODULE_CASES.extend(
     ]
 )
 
+# 2.8 (beta-8): assert, named throw/catch, `then`, <json> literals, json load/dump, time helpers,
+# string imports.
+POSITIVE.update(
+    {
+        "beta8_errors": (
+            'try\n    throw "MyError" "custom failure"\ncatch "MyError" e\n    print "caught", e.name, e.message\nthen\n    print "then ran"\nend\n'
+            'try\n    throw "ValueError" "bad"\ncatch ValueError v\n    print v.name, v.message\nend\n'
+            'try\n    throw "Other", "x"\ncatch "MyError" e\n    print "wrong"\ncatch e\n    print "any", e.name\nend\n'
+            'try\n    assert 1 > 2 "math is broken"\ncatch AssertionError a\n    print a.message\nend\n'
+            'try\n    assert(false, "paren form")\ncatch "AssertionError" a\n    print a.message\nend\n'
+            'try\n    assert false\ncatch e\n    print e.message\nend\n'
+            'assert 1 < 2 "fine"\nimport testing\ntesting.assert(true)\n',
+            "caught MyError custom failure\nthen ran\nValueError bad\nany Other\nmath is broken\nparen form\nassertion failed\n",
+        ),
+        "beta8_json": (
+            'import json\nvar doc = <json>{"name": "Ann", "tags": [1, 2, {"x": null}], "ok": true}</json>\n'
+            'print json.as_string(doc["name"]), json.length(doc["tags"])\n'
+            'class P\n    string name\nend\nP p = json.decode(doc)\nprint p.name\n'
+            'print json.dumps(json.loads("[1, 2]")), json.dumps(<json>[]</json>)\n'
+            'json.dump(doc, "beta8.json", 2)\nprint json.load("beta8.json")["ok"]\n'
+            'import fs\nprint fs.read("beta8.json").contains("\\n  \\"name\\": \\"Ann\\"")\nfs.remove("beta8.json")\n',
+            'Ann 3\nAnn\n[1,2] []\ntrue\ntrue\n',
+        ),
+        "beta8_time": (
+            'import time\nvar t0 = time.monotonic()\ntime.sleep_ms(5)\ntime.delay(0.001)\n'
+            'print time.elapsed(t0) >= 0.005, time.today().length, time.clock().length, time.unix() > 1700000000, time.millis() > 0, time.timestamp().ends_with("Z")\n',
+            "true 10 8 true true true\n",
+        ),
+        "beta8_string_imports": (
+            'import "math"\nimport "json" as j\nprint math.sqrt(16.0), j.kind(j.parse("1"))\n',
+            "4 number\n",
+        ),
+    }
+)
+NEGATIVE.update(
+    {
+        "json_literal_invalid": ("var x = <json>{\"a\": }</json>\n", "invalid JSON in <json> literal"),
+        "json_literal_unterminated": ("var x = <json>{}\n", "unterminated <json> literal"),
+        "throw_named_types": ('throw "A" 3\n', "throw with a name expects two strings"),
+        "import_path_alias": ('import "lib/1x.fw"\n', "add `as name`"),
+        "import_native_missing": ("import c nothing_here\n", "C source for 'nothing_here' not found"),
+    }
+)
+
 
 class CompilerTests(unittest.TestCase):
     def setUp(self):
@@ -3294,6 +3339,97 @@ print web.static("/assets", "public", {port})
         symbols = [s["name"] for s in request(7, "textDocument/documentSymbol", {"textDocument": {"uri": uri}})]
         self.assertEqual(symbols, ["total", "p", "twice"])
         request(8, "shutdown", None)
+
+    def test_beta8_commands(self):
+        calc = 'import os\nvar total = 0\nfor a in os.args() do\n    total += int(a)\nend\nreturn {"sum": total, "count": os.args().length}\n'
+        (self.root / "calc.fw").write_text(calc, encoding="utf-8")
+        result = self.command("export", "calc.fw", "sum.json", "1", "2", "3")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads((self.root / "sum.json").read_text()), {"sum": 6, "count": 3})
+        result = self.command("export", "-s", 'import html.*\nreturn <p>a &amp; b</p>', "page.html")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / "page.html").read_text(), "<p>a &amp; b</p>")
+        result = self.command("export", "-s", 'print "x"', "none.txt")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("returned no value", result.stderr)
+        result = self.command("debug", "calc.fw", "--", "4", "5")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stderr, r'^\[debug\] returned map<string,int> \{"sum":9,"count":2\} in [0-9.]+ (us|ms|s)\n$')
+        result = self.command("debug", "-s", 'throw "Oops" "bad"')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Oops: bad", result.stderr)
+        self.assertIn("[debug] no return value, exit status 1 in", result.stderr)
+        result = self.command("run", "--source", 'print "from source", 6 * 7')
+        self.assertEqual((result.returncode, result.stdout), (0, "from source 42\n"), result.stderr)
+        result = self.command("run", "-s", "print x")
+        self.assertIn("<source>:1:7: error:", result.stderr)
+        # Sources and imports named by file:// URL and path strings.
+        lib = self.root / "lib"
+        lib.mkdir()
+        (lib / "util.fw").write_text("function twice(int n) returns int\n    return n * 2\nend\n", encoding="utf-8")
+        (self.root / "main.fw").write_text('import "lib/util.fw"\nimport "lib/util" as again\nprint util.twice(21), again.twice(1)\nreturn 7\n', encoding="utf-8")
+        result = self.command("run", (self.root / "main.fw").as_uri())
+        self.assertEqual((result.returncode, result.stdout), (7, "42 2\n"), result.stderr)
+        result = self.command("run", "ws://example.invalid/x.fw")
+        self.assertIn("message streams, not files", result.stderr)
+        # The flywheel module runs other files and returns their top-level values.
+        (self.root / "noreturn.fw").write_text('print "side effect"\n', encoding="utf-8")
+        (self.root / "broken.fw").write_text("print undefined_thing\n", encoding="utf-8")
+        caller = (
+            'import flywheel\nimport json\nvar r = flywheel.run("calc.fw", ["10", "20"])\n'
+            'print json.as_int(r["sum"]), flywheel.run("noreturn.fw")\n'
+            'print flywheel.export("calc.fw", "out.json", ["5"])["sum"]\n'
+            'try\n    flywheel.run("broken.fw")\ncatch ProcessError e\n    print "failed"\nend\nprint "still running"\n'
+        )
+        self.source.write_text(caller, encoding="utf-8")
+        result = self.command("run", self.source)
+        self.assertEqual(result.stdout, "side effect\n30 null\n5\nfailed\nstill running\n", result.stderr)
+        self.assertEqual(json.loads((self.root / "out.json").read_text()), {"sum": 5, "count": 1})
+
+    def test_beta8_native_imports(self):
+        (self.root / "cmath.c").write_text(
+            '#include <stdio.h>\nint add(int a, int b) { return a + b; }\nstatic double half(double x) { return x / 2; }\n'
+            'const char *greet(const char *n) { static char b[64]; snprintf(b, sizeof b, "hi %s", n); return b; }\n'
+            '_Bool even(long n) { return n % 2 == 0; }\nstruct p { int x; };\nint skipped(struct p *q) { return q->x; }\nint main(void) { return 0; }\n',
+            encoding="utf-8",
+        )
+        (self.root / "text.cpp").write_text(
+            '#include <string>\n#include <stdexcept>\nstd::string reverse(const std::string &s) { return std::string(s.rbegin(), s.rend()); }\n'
+            'int risky(int x) { if (x < 0) throw std::invalid_argument("negative input"); return x; }\n'
+            'template <typename T> T ident(T x) { return x; }\nextern "C" { int sum3(int a, int b, int c) { return a + b + c; } }\n',
+            encoding="utf-8",
+        )
+        source = (
+            'import c cmath\nimport++ text\nimport cxx "text.cpp" as same\n'
+            'print cmath.add(2, 3), cmath.half(5.0), cmath.greet("fw"), cmath.even(4)\n'
+            'print text.reverse("flywheel"), same.sum3(1, 2, 3)\n'
+            'try\n    text.risky(-1)\ncatch NativeError e\n    print "C++:", e.message\nend\n'
+        )
+        expected = "5 2.5 hi fw true\nleehwylf 6\nC++: negative input\n"
+        rust = shutil.which("rustc")
+        if rust:
+            (self.root / "fast.rs").write_text(
+                'pub fn fib(n: u64) -> u64 { if n < 2 { n } else { fib(n - 1) + fib(n - 2) } }\n'
+                'pub fn upper(s: &str) -> String { s.to_uppercase() }\n'
+                'pub fn boom(x: i64) -> i64 { if x == 0 { panic!("zero") } 10 / x }\n',
+                encoding="utf-8",
+            )
+            source += 'import rust fast\nprint fast.fib(20), fast.upper("rust")\ntry\n    fast.boom(0)\ncatch e\n    print e.name, e.message\nend\n'
+            expected += "6765 RUST\nNativeError zero\n"
+        self.source.write_text(source, encoding="utf-8")
+        cache = self.root / "cache"
+        env = {**os.environ, "XDG_CACHE_HOME": str(cache)}
+        run = lambda *args: subprocess.run([COMPILER, *map(str, args)], cwd=self.root, capture_output=True, text=True, timeout=180, env=env)
+        result = run("run", self.source)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, expected, ""))
+        self.assertEqual(run("check", self.source).returncode, 0)
+        exe = self.root / ("native.exe" if os.name == "nt" else "native")
+        result = run("build", self.source, "-o", exe)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
+        self.assertEqual((result.returncode, result.stdout), (0, expected), result.stderr)
+        self.source.write_text("import c cmath\nprint cmath.skipped(1)\n", encoding="utf-8")
+        self.assertIn("has no exported name 'skipped'", run("check", self.source).stderr)
 
     def test_top_level_return(self):
         source = 'print "start"\nint code = 3\ntry\n    for i in [1, 2] do\n        if i == 2 then\n            return code + i\n        end\n    end\nfinally\n    print "finally"\nend\nprint "unreachable"\n'
