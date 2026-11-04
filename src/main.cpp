@@ -646,19 +646,25 @@ int main(int argc, char **argv) {
     static int anchor;
     fw::setExecutablePath(llvm::sys::fs::getMainExecutable(argv[0], &anchor));
     std::string usage =
-        "Usage: flywheel {build|run|check} source.fw [-O0..3] [-g] [--race] [-o output] "
-        "[--emit-ir file.ll] [-- program arguments]\n"
-        "       flywheel desktop source.fw [options] [-- program arguments]\n"
-        "       flywheel export source.fw output [program arguments]\n"
-        "       flywheel debug source.fw [options] [-- program arguments]\n"
-        "       (source.fw may be a path or an https://, http://, ftp://, ftps://, sftp://,\n"
-        "        ssh://, scp://, or file:// URL; -s CODE / --source CODE runs code instead)\n"
-        "       flywheel serve source.fw [--port N] [--host H] [options] [-- program arguments]\n"
+        "Usage: flywheel run|build|check SOURCE [options] [-- program arguments]\n"
+        "       flywheel desktop SOURCE [options] [-- program arguments]\n"
+        "       flywheel serve SOURCE [--port N] [--host H] [options] [-- program arguments]\n"
+        "       flywheel export SOURCE OUTPUT [options] [program arguments]\n"
+        "       flywheel debug SOURCE [options] [-- program arguments]\n"
         "       flywheel test [files or directories] [-O0..3] [--coverage] [--race]\n"
         "       flywheel fmt [--check] files...\n"
         "       flywheel doc module.fw [-o output.html]\n"
-
-        "       flywheel repl | lsp | selftest | --version\n";
+        "       flywheel repl | lsp | selftest | --version\n"
+        "\n"
+        "SOURCE is a .fw/.fly path or a URL (https, http, ftp, ftps, sftp, ssh, scp, file).\n"
+        "Use -s CODE (--source CODE) instead of SOURCE to run code from the command line.\n"
+        "\n"
+        "Options:\n"
+        "  -O0..-O3         optimization level\n"
+        "  -g               debug information\n"
+        "  --race           detect data races\n"
+        "  -o FILE          output file (build, export)\n"
+        "  --emit-ir FILE   write the LLVM IR\n";
     if (argc == 2 && std::string(argv[1]) == "--version") {
         std::cout << "Flywheel " FW_VERSION ", LLVM " LLVM_VERSION_STRING "\n";
         return 0;
