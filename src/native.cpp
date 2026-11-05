@@ -868,6 +868,8 @@ ForeignBuild buildForeign(const std::vector<ForeignModule> &modules, bool shared
             args = {"/nologo",     "/O2",
                     "/MD",         "/EHsc",
                     "/c",          cxx ? "/TP" : "/TC",
+                    // MSVC defaults to C++14 and C89-era C; the shim needs std::string_view.
+                    cxx ? "/std:c++17" : "/std:c11",
                     "/D" + rename, "/I" + fs::path(m.source).parent_path().string(),
                     shim.string(), "/Fo:" + partial};
 #else
