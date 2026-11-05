@@ -12,7 +12,11 @@
 #include <llvm/Support/DynamicLibrary.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/Program.h>
-#ifndef _WIN32
+#ifdef _WIN32
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <atomic>
 #include <cerrno>
 #include <csignal>
@@ -142,6 +146,43 @@ int runProgram(const std::string &executable, const std::vector<std::string> &ar
         return 1;
     }
     return childStatus(status);
+}
+#endif
+#ifdef _WIN32
+// Terminating this process (TerminateProcess, which is what a Windows "kill" is) would leave the
+// program running, holding its console handles and temporary directory. The program runs in a
+// job that is killed when this process's handle to it closes, as SIGTERM is forwarded elsewhere.
+int runProgram(const std::string &executable, const std::vector<std::string> &args) {
+    static HANDLE job = [] {
+        HANDLE created = CreateJobObjectW(nullptr, nullptr);
+        if (created) {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if (!SetInformationJobObject(created, JobObjectExtendedLimitInformation, &limits,
+                                         sizeof limits)) {
+                CloseHandle(created);
+                created = nullptr;
+            }
+        }
+        return created;
+    }();
+    std::vector<llvm::StringRef> refs;
+    refs.emplace_back(executable);
+    for (auto &a : args)
+        refs.emplace_back(a);
+    std::string error;
+    bool failed = false;
+    auto child = llvm::sys::ExecuteNoWait(executable, refs, std::nullopt, {}, 0, &error, &failed);
+    if (failed) {
+        std::cerr << "cannot run " << executable << ": " << error << '\n';
+        return 1;
+    }
+    if (job)
+        AssignProcessToJobObject(job, child.Process);
+    auto done = llvm::sys::Wait(child, std::nullopt, &error);
+    if (!error.empty())
+        std::cerr << error << '\n';
+    return done.ReturnCode < 0 ? 1 : done.ReturnCode;
 }
 #endif
 #ifdef FW_JIT
@@ -299,11 +340,7 @@ int compileProgram(const std::string &command, const std::string &filename,
     if (linked)
         return linked;
     if (runs)
-#ifdef _WIN32
-        return timed([&] { return execute(binary.string(), programArguments); });
-#else
         return timed([&] { return runProgram(binary.string(), programArguments); });
-#endif
     return 0;
 }
 // The virtual file holding --source code; diagnostics name it <source>.
@@ -611,8 +648,17 @@ int repl(const char *argv0) {
             text << in.rdbuf();
             return text.str();
         };
-        output = read(out);
-        errors = read(err);
+        // The child writes text-mode output, so on Windows its lines end in "\r\n"; std::cout
+        // adds the "\r" back when the REPL echoes them.
+        auto lf = [](const std::string &text) {
+            std::string out;
+            for (size_t i = 0; i < text.size(); ++i)
+                if (text[i] != '\r' || i + 1 >= text.size() || text[i + 1] != '\n')
+                    out += text[i];
+            return out;
+        };
+        output = lf(read(out));
+        errors = lf(read(err));
         auto at = output.find(sentinel + "\n");
         output = at == std::string::npos ? "" : output.substr(at + sentinel.size() + 1);
         // Report locations relative to the input rather than the generated file.

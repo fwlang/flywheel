@@ -77,39 +77,73 @@ double fromCalendar(std::tm &parts) {
 // ---------------------------------------------------------------------------------------------
 // regex (ECMAScript syntax over characters). Text and patterns are matched as wide strings, so
 // `.` and character classes see whole characters, matching the string model. wchar_t is UTF-32
-// except on Windows, where characters outside the BMP become surrogate pairs.
-std::wstring wideText(const std::string &text) {
-    std::wstring out;
-    for (auto c : decodeUtf8(text)) {
-        if (sizeof(wchar_t) == 2 && c > 0xffff) {
-            c -= 0x10000;
-            out += static_cast<wchar_t>(0xd800 + (c >> 10));
-            out += static_cast<wchar_t>(0xdc00 + (c & 0x3ff));
-        } else
-            out += static_cast<wchar_t>(c);
+// except on Windows, where it is UTF-16: there each character outside the BMP that a call uses
+// stands in as a private-use character the call does not otherwise contain, so it is still one
+// unit (a surrogate pair would let `.` or `[^a]` split it into two invalid halves).
+struct RegexText {
+    std::map<uint32_t, wchar_t> stand;
+    std::map<wchar_t, uint32_t> back;
+    explicit RegexText(std::initializer_list<const std::string *> inputs) {
+        if (sizeof(wchar_t) != 2)
+            return;
+        std::set<uint32_t> astral, used;
+        for (auto *input : inputs)
+            for (auto c : decodeUtf8(*input))
+                (c > 0xffff ? astral : used).insert(c);
+        uint32_t next = 0xe000;
+        for (auto c : astral) {
+            while (next <= 0xf8ff && used.count(next))
+                ++next;
+            if (next > 0xf8ff)
+                break; // more than the private-use area holds: the rest become surrogate pairs
+            stand[c] = static_cast<wchar_t>(next);
+            back[static_cast<wchar_t>(next)] = c;
+            ++next;
+        }
     }
-    return out;
-}
-std::string narrowText(const std::wstring &text) {
-    std::string out;
-    for (size_t i = 0; i < text.size(); ++i) {
-        auto c = static_cast<uint32_t>(text[i]);
-        if (sizeof(wchar_t) == 2 && c >= 0xd800 && c < 0xdc00 && i + 1 < text.size())
-            c = 0x10000 + ((c - 0xd800) << 10) + (static_cast<uint32_t>(text[++i]) - 0xdc00);
-        appendUtf8(out, c);
+    std::wstring wide(const std::string &text) const {
+        std::wstring out;
+        for (auto c : decodeUtf8(text)) {
+            if (sizeof(wchar_t) == 2 && c > 0xffff) {
+                auto it = stand.find(c);
+                if (it != stand.end()) {
+                    out += it->second;
+                    continue;
+                }
+                c -= 0x10000;
+                out += static_cast<wchar_t>(0xd800 + (c >> 10));
+                out += static_cast<wchar_t>(0xdc00 + (c & 0x3ff));
+            } else
+                out += static_cast<wchar_t>(c);
+        }
+        return out;
     }
-    return out;
-}
-const std::wregex &compiledRegex(const std::string &pattern) {
-    thread_local std::map<std::string, std::wregex> cache;
-    auto it = cache.find(pattern);
+    std::string narrow(const std::wstring &text) const {
+        std::string out;
+        for (size_t i = 0; i < text.size(); ++i) {
+            auto c = static_cast<uint32_t>(text[i]);
+            if (sizeof(wchar_t) == 2) {
+                auto it = back.find(text[i]);
+                if (it != back.end())
+                    c = it->second;
+                else if (c >= 0xd800 && c < 0xdc00 && i + 1 < text.size())
+                    c = 0x10000 + ((c - 0xd800) << 10) + (static_cast<uint32_t>(text[++i]) - 0xdc00);
+            }
+            appendUtf8(out, c);
+        }
+        return out;
+    }
+};
+const std::wregex &compiledRegex(const RegexText &mapping, const std::string &pattern) {
+    thread_local std::map<std::wstring, std::wregex> cache;
+    auto wide = mapping.wide(pattern);
+    auto it = cache.find(wide);
     if (it != cache.end())
         return it->second;
     if (cache.size() > 128)
         cache.clear();
     try {
-        return cache.emplace(pattern, std::wregex(wideText(pattern), std::regex::ECMAScript))
-            .first->second;
+        return cache.emplace(wide, std::wregex(wide, std::regex::ECMAScript)).first->second;
     } catch (const std::regex_error &error) {
         fail("invalid regular expression '" + pattern + "': " + error.what(), "RegexError");
     }
@@ -964,55 +998,64 @@ double fw_time_from_date(int64_t year, int64_t month, int64_t day, int64_t hour,
 // regex ----------------------------------------------------------------------------------------
 int64_t fw_regex_test(Object *pattern, Object *text, int64_t full) {
     return regexBoundary([&]() -> int64_t {
-        auto &re = compiledRegex(requireString(pattern)->text);
-        auto source = wideText(requireString(text)->text);
+        auto &p = requireString(pattern)->text, &t = requireString(text)->text;
+        RegexText mapping{&p, &t};
+        auto &re = compiledRegex(mapping, p);
+        auto source = mapping.wide(t);
         return full ? std::regex_match(source, re) : std::regex_search(source, re);
     });
 }
 Object *fw_regex_find(Frame *frame, Object *pattern, Object *text) {
     return regexBoundary([&]() -> Object * {
+        auto &p = requireString(pattern)->text, &t = requireString(text)->text;
+        RegexText mapping{&p, &t};
         std::wsmatch match;
-        auto source = wideText(requireString(text)->text);
-        if (!std::regex_search(source, match, compiledRegex(requireString(pattern)->text)))
+        auto source = mapping.wide(t);
+        if (!std::regex_search(source, match, compiledRegex(mapping, p)))
             return nullptr;
-        return string(frame, narrowText(match.str(0)));
+        return string(frame, mapping.narrow(match.str(0)));
     });
 }
 // 0 find_all (whole matches), 1 groups of the first match (null when nothing matches)
 Object *fw_regex_list(Frame *frame, Object *pattern, Object *text, int64_t groups) {
     return regexBoundary([&]() -> Object * {
-        auto source = wideText(requireString(text)->text);
-        auto &re = compiledRegex(requireString(pattern)->text);
+        auto &p = requireString(pattern)->text, &t = requireString(text)->text;
+        RegexText mapping{&p, &t};
+        auto source = mapping.wide(t);
+        auto &re = compiledRegex(mapping, p);
         std::vector<std::string> out;
         if (groups) {
             std::wsmatch match;
             if (!std::regex_search(source, match, re))
                 return nullptr;
             for (size_t i = 1; i < match.size(); ++i)
-                out.push_back(match[i].matched ? narrowText(match.str(i)) : "");
+                out.push_back(match[i].matched ? mapping.narrow(match.str(i)) : "");
         } else
             for (std::wsregex_iterator it(source.begin(), source.end(), re), end; it != end; ++it)
-                out.push_back(narrowText(it->str(0)));
+                out.push_back(mapping.narrow(it->str(0)));
         return stringArray(frame, out);
     });
 }
 Object *fw_regex_replace(Frame *frame, Object *pattern, Object *text, Object *replacement) {
     return regexBoundary([&] {
-        return string(frame, narrowText(std::regex_replace(
-                                 wideText(requireString(text)->text),
-                                 compiledRegex(requireString(pattern)->text),
-                                 wideText(requireString(replacement)->text))));
+        auto &p = requireString(pattern)->text, &t = requireString(text)->text,
+             &r = requireString(replacement)->text;
+        RegexText mapping{&p, &t, &r};
+        return string(frame, mapping.narrow(std::regex_replace(mapping.wide(t),
+                                                               compiledRegex(mapping, p),
+                                                               mapping.wide(r))));
     });
 }
 Object *fw_regex_split(Frame *frame, Object *pattern, Object *text) {
     return regexBoundary([&] {
-        auto source = wideText(requireString(text)->text);
+        auto &p = requireString(pattern)->text, &t = requireString(text)->text;
+        RegexText mapping{&p, &t};
+        auto source = mapping.wide(t);
         std::vector<std::string> out;
-        std::wsregex_token_iterator it(source.begin(), source.end(),
-                                       compiledRegex(requireString(pattern)->text), -1),
+        std::wsregex_token_iterator it(source.begin(), source.end(), compiledRegex(mapping, p), -1),
             end;
         for (; it != end; ++it)
-            out.push_back(narrowText(it->str()));
+            out.push_back(mapping.narrow(it->str()));
         return stringArray(frame, out);
     });
 }

@@ -3421,7 +3421,7 @@ print web.static("/assets", "public", {port})
         env = {**os.environ, "XDG_CACHE_HOME": str(cache)}
         run = lambda *args: subprocess.run([COMPILER, *map(str, args)], cwd=self.root, capture_output=True, text=True, timeout=180, env=env)
         result = run("run", self.source)
-        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, expected, ""))
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, expected, ""), result.stderr)
         self.assertEqual(run("check", self.source).returncode, 0)
         exe = self.root / ("native.exe" if os.name == "nt" else "native")
         result = run("build", self.source, "-o", exe)

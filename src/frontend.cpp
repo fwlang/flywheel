@@ -386,7 +386,14 @@ std::string entities(const std::string &text, Location l) {
     return out;
 }
 } // namespace
-std::vector<Token> lex(const std::string &source) {
+std::vector<Token> lex(const std::string &text) {
+    // CRLF line endings (Windows editors, or text-mode writes) read as LF, so a string literal
+    // that spans lines holds "\n" rather than "\r\n".
+    std::string source;
+    source.reserve(text.size());
+    for (size_t i = 0; i < text.size(); ++i)
+        if (text[i] != '\r' || i + 1 >= text.size() || text[i + 1] != '\n')
+            source += text[i];
     // Validate UTF-8 before tokenization; identifier spelling is ASCII in this prototype.
     for (size_t i = 0; i < source.size();) {
         auto c = static_cast<unsigned char>(source[i++]);
