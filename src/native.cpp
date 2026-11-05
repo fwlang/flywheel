@@ -821,6 +821,8 @@ ForeignBuild buildForeign(const std::vector<ForeignModule> &modules, bool shared
     auto root = fs::path(cacheDirectory("native"));
 #ifdef _WIN32
     std::string sharedSuffix = ".dll", staticSuffix = ".lib", objectSuffix = ".obj";
+#elif defined(__APPLE__)
+    std::string sharedSuffix = ".dylib", staticSuffix = ".a", objectSuffix = ".o";
 #else
     std::string sharedSuffix = ".so", staticSuffix = ".a", objectSuffix = ".o";
 #endif
@@ -874,8 +876,13 @@ ForeignBuild buildForeign(const std::vector<ForeignModule> &modules, bool shared
             if (!cxx)
                 args.insert(args.begin(), {"-x", "c"});
             args.push_back(shim.string());
-            if (shared)
+            if (shared) {
+#ifdef __APPLE__
+                // fw_* runtime symbols resolve against the host process at load time.
+                args.insert(args.end(), {"-undefined", "dynamic_lookup"});
+#endif
                 args.insert(args.end(), {"-shared", "-o", partial});
+            }
             else
                 args.insert(args.end(), {"-c", "-o", partial});
 #endif
@@ -889,6 +896,8 @@ ForeignBuild buildForeign(const std::vector<ForeignModule> &modules, bool shared
         fs::create_directories(directory);
 #ifdef _WIN32
         auto library = directory / (shared ? "shim.dll" : "shim.lib");
+#elif defined(__APPLE__)
+        auto library = directory / (shared ? "libshim.dylib" : "libshim.a");
 #else
         auto library = directory / (shared ? "libshim.so" : "libshim.a");
 #endif

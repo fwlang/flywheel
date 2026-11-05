@@ -285,7 +285,7 @@ Slot castNumber(const Slot &value, const std::string &type) {
         auto &text = source.object->text;
         if (real) {
             double n;
-            auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), n);
+            auto [end, error] = parseDouble(text.data(), text.data() + text.size(), n);
             if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(n))
                 fail("invalid or out-of-range real string", "NumericError");
             source.kind = Slot::Real;

@@ -229,8 +229,10 @@ int compileProgram(const std::string &command, const std::string &filename,
     for (auto library : {"-lws2_32", "-lbcrypt", "-lcrypt32"})
         link.push_back(library);
 #endif
-#if !defined(_MSC_VER) && !defined(__APPLE__)
     // Drop the parts of the runtime (SQLite, TLS, ...) a program does not use.
+#ifdef __APPLE__
+    link.push_back("-Wl,-dead_strip");
+#elif !defined(_MSC_VER)
     link.push_back("-Wl,--gc-sections");
 #endif
 #if !defined(_WIN32) && !defined(__APPLE__)

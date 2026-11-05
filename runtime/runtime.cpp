@@ -25,8 +25,40 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#if defined(_LIBCPP_VERSION) && !defined(__cpp_lib_to_chars)
+#include <locale.h>
+#ifdef __APPLE__
+#include <xlocale.h>
+#endif
+#endif
 
 namespace {
+// std::from_chars for double, which Apple's libc++ lacks. The fallback keeps from_chars rules:
+// no leading whitespace, '+' or hex prefix, and the C locale's decimal point.
+std::from_chars_result parseDouble(const char *first, const char *last, double &value) {
+#if defined(_LIBCPP_VERSION) && !defined(__cpp_lib_to_chars)
+    if (first == last || std::isspace(static_cast<unsigned char>(*first)) || *first == '+')
+        return {first, std::errc::invalid_argument};
+    // "0x1" reads as 0 followed by "x1", as from_chars does.
+    auto digits = first + (*first == '-');
+    if (last - digits >= 2 && digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X'))
+        last = digits + 1;
+    static locale_t c = newlocale(LC_ALL_MASK, "C", nullptr);
+    std::string text(first, last);
+    char *end = nullptr;
+    errno = 0;
+    double parsed = strtod_l(text.c_str(), &end, c);
+    if (end == text.c_str())
+        return {first, std::errc::invalid_argument};
+    auto stop = first + (end - text.c_str());
+    if (errno == ERANGE)
+        return {stop, std::errc::result_out_of_range};
+    value = parsed;
+    return {stop, std::errc{}};
+#else
+    return std::from_chars(first, last, value);
+#endif
+}
 struct NativeFailure {
     std::string type, message;
 };
@@ -1832,7 +1864,7 @@ uint64_t fw_parse_uint(Object *s) {
 double fw_parse_real(Object *s) {
     try {
         double n;
-        auto [end, ec] = std::from_chars(s->text.data(), s->text.data() + s->text.size(), n);
+        auto [end, ec] = parseDouble(s->text.data(), s->text.data() + s->text.size(), n);
         if (ec != std::errc{} || end != s->text.data() + s->text.size() || !std::isfinite(n))
             fail("invalid or out-of-range real string", "NumericError");
         return n;
