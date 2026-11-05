@@ -2004,7 +2004,7 @@ POSITIVE.update(
     }
 )
 if os.name != "nt":
-    POSITIVE["stdlib_processes"] = ('import os\nvar r = os.run(["sh", "-c", "echo out; echo err >&2; exit 3"])\nprint r.status, r.stdout.trim(), r.stderr.trim(), r.timed_out\nvar pr = os.process(["cat"])\npr.input = "fed through stdin"\nprint pr.run().stdout\nvar slow = os.process(["sleep", "5"])\nslow.timeout = 0.2\nvar sr = slow.run()\nprint sr.timed_out\nvar cw = os.process(["pwd"])\ncw.cwd = "/tmp"\ncw.env["FLY_X"] = "42"\nprint cw.run().stdout.trim()\nvar envp = os.process(["sh", "-c", "echo $FLY_X"])\nenvp.env["FLY_X"] = "42"\nprint envp.run().stdout.trim()\nprint os.pipeline([["printf", "b\\\\na\\\\nc\\\\n"], ["sort"], ["head", "-n", "2"]]).stdout.lines()\n', '3 out err false\nfed through stdin\ntrue\n/tmp\n42\n["a", "b"]\n')
+    POSITIVE["stdlib_processes"] = ('import os\nvar r = os.run(["sh", "-c", "echo out; echo err >&2; exit 3"])\nprint r.status, r.stdout.trim(), r.stderr.trim(), r.timed_out\nvar pr = os.process(["cat"])\npr.input = "fed through stdin"\nprint pr.run().stdout\nvar slow = os.process(["sleep", "5"])\nslow.timeout = 0.2\nvar sr = slow.run()\nprint sr.timed_out\nvar cw = os.process(["pwd"])\ncw.cwd = "/"\ncw.env["FLY_X"] = "42"\nprint cw.run().stdout.trim()\nvar envp = os.process(["sh", "-c", "echo $FLY_X"])\nenvp.env["FLY_X"] = "42"\nprint envp.run().stdout.trim()\nprint os.pipeline([["printf", "b\\\\na\\\\nc\\\\n"], ["sort"], ["head", "-n", "2"]]).stdout.lines()\n', '3 out err false\nfed through stdin\ntrue\n/\n42\n["a", "b"]\n')
 NEGATIVE.update(
     {
         "json_decode_target": ('import json\nprint json.decode("[1]")', "needs a target type"),

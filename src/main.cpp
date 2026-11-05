@@ -12,15 +12,20 @@
 #include <llvm/Support/DynamicLibrary.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/Program.h>
-#ifdef FW_JIT
+#ifndef _WIN32
+#include <atomic>
 #include <cerrno>
-#include <cstring>
-#include <cstdio>
-#include <llvm/ExecutionEngine/Orc/LLJIT.h>
-#include <llvm/Support/MemoryBuffer.h>
 #include <csignal>
+#include <cstdio>
+#include <cstring>
+#include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
+extern char **environ;
+#endif
+#ifdef FW_JIT
+#include <llvm/ExecutionEngine/Orc/LLJIT.h>
+#include <llvm/Support/MemoryBuffer.h>
 #ifdef __linux__
 #include <sys/prctl.h>
 #endif
@@ -90,6 +95,55 @@ std::string desktopPath(const fs::path &runtime) {
         return fs::absolute(installed).string();
     return FW_DESKTOP_BACKEND;
 }
+#ifndef _WIN32
+// Reports a child's wait status the way a shell would, rather than exiting with a bare status.
+int childStatus(int status) {
+    if (WIFEXITED(status))
+        return WEXITSTATUS(status);
+    int signal = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+    std::cerr << "flywheel: program terminated by signal " << signal;
+    if (auto name = signal ? strsignal(signal) : nullptr)
+        std::cerr << " (" << name << ")";
+    std::cerr << '\n';
+    return 128 + signal;
+}
+std::atomic<pid_t> runningProgram{0};
+void forwardSignal(int signal) {
+    if (pid_t child = runningProgram.load())
+        kill(child, signal);
+}
+// Runs a linked program as a child. SIGTERM and SIGHUP sent to the driver reach the program too,
+// so stopping `flywheel run` or `flywheel serve` stops (and frees the port of) what it started.
+int runProgram(const std::string &executable, const std::vector<std::string> &args) {
+    std::vector<std::string> owned{executable};
+    owned.insert(owned.end(), args.begin(), args.end());
+    std::vector<char *> argv;
+    for (auto &a : owned)
+        argv.push_back(a.data());
+    argv.push_back(nullptr);
+    struct sigaction forward {}, oldTerm {}, oldHup {};
+    forward.sa_handler = forwardSignal;
+    sigemptyset(&forward.sa_mask);
+    sigaction(SIGTERM, &forward, &oldTerm);
+    sigaction(SIGHUP, &forward, &oldHup);
+    pid_t child = 0;
+    int error = posix_spawn(&child, executable.c_str(), nullptr, nullptr, argv.data(), environ);
+    int status = 0;
+    if (error == 0) {
+        runningProgram = child;
+        while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+        }
+        runningProgram = 0;
+    }
+    sigaction(SIGTERM, &oldTerm, nullptr);
+    sigaction(SIGHUP, &oldHup, nullptr);
+    if (error) {
+        std::cerr << "cannot run " << executable << ": " << std::strerror(error) << '\n';
+        return 1;
+    }
+    return childStatus(status);
+}
+#endif
 #ifdef FW_JIT
 // Runs a compiled object without linking it: the runtime is part of this executable and its fw_*
 // symbols are exported for the JIT. The program runs in a child process, so traps and crashes
@@ -141,15 +195,7 @@ std::optional<int> runInProcess(const std::string &object, std::vector<std::stri
     while (waitpid(child, &status, 0) < 0)
         if (errno != EINTR)
             return 1;
-    if (WIFEXITED(status))
-        return WEXITSTATUS(status);
-    // Report a crash the way a shell would, rather than exiting with a bare status.
-    int signal = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
-    std::cerr << "flywheel: program terminated by signal " << signal;
-    if (auto name = signal ? strsignal(signal) : nullptr)
-        std::cerr << " (" << name << ")";
-    std::cerr << '\n';
-    return 128 + signal;
+    return childStatus(status);
 }
 #endif
 // Compiles `load()` and runs it (run, desktop, serve), links it (build), or only checks it
@@ -253,7 +299,11 @@ int compileProgram(const std::string &command, const std::string &filename,
     if (linked)
         return linked;
     if (runs)
+#ifdef _WIN32
         return timed([&] { return execute(binary.string(), programArguments); });
+#else
+        return timed([&] { return runProgram(binary.string(), programArguments); });
+#endif
     return 0;
 }
 // The virtual file holding --source code; diagnostics name it <source>.

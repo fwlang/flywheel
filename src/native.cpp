@@ -936,7 +936,13 @@ ForeignBuild buildForeign(const std::vector<ForeignModule> &modules, bool shared
             std::ifstream in(flagsFile);
             std::string flag;
             while (in >> flag)
+#ifdef __APPLE__
+                // The C++ driver links libSystem already; ld warns about a second copy.
+                if (flag != "-lSystem" &&
+                    std::find(build.flags.begin(), build.flags.end(), flag) == build.flags.end())
+#else
                 if (std::find(build.flags.begin(), build.flags.end(), flag) == build.flags.end())
+#endif
                     build.flags.push_back(flag);
         }
     }
