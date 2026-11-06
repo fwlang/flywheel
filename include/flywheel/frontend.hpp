@@ -172,6 +172,9 @@ class Parser {
     std::string typeArguments(bool allowSpace = false);
     std::string markupName(); // a tag or attribute name such as my-card or stroke-width
     EP expression(int precedence = 0);
+    EP operators(EP e, int precedence);
+    EP which(EP sequence);
+    int whichDepth = 0; // inside a `which` condition, `.name` and a leading comparison use the item
     EP prefix();
     EP outer();
     EP markup();

@@ -689,7 +689,7 @@ class Navigator {
                              "match", "case", "try", "catch", "finally", "throw", "defer",
                              "import", "private", "readonly", "inst", "true", "false", "null",
                              "and", "or", "not", "print", "returns", "break", "continue",
-                             "assert"})
+                             "assert", "which"})
             if (seen.insert(keyword).second)
                 out.push_back({keyword, "keyword"});
         return out;

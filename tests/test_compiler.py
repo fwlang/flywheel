@@ -965,6 +965,46 @@ next
 print next()""",
             '42\n15\n11\n[1, 4, 9, 16, 25]\n[1, 3, 5]\n15\ntrue\nfalse\nthree\n[2, 4, 6, 8, 10]\n["n1", "n2", "n3", "n4", "n5"]\n6\n13\n3\n11\nfunction(int) returns int\n<function>\n3\n',
         ),
+        "which_filter": (
+            """class Person
+    string name
+    int age
+    bool admin = false
+    function shout() returns string
+        return inst name.upper()
+    end
+end
+
+var people = [Person("Danny", 15), Person("Alice", 30, true), Person("Bob", 18)]
+var adults = people which .age >= 18
+print adults.length
+for p in adults do
+    print p.name
+end
+for p in people which .name == "Danny" do
+    print p.age
+end
+var numbers = [4, 12, 7, 30, 11]
+print numbers which > 10
+print numbers which > 5 and < 12
+print numbers which > 5 which < 12
+var limit = 10
+print numbers which >= limit
+var big = numbers which > 10
+print big.length
+print numbers which % 2 == 0
+print people which .admin
+var plain = people which not .admin
+print plain.length
+var bob = people which .shout() == "BOB"
+print bob[0].name
+print [1, 2, 3] which in [2, 3, 4]
+var s = {3, 1, 4, 1, 5}
+print s which > 2
+print ["a", "bb", "ccc"] which .length > 1
+print numbers which > 100""",
+            '2\nAlice\nBob\n15\n[12, 30, 11]\n[7, 11]\n[7, 11]\n[12, 30, 11]\n3\n[4, 12, 30]\n[Person(name="Alice", age=30, admin=true)]\n2\nBob\n[2, 3]\n[3, 4, 5]\n["bb", "ccc"]\n[]\n',
+        ),
         "closure_fields_and_nesting": (
             """import testing
 class Button
@@ -1369,6 +1409,9 @@ NEGATIVE.update(
         ),
         "not_callable": ("var n = 5\nprint n(1)", "is not callable"),
         "weak_primitive": ("weak<int> w = 1", "weak<T> requires a non-null reference type"),
+        "which_not_sequence": ("print 5 which > 3", "'which' filters an array, tuple, or set"),
+        "which_no_condition": ("var xs = [1]\nprint xs which", "'which' expects a condition"),
+        "which_condition_type": ("var xs = [1]\nprint xs which .length", "has no"),
         "filter_predicate": (
             "print [1, 2].filter(function(int x) => x)",
             "cannot convert int to bool",

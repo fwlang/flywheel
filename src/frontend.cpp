@@ -630,7 +630,7 @@ Token Parser::identifier() {
         "for",     "in",      "end",  "break", "continue", "try",      "catch",
         "finally", "throw",   "inst", "attr",  "true",     "false",    "null",
         "public",  "private", "void", "weak",  "and",      "or",       "not",
-        "enum",    "interface", "extends", "implements", "match", "case", "super", "is",
+        "enum",    "interface", "extends", "implements", "match", "case", "super", "is", "which",
         "elements", "defer"};
     if (t.kind != "id" || reserved.count(t.text))
         throw Error(t.loc, "expected identifier");
@@ -1013,6 +1013,15 @@ EP Parser::prefix() {
     } else if (t.kind == "string") {
         take();
         e = stringExpr(t);
+    } else if (whichDepth > 0 && t.kind == "op" && t.text == "." && peek(1).kind == "id") {
+        // `.name` inside a `which` condition reads a member of the item being tested.
+        e = node("name", "$which", t.loc);
+    } else if (whichDepth > 0 && ((t.kind == "op" && (comparison(t.text) || t.text == "*" ||
+                                                     t.text == "/" || t.text == "//" ||
+                                                     t.text == "%")) ||
+                                  (t.kind == "id" && (t.text == "in" || t.text == "is")))) {
+        // A condition that starts with an operator compares the item: `which > 10`.
+        return node("name", "$which", t.loc);
     } else if (t.kind == "int" || t.kind == "real") {
         take();
         e = node(t.kind, t.text, t.loc);
@@ -1079,7 +1088,7 @@ EP Parser::prefix() {
             "return",   "if",    "then",      "else",     "while",  "do",      "for",
             "in",       "end",   "break",     "continue", "try",    "catch",   "finally",
             "throw",    "as",    "void",      "weak",     "and",    "or",      "enum",
-            "interface", "extends", "implements", "match", "case",  "is"};
+            "interface", "extends", "implements", "match", "case",  "is", "which"};
         if (structural.count(t.text))
             throw Error(t.loc, "unexpected keyword '" + t.text + "' in expression");
         take();
@@ -1133,8 +1142,45 @@ std::string Parser::typeArguments(bool allowSpace) {
         return "";
     }
 }
+// `items which condition` keeps the items for which the condition holds. It binds looser than
+// every other operator and chains left to right: `xs which > 1 which < 9`.
 EP Parser::expression(int level) {
-    auto e = prefix();
+    auto e = operators(prefix(), level);
+    while (level == 0 && peek().kind == "id" && peek().text == "which")
+        e = which(std::move(e));
+    return e;
+}
+EP Parser::which(EP sequence) {
+    auto t = take();
+    auto f = std::make_shared<Function>();
+    f->loc = t.loc;
+    f->name = "lambda";
+    Param item;
+    item.name = "$which"; // typed from the sequence's item type by the compiler
+    item.loc = t.loc;
+    f->params.push_back(std::move(item));
+    auto r = std::make_unique<Stmt>();
+    r->kind = "return";
+    r->loc = peek().loc;
+    if (peek().kind == "eof" || peek().kind == "nl" || peek().text == "which")
+        throw Error(peek().loc, "'which' expects a condition, such as 'which .age >= 18' or 'which > 10'");
+    ++whichDepth;
+    try {
+        r->expr = operators(prefix(), 0);
+    } catch (...) {
+        --whichDepth;
+        throw;
+    }
+    --whichDepth;
+    f->body.push_back(std::move(r));
+    auto fn = node("lambda", "", t.loc);
+    fn->lambda = std::move(f);
+    auto n = node("which", "", t.loc);
+    n->args.push_back(std::move(sequence));
+    n->args.push_back(std::move(fn));
+    return n;
+}
+EP Parser::operators(EP e, int level) {
     while ((peek().kind == "op" || peek().kind == "id") && precedence(peek().text) > level) {
         if (peek().text == "is" || peek().text == "as") {
             // x is Type tests a runtime class; x as Type is a checked downcast.

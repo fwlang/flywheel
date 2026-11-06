@@ -2825,6 +2825,16 @@ Val Compiler::value(Expr &e, Ty expected) {
         return invoke(e, expected);
     if (e.kind == "lambda")
         return lambda(e, expected);
+    if (e.kind == "which") {
+        // `items which condition`: a filter whose condition is a lambda over the hidden item.
+        auto items = value(*e.args[0]);
+        if (items.t.set())
+            items = {objectCall("fw_map_keys", {frame, items.v}),
+                     Ty{items.t.parts()[0].name + "[]"}};
+        if (!items.t.sequence())
+            error("'which' filters an array, tuple, or set, not " + displayName(items.t.name));
+        return sequenceMethod(items, "filter", e);
+    }
     if (e.kind == "array") {
         std::vector<Val> items;
         auto parts = expected.tuple() ? expected.parts() : std::vector<Ty>{};
@@ -4969,7 +4979,8 @@ Val Compiler::sequenceMethod(Val sequence, const std::string &method, Expr &e) {
     auto parts = function.t.parts();
     auto result = parts[0];
     if (predicate && result.name != "bool")
-        error(method + " expects a function returning bool");
+        error(e.kind == "which" ? "'which' condition must be bool, got " + displayName(result.name)
+                                : method + " expects a function returning bool");
     if (method == "map" && result.name == "void")
         error("map expects a function returning a value");
     Ty accumulator = reduce ? parts[1] : Ty{};
@@ -7393,7 +7404,11 @@ Val Compiler::lambda(Expr &e, Ty expected) {
     location = e.loc;
     std::vector<Ty> params;
     for (auto &param : f.params) {
-        auto t = type(param.type);
+        // An untyped parameter (the item of a `which` condition) takes the expected type.
+        auto t = param.type.empty() && expected.function() &&
+                         expected.parts().size() == f.params.size() + 1
+                     ? expected.parts()[params.size() + 1]
+                     : type(param.type);
         if (t.name == "void")
             error("lambda parameters cannot be void");
         params.push_back(t);

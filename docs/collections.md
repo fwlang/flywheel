@@ -31,6 +31,20 @@ print values.remove_at(0), values.remove(3), values.join(", ")
 | `join(separator = "")` | concatenate items; non-strings use their `string(...)` form |
 | `map`, `filter`, `reduce(initial, f)`, `any`, `all`, `each` | higher-order helpers |
 
+### Filtering with `which`
+
+`items which condition` returns a new array of the items for which the condition is true. Inside the condition, `.name` reads a member of the item and a condition that starts with an operator applies it to the item:
+
+```flywheel
+var adults = people which .age >= 18
+var dannys = people which .name == "Danny"
+print numbers which > 10
+print numbers which > 5 and < 12, numbers which % 2 == 0
+print people which not .admin, words which .length > 3, ids which in allowed
+```
+
+`which` works on arrays, tuples, and sets, binds looser than every other operator (so `and`/`or` stay inside the condition), and chains: `xs which > 1 which < 9`. Parenthesize it to use the result in a larger expression: `(people which .admin).length`. The condition must be `bool`; it can use local variables and call methods (`people which .greet() == "hi"`).
+
 `a[i..j]` and `a[i..<j]` slice like `slice` with an inclusive or exclusive end. Tuples (`tuple<T>` and `[A, B]`) support the read-only methods (`slice`, `index_of`, `contains`, `copy`, `join`); mutating methods require an array.
 
 A `for` expression is evaluated once and captures the initial length; shrinking the array during iteration can raise `IndexError`. `for index, item in values` also binds the index.
