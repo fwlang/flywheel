@@ -2,7 +2,7 @@
 
 A C++20 compiler that turns Flywheel source into LLVM IR, native object files, and executables. Native markup and components become compiled element construction with escaped HTML serialization. Programs require neither Python nor a runtime interpreter.
 
-Flywheel is currently in its **beta** phase: version **2.11 (beta-11)** (`flywheel --version`).
+Flywheel is currently in its **beta** phase: version **2.12 (beta-12)** (`flywheel --version`).
 
 ## Build
 
@@ -131,7 +131,7 @@ print describe(Token.Number(1500)), "{label}: {count:>4}"
 
 ## Reactive variables and units
 
-`reactive` variables can be watched: `when condition do ... end` runs each time the condition becomes true, and `computed` values follow their expression. `bool alive/dead = true` declares a bool with a negated alias. Units of measure are checked at compile time: `unitns`, `unit`, and `unitconv` declare dimensions, units, and relations, and `100m + 2km`, `distance in cm`, and `100m / 10s` work while `100m + 10s` is a compile error. See [reactive variables](docs/reactive.md) and [units](docs/units.md).
+`reactive` variables can be watched: `when condition do ... end` runs each time the condition becomes true, and `computed` values follow their expression. `bool alive/dead = true` declares a bool with a negated alias. Units of measure are checked at compile time and apply to every numeric type: `unitns`, `unit`, and `unitconv` declare dimensions, units, and relations, the `metric`, `imperial`, and `time` modules declare common ones, and `100m + 2km`, `distance in cm`, and `100m / 10s` work while `100m + 10s` is a compile error. See [reactive variables](docs/reactive.md) and [units](docs/units.md).
 
 ```flywheel
 reactive bool playerAlive/playerDead = true
@@ -140,11 +140,11 @@ when playerDead do
 end
 playerAlive = false              # prints "Game over!"
 
-unitns time for int, float
-unit time.s = 1
-unit time.min = 60
+import metric
+import time
 int[time] duration = 90s
 print duration in time.min       # 1.5min
+print 12.5km / 30min in kmph     # 25kmph
 ```
 
 ## Constructors
