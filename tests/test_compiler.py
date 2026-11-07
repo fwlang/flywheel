@@ -2651,6 +2651,56 @@ print 3ft * 2ft, 14lb in st
 """,
             "1000m 5280ft 60mph 8pt 43560sqft\n6sqft 1st\n",
         ),
+        "when_plain_variables": (
+            """import time
+int[time] delay = 1000ms
+when delay == 3000ms do
+    print "reached", delay
+end
+function bump() returns void
+    delay += 1000ms
+end
+bump()
+bump()
+bool on/off = true
+when off do
+    print "off"
+end
+on = false
+int n = 1
+computed int twice = n * 2
+n = 4
+print twice
+""",
+            "reached 3000ms\noff\n8\n",
+        ),
+        "sleep_quantities": (
+            """import time
+import time.time
+int[time] delay = 2ms
+var start = time.monotonic()
+time.sleep delay
+time.sleep 1ms
+time.sleep 0.001
+time.sleep 0
+time.sleep (delay in s).value
+time.sleep_ms 1
+time.sleep_ms 1ms
+time.delay delay
+print time.monotonic() - start >= 0.009
+""",
+            "true\n",
+        ),
+        "grouped_argument_member": (
+            """var xs = [1, 2]
+xs.push (3 + 4) * 2
+print ("abc").upper(), (1 + 2) * 3
+print ([1, 2, 3])[1]
+print xs
+""",
+            "ABC 9\n2\n[1, 2, 14]\n",
+        ),
+        "import_repeated": ("import math\nimport math\nprint math.floor(2.5)\n", "2\n"),
     }
 )
 NEGATIVE.update(
@@ -2664,12 +2714,20 @@ NEGATIVE.update(
         "alias_not_bool": ("int on/off = 3\n", "negated aliases (name/negated) are only for bool"),
         "alias_var": ("var on/off = true\n", "negated aliases need the bool type"),
         "alias_compound": ("bool a/b = true\nb += 1\n", "assign it with ="),
-        "when_not_reactive": ("bool x = true\nwhen x do\n    print 1\nend\n", "must read a reactive"),
+        "when_parameter": (
+            "function f(int x) returns void\n    when x > 1 do\n        print 1\n    end\nend\n",
+            "parameters and loop variables are not watched",
+        ),
+        "sleep_not_number": ('import time\ntime.sleep "1"\n', "time.sleep expects seconds or a time quantity"),
+        "sleep_wrong_unit": (
+            "unitns length\nunit length.m = 1\nimport time\ntime.sleep 5m\n",
+            "expects seconds or a time quantity, not int[length]",
+        ),
         "computed_assign": (
             "reactive int a = 1\ncomputed int b = a * 2\nb = 5\n",
             "cannot assign to computed value 'b'",
         ),
-        "computed_constant": ("computed int c = 5\n", "a computed value must read a reactive"),
+        "computed_constant": ("computed int c = 5\n", "a computed value must read a variable"),
         "reactive_const": ("reactive const int c = 5\n", "cannot be const"),
         "units_namespaces": (
             UNITS_PRELUDE + "print 1m + 1s\n",

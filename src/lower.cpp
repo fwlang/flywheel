@@ -8,6 +8,8 @@
 //                                  condition becomes true (and re-arms when it becomes false)
 //   bool enabled/disabled = true   `disabled` reads `not enabled`; `disabled = x` assigns
 //                                  `enabled = not x`
+//   int n = 0; when n > 3 do       a plain variable that a `when` or `computed` reads becomes
+//                                  reactive, as if declared `reactive int n = 0`
 //
 // Names resolve lexically (functions see top-level declarations; locals, parameters, loop
 // variables, and catch bindings shadow them), so the lowering agrees with the compiler's scopes.
@@ -70,6 +72,44 @@ const char *watcherType = "array<function() returns void>";
 class Lowerer {
     std::vector<std::map<std::string, Binding>> scopes;
     int counter = 0;
+    // Names that a `when` condition or `computed` expression reads. A plain variable with one of
+    // these names is made reactive, so `when delay == 10s do` works on `int[time] delay`.
+    std::set<std::string> watched;
+
+    void reads(Expr &e) {
+        if (e.kind == "name")
+            watched.insert(e.text);
+        for (auto &a : e.args)
+            if (a)
+                reads(*a);
+    }
+    void collect(std::vector<SP> &body) {
+        for (auto &s : body) {
+            if (s->kind == "when" && s->expr)
+                reads(*s->expr);
+            if (s->kind == "declare" && s->op == "computed" && s->expr)
+                reads(*s->expr);
+            if (s->expr)
+                collectLambdas(*s->expr);
+            if (s->target)
+                collectLambdas(*s->target);
+            collect(s->body);
+            collect(s->other);
+            collect(s->finalizer);
+            for (auto &c : s->catches)
+                collect(c);
+        }
+    }
+    void collectLambdas(Expr &e) {
+        for (auto &a : e.args)
+            if (a)
+                collectLambdas(*a);
+        if (e.lambda)
+            collect(e.lambda->body);
+    }
+    bool promoted(const Stmt &s) const {
+        return s.op != "const" && (watched.count(s.name) || (!s.alias.empty() && watched.count(s.alias)));
+    }
 
     Binding *find(const std::string &name) {
         for (auto i = scopes.rbegin(); i != scopes.rend(); ++i)
@@ -159,8 +199,8 @@ class Lowerer {
         std::vector<std::string> deps;
         dependencies(e, deps);
         if (deps.empty())
-            throw Error(loc, what + " must read a reactive or computed variable, such as "
-                                    "`reactive bool alive = true`");
+            throw Error(loc, what + " must read a variable, such as `alive` in `when alive do`; "
+                                    "parameters and loop variables are not watched");
         return deps;
     }
 
@@ -202,8 +242,8 @@ class Lowerer {
                     i = at - 1;
                     continue;
                 }
-                bool reactive = s.op == "reactive";
-                if (reactive)
+                bool reactive = s.op == "reactive" || promoted(s);
+                if (s.op == "reactive")
                     s.op = "var";
                 bind(s.name, {reactive ? Binding::Reactive : Binding::Plain, ""});
                 if (!s.alias.empty())
@@ -383,9 +423,15 @@ class Lowerer {
         }
         if (!any)
             return;
+        collect(p.body);
+        for (auto &f : p.functions)
+            collect(f.body);
+        for (auto &c : p.classes)
+            for (auto &m : c.methods)
+                collect(m.body);
         for (auto &s : p.body)
             if (s->kind == "declare") {
-                top[s->name] = {s->op == "reactive"   ? Binding::Reactive
+                top[s->name] = {s->op == "reactive" || promoted(*s) ? Binding::Reactive
                                 : s->op == "computed" ? Binding::Computed
                                                       : Binding::Plain,
                                 ""};

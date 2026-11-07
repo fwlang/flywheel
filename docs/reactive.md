@@ -34,7 +34,8 @@ A `when` behaves like this:
 
 Details:
 
-- **Dependency tracking:** dependencies are found automatically from the reactive and computed variables that the condition names. The condition must name at least one. Variables read only inside functions that the condition calls are not tracked.
+- **Dependency tracking:** dependencies are found automatically from the variables that the condition names. A plain variable that a `when` condition or `computed` expression names becomes reactive, so `int[time] delay = 1s` followed by `when delay == 10s do` works without writing `reactive`. The condition must name at least one variable; parameters, loop variables, and constants are not watched. Variables read only inside functions that the condition calls are not tracked.
+- **`reactive` keeps its initial value:** `reactive bool done = count == 10` evaluates `count == 10` once, at the declaration. Use `computed bool done = count == 10` (or `when count == 10 do`) to follow `count`.
 - **Synchronous evaluation:** checks run during the assignment that changes a dependency, before the next statement. Every change is seen; there is no batching.
   - A `when` whose body assigns its own dependencies does not re-run itself while its condition stays true.
 - **Computed values update eagerly:** they are recomputed as soon as a dependency changes, so reading one is an ordinary variable read.

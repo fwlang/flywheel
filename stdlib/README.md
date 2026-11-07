@@ -84,14 +84,14 @@ Paths are UTF-8 strings and are returned with `/` separators. Failures raise `Fi
 | Function | Behavior |
 |---|---|
 | `monotonic()` | seconds from a steady clock, for measuring durations |
-| `sleep(seconds)` | pause the calling thread |
+| `sleep(seconds)` | pause the calling thread; takes a number of seconds or a time quantity (`time.sleep 500ms`, `time.sleep delay`), converted to seconds |
 | `now()` | wall-clock seconds since the Unix epoch |
 | `format(seconds, pattern = "%Y-%m-%dT%H:%M:%SZ")` | UTC text using `strftime` patterns |
 | `format_local(seconds, pattern = "%Y-%m-%d %H:%M:%S")` | local-time text |
 | `parse(text, pattern = "%Y-%m-%dT%H:%M:%SZ")` | seconds, reading the text as UTC |
 | `date(seconds)`, `local_date(seconds)` | a `time.datetime` with `year`, `month`, `day`, `hour`, `minute`, `second`, `weekday` (0 = Sunday), `yearday` |
 | `from_date(year, month, day, hour = 0, minute = 0, second = 0.0)` | seconds for a UTC calendar time |
-| `delay(seconds)`, `sleep_ms(milliseconds)` | pause the calling thread (`delay` is `sleep`) |
+| `delay(seconds)`, `sleep_ms(milliseconds)` | pause the calling thread (`delay` is `sleep`); a time quantity keeps its own unit |
 | `millis()` | integer milliseconds from the steady clock |
 | `elapsed(start)` | seconds since `start`, a `monotonic()` reading |
 | `unix()` | integer seconds since the Unix epoch |

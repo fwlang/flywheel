@@ -112,6 +112,8 @@ print 72km / 10metric_speed.mps  # 7200s
 | `metric` | `length`: `nm`, `um`, `mm`, `cm`, `dm`, `m`, `km` · `area`: `mm2`, `cm2`, `m2`, `ha`, `km2` · `volume`: `ml`, `cm3`, `cl`, `dl`, `l`, `dm3`, `m3` · `weight`: `mg`, `g`, `kg`, `t` · `speed`: `mps`, `kmph` |
 | `imperial` | `length`: `inch`, `ft`, `yd`, `ch`, `fur`, `mi` · `area`: `sqin`, `sqft`, `sqyd`, `acre`, `sqmi` · `volume`: `floz`, `gi`, `pt`, `qt`, `gal`, `cuin`, `cuft` · `weight`: `oz`, `lb`, `st`, `cwt`, `ton` · `speed`: `fps`, `mph` |
 
+- **`import time.time`:** names the `time` namespace inside the `time` module. It is the same import as `import time`, so writing both is allowed.
+- **Sleeping:** `time.sleep` takes a time quantity as well as a number of seconds: `time.sleep 500ms` and `time.sleep delay` (an `int[time]`) convert to seconds.
 - **Relations:** `metric` and `imperial` relate length × length = area, area × length = volume, and length / time = speed (they import `time`), so `3m * 4m` is `12m2`, `100m / 10s` is `10mps`, and `60mi / 1h in mph` is `60mph`.
 - **Imperial measures:** `imperial` uses British imperial measures: a pint is 20 fluid ounces, a gallon 160, and a ton is the long ton (2240 lb). `in` is a keyword, so inches are `inch`.
 - **Between the systems:** `imperial` imports `metric` and relates each of its namespaces to the metric one (`unitconv 1length.ft = 0.3048metric.length.m`), so with both imported `1m + 1ft` is `1.3048m`, `1ft + 1m` is `4.28083989501312ft`, `1m > 1ft` is `true`, and `5ft in cm` is `152.4cm`.

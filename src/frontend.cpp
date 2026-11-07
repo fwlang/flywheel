@@ -1280,14 +1280,22 @@ EP Parser::outer() {
         return (peek(n).text == "-" || peek(n).text == "+") && peek(n).spaced &&
                !peek(n + 1).spaced;
     };
-    // `print (1+2)*3` passes `(1+2)*3`: a spaced '(' whose group is followed by a binary operator
-    // opens the argument rather than an argument list. `print (a, b)` and `print(1+2)*3` are calls.
+    // The callee: a name, or a dotted path written without spaces (`time.sleep`, `obj.run`).
+    size_t width = 1;
+    if (peek().kind == "id")
+        while (peek(width).text == "." && !peek(width).spaced && peek(width + 1).kind == "id" &&
+               !peek(width + 1).spaced)
+            width += 2;
+    // `print (1+2)*3` passes `(1+2)*3`: a spaced '(' whose group is followed by a binary operator,
+    // or by `.` or `[` written against it, opens the argument rather than an argument list, so
+    // `time.sleep (delay in s).value` passes `(delay in s).value`. `print (a, b)` and
+    // `print(1+2)*3` are calls.
     auto groupedOperand = [&] {
-        if (peek(1).text != "(" || !peek(1).spaced || peek(1).kind == "string" ||
-            peek(1).kind == "markup")
+        if (peek(width).text != "(" || !peek(width).spaced || peek(width).kind == "string" ||
+            peek(width).kind == "markup")
             return false;
         int depth = 0;
-        for (size_t n = 1;; ++n) {
+        for (size_t n = width;; ++n) {
             const auto &t = peek(n);
             if (t.kind == "eof")
                 return false;
@@ -1297,13 +1305,26 @@ EP Parser::outer() {
                 ++depth;
             else if ((t.text == ")" || t.text == "]" || t.text == "}") && --depth == 0) {
                 const auto &next = peek(n + 1);
+                if ((next.text == "." || next.text == "[") && !next.spaced)
+                    return true;
                 return (next.kind == "op" || next.kind == "id") && precedence(next.text) > 0;
             }
         }
     };
-    bool grouped = callable && groupedOperand();
-    if (callable && (attachedSign(1) || peek(1).text == "not" || grouped ||
-                     (peek(1).text == "[" && peek(1).spaced))) {
+    bool grouped = (callable || width > 1) && groupedOperand();
+    if (grouped && width > 1) {
+        auto t = take();
+        e = node("name", t.text, t.loc);
+        while (peek().text == "." && !peek().spaced && width > 1) {
+            take();
+            auto field = take();
+            auto m = node("member", field.text, field.loc);
+            m->args.push_back(std::move(e));
+            e = std::move(m);
+            width -= 2;
+        }
+    } else if (callable && (attachedSign(1) || peek(1).text == "not" || grouped ||
+                            (peek(1).text == "[" && peek(1).spaced))) {
         auto t = take();
         e = node("name", t.text, t.loc);
     } else
@@ -1923,12 +1944,21 @@ Program Parser::parse() {
                 p.html = true;
             if (wildcard && name == "svg")
                 p.svg = true;
-            if (p.imports.count(alias))
-                throw Error(peek().loc, "duplicate import '" + alias + "'");
-            p.imports[alias] = name;
-            p.importOrder.push_back(alias);
-            p.importLocations[alias] = tokens[pos - 1].loc;
-            finish();
+            // `import time.time` names the time unit namespace, which `import time` brings.
+            if (!path && name == "time.time")
+                name = "time";
+            // Importing the same module under the same name again changes nothing.
+            if (p.imports.count(alias) && p.imports.at(alias) == name && !path &&
+                p.wildcards.count(alias) == static_cast<size_t>(wildcard)) {
+                finish();
+            } else {
+                if (p.imports.count(alias))
+                    throw Error(peek().loc, "duplicate import '" + alias + "'");
+                p.imports[alias] = name;
+                p.importOrder.push_back(alias);
+                p.importLocations[alias] = tokens[pos - 1].loc;
+                finish();
+            }
         } else if (peek().text == "function" && peek(1).text != "(")
             p.functions.push_back(function());
         else if (accept("enum")) {

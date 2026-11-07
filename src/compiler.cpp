@@ -418,6 +418,21 @@ class Compiler {
             return callNamedMethod(real(like), from_, {real(from)});
         return std::nullopt;
     }
+    // A duration in seconds for time.sleep and friends: any number, or a time quantity
+    // (`500ms`, `delay`), converted to seconds.
+    llvm::Value *seconds(Val v, const std::string &function) {
+        if (auto q = quantity(v.t)) {
+            if (q->ns->name == "time")
+                if (auto s = unitIndex(*q->ns, "s"))
+                    return callNamedMethod(v, "__fwu_real",
+                                           {Val{i64(static_cast<int64_t>(*s)), Ty{"i64"}}})
+                        .v;
+            error(function + " expects seconds or a time quantity, not " + displayName(v.t.name));
+        }
+        if (!v.t.numeric())
+            error(function + " expects seconds or a time quantity, not " + displayName(v.t.name));
+        return convert(v, Ty{"double"}, true).v;
+    }
     // A float quantity of zero in unit `index` of `ns`, to name a target unit.
     Val unitTemplate(UnitNamespace &ns, size_t index, Location loc) {
         Expr construct;
@@ -4740,7 +4755,7 @@ Val Compiler::invoke(Expr &e, Ty expected) {
     }
     if (name == "time.sleep") {
         count(1);
-        call("fw_sleep", b.getVoidTy(), {real(0)});
+        call("fw_sleep", b.getVoidTy(), {seconds(args[0], name)});
         return {};
     }
     if (auto result = mathCall(name, args))
@@ -5681,10 +5696,12 @@ std::optional<Val> Compiler::stdlibCall(const std::string &name, std::vector<Val
     if (module == "time") {
         if (function == "delay" || function == "sleep_ms") {
             arity(1, 1);
-            auto seconds = real(0);
-            if (function == "sleep_ms")
-                seconds = b.CreateFDiv(seconds, llvm::ConstantFP::get(b.getDoubleTy(), 1000.0));
-            call("fw_sleep", b.getVoidTy(), {seconds});
+            // A time quantity already says its unit; plain numbers are seconds or milliseconds.
+            bool quantity_ = quantity(args[0].t).has_value();
+            auto duration = seconds(args[0], "time." + function);
+            if (function == "sleep_ms" && !quantity_)
+                duration = b.CreateFDiv(duration, llvm::ConstantFP::get(b.getDoubleTy(), 1000.0));
+            call("fw_sleep", b.getVoidTy(), {duration});
             return Val{};
         }
         if (function == "millis") {
