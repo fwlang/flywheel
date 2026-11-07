@@ -167,6 +167,8 @@ std::string format(const std::string &source) {
             stack.push_back({"block", depth});
         else if (keyword == "if" && line.back()->text == "then")
             stack.push_back({"block", depth});
+        else if (keyword == "when" && line.size() > first + 1 && line.back()->text == "do")
+            stack.push_back({"block", depth}); // `when condition do` ... `end`
         else if (keyword == "defer" && first + 1 == line.size())
             stack.push_back({"block", depth}); // `defer` alone opens a block ending in `end`
         int lambdaDepth = 0;

@@ -2421,6 +2421,244 @@ NEGATIVE.update(
 )
 
 
+UNITS_PRELUDE = """unitns time for int, float
+unit time.s = 1
+unit time.min = 60
+unit time.h = 3600
+unitns metric_length for int, float
+unit metric_length.cm = 0.01
+unit metric_length.m = 1
+unit metric_length.km = 1000
+unitns metric_speed for int, float
+unit metric_speed.mps = 1
+unit metric_speed.kmph = 0.2777777777777778
+unitconv 1metric_length.m / 1time.s = 1metric_speed.mps
+"""
+POSITIVE.update(
+    {
+        "error_declarations": (
+            """error BadInput
+error HttpFailure(int status)
+function check(int x) returns int
+    if x < 0 then
+        throw BadInput with "x must not be negative, got {x}"
+    end
+    return x
+end
+try
+    check(-3)
+catch BadInput e
+    print "bad:", e.message
+end
+try
+    throw HttpFailure(503) with "upstream down"
+catch HttpFailure e
+    print e.status, e.message
+end
+try
+    throw "Timeout" with "took too long"
+catch "Timeout" e
+    print e.name, e.message
+end
+try
+    throw ValueError with "nope"
+catch ValueError e
+    print "value:", e.message
+end
+try
+    throw BadInput with "any"
+catch e
+    print e.name, e.message
+end
+try
+    throw BadInput
+catch "BadInput" e
+    print "[{e.message}]"
+end
+class Custom
+    int code
+    string message = "default"
+end
+try
+    throw Custom(7) with "custom"
+catch Custom c
+    print c.code, c.message
+end""",
+            "bad: x must not be negative, got -3\n503 upstream down\nTimeout took too long\n"
+            "value: nope\nBadInput any\n[]\n7 custom\n",
+        ),
+        "negated_aliases": (
+            """bool enabled/disabled = true
+print enabled, disabled
+disabled = true
+print enabled, disabled
+enabled = true
+print "{disabled}", not disabled
+function flip() returns void
+    disabled = not disabled
+end
+flip()
+print enabled
+var check = function() returns bool => disabled
+print check()
+if disabled then
+    print "off"
+end""",
+            "true false\nfalse true\nfalse true\nfalse\ntrue\noff\n",
+        ),
+        "reactive_when_computed": (
+            """reactive bool playerAlive/playerDead = true
+when playerDead do
+    print "Game over!"
+end
+print "playing"
+playerAlive = false
+playerDead = true
+playerAlive = true
+playerDead = true
+reactive int score = 5
+when score > 3 do
+    print "already", score
+end
+computed bool winning = score >= 10
+when winning do
+    print "winning at", score
+end
+function add(int n) returns void
+    score += n
+end
+add(4)
+add(2)
+score = 0
+score = 12
+print winning
+function local(int target) returns void
+    reactive int x = 0
+    when x == target do
+        print "hit", x
+    end
+    for i in [1, 2, 3] do
+        x = i
+    end
+end
+local(2)
+local(3)
+reactive string name = "a"
+computed string shout = name.upper() + "!"
+computed int size = shout.length
+when size > 3 do
+    print shout
+end
+name = "abc"
+var rename = function(string s) returns void
+    name = s
+end
+rename("z")
+print shout, size""",
+            "playing\nGame over!\nGame over!\nalready 5\nwinning at 11\nalready 12\nwinning at 12\ntrue\n"
+            "hit 2\nhit 3\nABC!\nZ! 2\n",
+        ),
+        "units": (
+            UNITS_PRELUDE
+            + """int[metric_length] length = 100m
+float[metric_length] distance = 0.32km
+print length, distance in cm
+int[time] duration = 15s
+print type(duration), unit(duration), unitns(duration), duration in time.min
+int[metric_length] a = 100m
+int[metric_length] b = 2km
+print a + b, a < b, b - a, a == 10000cm, a != 1m, a >= b
+print length in cm, 1cm in metric_length.m
+print -a, a * 3, 3 * a, a // 3, a / 4, a / b
+var speed = 100m / 10s
+print speed, speed in kmph, type(speed), unitns(speed)
+print 36km / 1h in kmph, speed * 2s, 72km / 10metric_speed.mps
+float[time] t = 15s
+print t, t + 1.5min, type(t)
+int[metric_length][] lengths = [1m, 50cm, 2km]
+print lengths, lengths[1] + lengths[0], length.value, 15s.value
+function twice(int[metric_length] x) returns int[metric_length]
+    return x * 2
+end
+print twice(5km)
+set<int[metric_length]> s = {100cm, 1m, 2m}
+print s.length
+int[time] total = 0s
+total += 1min
+total += 30s
+print total, total in time.min
+reactive int[time] elapsed = 0s
+when elapsed >= 2min do
+    print "two minutes at", elapsed
+end
+elapsed += 90s
+elapsed += 30s
+print type(5), type("x")""",
+            "100m 32000cm\nint s time 0.25min\n2100m true 1900m true true false\n"
+            "10000cm 0.01m\n-100m 300m 300m 33m 25m 0.05\n10mps 36kmph float metric_speed\n"
+            "36kmph 20m 7200s\n15s 105s float\n[1m, 50cm, 2km] 150cm 100 15\n10km\n2\n90s 1.5min\n"
+            "two minutes at 120s\nint string\n",
+        ),
+    }
+)
+NEGATIVE.update(
+    {
+        "throw_with_no_message_field": (
+            "class Plain\n    int x = 0\nend\nthrow Plain(1) with \"m\"\n",
+            "needs an error type with a message field",
+        ),
+        "throw_with_no_message": ('error E\nthrow E with\n', "'with' expects a message"),
+        "error_message_field": ("error E(string message)\n", "already have a message field"),
+        "alias_not_bool": ("int on/off = 3\n", "negated aliases (name/negated) are only for bool"),
+        "alias_var": ("var on/off = true\n", "negated aliases need the bool type"),
+        "alias_compound": ("bool a/b = true\nb += 1\n", "assign it with ="),
+        "when_not_reactive": ("bool x = true\nwhen x do\n    print 1\nend\n", "must read a reactive"),
+        "computed_assign": (
+            "reactive int a = 1\ncomputed int b = a * 2\nb = 5\n",
+            "cannot assign to computed value 'b'",
+        ),
+        "computed_constant": ("computed int c = 5\n", "a computed value must read a reactive"),
+        "reactive_const": ("reactive const int c = 5\n", "cannot be const"),
+        "units_namespaces": (
+            UNITS_PRELUDE + "print 1m + 1s\n",
+            "cannot use + on int[metric_length] and int[time]",
+        ),
+        "units_plain_number": (UNITS_PRELUDE + "int[time] t = 5\n", "give the number a unit"),
+        "units_to_number": (UNITS_PRELUDE + "int x = 5s\n", "use .value for the number"),
+        "units_add_number": (UNITS_PRELUDE + "print 5s + 1\n", "give the number a unit"),
+        "units_unknown": ("print 5px\n", "unknown unit 'px'"),
+        "units_no_unitconv": (UNITS_PRELUDE + "print 1s * 1s\n", "no unitconv relates time * time"),
+        "units_wrong_unit": (UNITS_PRELUDE + "print 5m in s\n", "s is a unit of time"),
+        "units_float_kind": (
+            "unitns n for int\nunit n.a = 1\nfloat[n] x = 1.5a\n",
+            "does not allow float values",
+        ),
+        "units_unknown_namespace": ("int[nowhere] x = 0\n", "unknown unit namespace 'nowhere'"),
+        "units_duplicate_unit": (
+            "unitns n for int\nunit n.a = 1\nunit n.a = 2\n",
+            "duplicate unit 'n.a'",
+        ),
+        "units_bad_factor": ("unitns n for int\nunit n.a = 0\n", "factor must be a positive number"),
+        "units_ambiguous": (
+            "unitns a for int\nunit a.m = 1\nunitns b for int\nunit b.m = 1\nprint 5m\n",
+            "unit 'm' is ambiguous",
+        ),
+    }
+)
+TRAPS.update(
+    {
+        "declared_error_uncaught": (
+            "error HttpFailure(int status)\nthrow HttpFailure(500) with \"fatal\"\n",
+            "HttpFailure: fatal",
+        ),
+        "units_inexact_int": (
+            "unitns len for int, float\nunit len.m = 1\nunit len.ft = 0.3048\nprint 1m + 1ft\n",
+            "is not a whole number of ft",
+        ),
+    }
+)
+
+
 class CompilerTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="flywheel-test-")
@@ -2647,6 +2885,29 @@ class CompilerTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unexpected keyword 'function'", result.stderr)
         self.assertNotIn("nested calls", result.stderr)
+
+    def test_catch_name_warnings(self):
+        self.source.write_text(
+            'error BadInput\ntry\n    throw "EmptyKey" "x"\ncatch "EmptyKye" e\n    print 1\n'
+            'catch "badinput" e\n    print 2\ncatch "EmptyKey" e\n    print 3\ncatch "ValueError" e\n'
+            "    print 4\nend\n",
+            encoding="utf-8",
+        )
+        result = self.command("run", self.source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "3\n")
+        self.assertIn('warning: catch "EmptyKye" never matches', result.stderr)
+        self.assertIn('did you mean "EmptyKey"?', result.stderr)
+        self.assertIn('did you mean "BadInput"?', result.stderr)
+        self.assertEqual(result.stderr.count("warning:"), 2)
+        # A name computed at run time could be anything, so there is nothing to warn about.
+        self.source.write_text(
+            'var n = "A"\ntry\n    throw n "x"\ncatch "B" e\n    print 1\ncatch e\n    print 2\nend\n',
+            encoding="utf-8",
+        )
+        result = self.command("run", self.source)
+        self.assertEqual(result.stdout, "2\n")
+        self.assertNotIn("warning:", result.stderr)
 
     def test_runtime_errors(self):
         for name, (source, message) in TRAPS.items():

@@ -35,10 +35,13 @@ struct Expr {
 using EP = std::unique_ptr<Expr>;
 struct Stmt {
     std::string kind, name, type, op;
+    // declare: the negated alias of a bool (`bool enabled/disabled = true` names `disabled`).
+    std::string alias;
     Location loc;
     EP expr, target;
     std::vector<std::unique_ptr<Stmt>> body, other, finalizer;
     std::vector<std::string> catchTypes, catchNames;
+    std::vector<Location> catchLocations; // try: where each catch clause starts
     std::vector<std::vector<std::unique_ptr<Stmt>>> catches;
     // match: catches holds case bodies; each case has value patterns, or a type pattern in
     // catchTypes with an optional binding in catchNames, and an optional guard.
@@ -137,6 +140,23 @@ std::string contentHash(const std::string &text);
 std::string fileUrlPath(const std::string &url);
 // Stores `contents` in the download cache under the URL's file name and returns the local path.
 std::string cacheDownload(const std::string &url, const std::string &contents);
+// A unit namespace (`unitns time for int, float`) and its units (`unit time.s = 1`). Quantity
+// values such as `15s` are instances of hidden classes, one per numeric kind (src/units.cpp).
+struct UnitNamespace {
+    std::string name;
+    Location loc;
+    bool integer = false, real = false;
+    std::string realSpelling = "float";     // how type() names the floating-point kind
+    std::vector<std::string> units, factors; // in declaration order; factors as written
+    std::vector<Location> unitLocations;
+    std::string intClass, realClass; // hidden class names; empty when the kind is not allowed
+};
+// `unitconv 1metric_length.m / 1time.s = 1metric_speed.mps`: relates three namespaces.
+struct UnitConversion {
+    Location loc;
+    std::string op; // "*" or "/"
+    std::string amounts[3], namespaces[3], units[3];
+};
 struct Program {
     std::vector<Function> functions;
     std::vector<Class> classes;
@@ -153,6 +173,8 @@ struct Program {
     std::map<std::string, Location> importLocations;
     bool html = false;
     std::set<std::string> wildcards, privateNames;
+    std::vector<UnitNamespace> unitNamespaces;
+    std::vector<UnitConversion> unitConversions; // consumed by lowerUnits
 };
 class Parser {
     std::vector<Token> tokens;
@@ -167,6 +189,7 @@ class Parser {
     void newlines();
     void finish();
     bool typedDeclaration();
+    bool aliasDeclaration(); // `bool name/negated = ...`
     std::string type();
     std::vector<std::string> typeParameters(std::map<std::string, std::string> *bounds = nullptr);
     std::string typeArguments(bool allowSpace = false);
@@ -191,6 +214,11 @@ class Parser {
     Program parse();
 };
 Program loadProgram(const std::string &filename);
+// Lowers reactive variables (`reactive`, `computed`, `when`) and negated bool aliases into
+// ordinary declarations, closures, and watcher lists (src/lower.cpp). Parser::parse runs it.
+void lowerReactive(Program &program);
+// Unit namespaces (`unitns`, `unit`, `unitconv`) become hidden quantity classes (src/units.cpp).
+void lowerUnits(Program &program);
 EP clone(const Expr &e);
 SP clone(const Stmt &s);
 Function clone(const Function &f);
@@ -210,6 +238,9 @@ struct Options {
     std::string *objectData = nullptr; // receives the object file in memory when set
     // The compiler executable, which the `flywheel` module runs (flywheel.run and friends).
     std::string compilerPath;
+    // Receives warnings (such as a `catch "Name"` that nothing throws) when set; otherwise
+    // they are printed to stderr as file:line:column: warning: message.
+    std::vector<Error> *warnings = nullptr;
 };
 void compile(Program &program, const std::string &filename, const Options &options);
 // Re-indents source by block structure (4 spaces), keeping multi-line tokens unchanged.

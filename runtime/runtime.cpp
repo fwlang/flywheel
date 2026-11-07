@@ -2054,6 +2054,42 @@ void fw_collection_clear(Object *p) {
 }
 }
 
+namespace {
+// The message of a thrown value: the string `message` field of an instance (error types
+// declared with `error Name`, or classes with such a field), else the value's own text.
+// `found` reports whether the value has a message at all.
+std::string thrownText(Object *value, bool *found = nullptr) {
+    if (found)
+        *found = true;
+    if (value && value->kind == Object::Instance) {
+        for (size_t i = 0; i < value->fieldNames.size() && i < value->slots.size(); ++i)
+            if (value->fieldNames[i] == "message" && value->slots[i].object &&
+                value->slots[i].object->kind == Object::String)
+                return value->slots[i].object->text;
+        if (found)
+            *found = false;
+    }
+    return value ? value->text : "";
+}
+// An error type as written in source: module prefixes ($m0$) are dropped.
+std::string shownErrorType(const std::string &type) {
+    std::string out;
+    for (size_t i = 0; i < type.size();) {
+        if (type.compare(i, 2, "$m") == 0) {
+            size_t p = i + 2;
+            while (p < type.size() && type[p] >= '0' && type[p] <= '9')
+                ++p;
+            if (p > i + 2 && p < type.size() && type[p] == '$') {
+                i = p + 1;
+                continue;
+            }
+        }
+        out += type[i++];
+    }
+    return out;
+}
+} // namespace
+
 extern "C" {
 int64_t fw_error_pending() {
     return errorPending;
@@ -2070,9 +2106,13 @@ void fw_throw(const char *type, Object *value) {
 }
 void fw_error_report() {
     if (pendingError.value) {
-        std::cerr << "Flywheel runtime error: " << pendingError.type << ": "
-                  << (pendingError.value->text.empty() ? "exception" : pendingError.value->text)
-                  << '\n';
+        bool hasMessage = true;
+        auto text = thrownText(pendingError.value, &hasMessage);
+        std::cerr << "Flywheel runtime error: " << shownErrorType(pendingError.type);
+        if (hasMessage && pendingError.value->kind == Object::Instance && text.empty())
+            std::cerr << '\n'; // `error Name` thrown without a message
+        else
+            std::cerr << ": " << (text.empty() ? "exception" : text) << '\n';
         pendingError.clear();
     }
 }
@@ -2085,9 +2125,13 @@ Object *fw_error_value(Frame *frame) {
 Object *fw_error_take(Frame *frame) {
     auto p = new Object(Object::ErrorValue);
     p->errorType = pendingError.type;
-    p->text = pendingError.value && !pendingError.value->text.empty()
-                  ? pendingError.value->text
-                  : "exception of type " + pendingError.type;
+    bool hasMessage = true;
+    auto text = thrownText(pendingError.value, &hasMessage);
+    // An instance with a message field keeps it even when empty (`throw BadInput`).
+    bool field = hasMessage && pendingError.value && pendingError.value->kind == Object::Instance;
+    p->text = pendingError.value && (!text.empty() || field)
+                  ? text
+                  : "exception of type " + shownErrorType(pendingError.type);
     p->slots.emplace_back();
     p->slots[0].object = pendingError.value;
     p->slots[0].kind = Slot::Reference;

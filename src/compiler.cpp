@@ -3,6 +3,7 @@
 #include <cctype>
 #include <cmath>
 #include <limits>
+#include <iostream>
 #include <llvm/Config/llvm-config.h>
 #include <llvm/BinaryFormat/Dwarf.h>
 #include <llvm/IR/DIBuilder.h>
@@ -81,6 +82,20 @@ std::string displayName(const std::string &text) {
         if (end < result.size() && (result[end] == '[' || result[end] == '?'))
             spelled = "(" + spelled + ")";
         result.replace(at, end - at, spelled);
+    }
+    // Quantity classes (src/units.cpp) are spelled int[time] and float[time].
+    for (auto at = result.find("__fwu_"); at != std::string::npos; at = result.find("__fwu_", at + 1)) {
+        size_t end = at + 6;
+        while (end < result.size() && word(result[end]))
+            ++end;
+        auto inner = result.substr(at + 6, end - at - 6);
+        auto split = inner.rfind("__");
+        if (split == std::string::npos || split == 0)
+            continue;
+        auto kind = inner.substr(split + 2);
+        if (kind != "int" && kind != "double")
+            continue;
+        result.replace(at, end - at, (kind == "int" ? "int[" : "float[") + inner.substr(0, split) + "]");
     }
     return result;
 }
@@ -271,6 +286,296 @@ class Compiler {
     // Coverage: one counter per executed source line, keyed (file, line).
     bool coverage = false, race = false;
     std::map<std::pair<std::string, int>, llvm::GlobalVariable *> coverageCounters;
+    // Warnings go to Options::warnings, or to stderr.
+    std::vector<Error> *warningSink = nullptr;
+    std::set<std::pair<std::string, std::pair<int, int>>> warned;
+    void warn(Location loc, const std::string &message) {
+        if (loc.file.empty())
+            loc.file = mainFileName;
+        if (!warned.insert({loc.file, {loc.line, loc.column}}).second)
+            return;
+        if (warningSink)
+            warningSink->push_back(Error(loc, message));
+        else
+            std::cerr << loc.file << ':' << loc.line << ':' << loc.column << ": warning: " << message
+                      << '\n';
+    }
+    std::string mainFileName;
+    // Quantities: instances of a unit namespace's hidden classes (src/units.cpp).
+    struct Quantity {
+        UnitNamespace *ns;
+        bool real;
+    };
+    std::optional<Quantity> quantity(const Ty &t) {
+        for (auto &ns : p.unitNamespaces) {
+            if (!ns.intClass.empty() && t.name == ns.intClass)
+                return Quantity{&ns, false};
+            if (!ns.realClass.empty() && t.name == ns.realClass)
+                return Quantity{&ns, true};
+        }
+        return std::nullopt;
+    }
+    static std::optional<size_t> unitIndex(const UnitNamespace &ns, const std::string &unit) {
+        auto it = std::find(ns.units.begin(), ns.units.end(), unit);
+        if (it == ns.units.end())
+            return std::nullopt;
+        return static_cast<size_t>(it - ns.units.begin());
+    }
+    // The namespace a name refers to in a unit context (`time` in time.s); imports of a module
+    // with the same name do not hide it.
+    UnitNamespace *unitNamespace(const std::string &name) {
+        for (auto &ns : p.unitNamespaces)
+            if (ns.name == name || (p.imports.count(name) && p.imports.at(name) == ns.name))
+                return &ns;
+        return nullptr;
+    }
+    // 100m, 0.32km, 15time.s: the unit's namespace comes from the spelling, the expected type,
+    // or the only namespace that has the unit.
+    Val unitLiteral(Expr &e, Ty expected) {
+        std::string unit = e.text, member;
+        UnitNamespace *ns = nullptr;
+        if (auto dot = unit.find('.'); dot != std::string::npos) {
+            ns = unitNamespace(unit.substr(0, dot));
+            if (ns)
+                unit = unit.substr(dot + 1);
+            else {
+                member = unit.substr(dot + 1); // 15s.value
+                unit = unit.substr(0, dot);
+            }
+            if (ns && !unitIndex(*ns, unit))
+                error("unit namespace '" + ns->name + "' has no unit '" + unit + "'");
+        }
+        auto wanted = quantity(nonNull(expected));
+        if (!ns && wanted && unitIndex(*wanted->ns, unit))
+            ns = wanted->ns;
+        if (!ns) {
+            std::vector<UnitNamespace *> found;
+            for (auto &candidate : p.unitNamespaces)
+                if (unitIndex(candidate, unit))
+                    found.push_back(&candidate);
+            if (found.empty())
+                error(p.unitNamespaces.empty()
+                          ? "unknown unit '" + unit + "' after " + e.args[0]->text +
+                                "; declare units with unitns and unit, such as `unitns length "
+                                "for int, float` and `unit length." + unit + " = 1`"
+                          : "unknown unit '" + unit + "' after " + e.args[0]->text);
+            if (found.size() > 1)
+                error("unit '" + unit + "' is ambiguous: " + found[0]->name + " and " +
+                      found[1]->name + " both have it; write " + e.args[0]->text +
+                      found[0]->name + "." + unit);
+            ns = found[0];
+        }
+        auto &number = *e.args[0];
+        bool real = number.kind == "real" || !ns->integer ||
+                    (wanted && wanted->ns == ns && wanted->real);
+        if (real && !ns->real)
+            error("int[" + ns->name + "] cannot hold " + number.text + "; declare unitns " +
+                  ns->name + " for int, float");
+        Expr construct;
+        construct.kind = "call";
+        construct.loc = e.loc;
+        auto callee = std::make_unique<Expr>();
+        callee->kind = "name";
+        callee->text = real ? ns->realClass : ns->intClass;
+        callee->loc = e.loc;
+        construct.args.push_back(std::move(callee));
+        auto amount = clone(number);
+        if (real && amount->kind == "int") {
+            amount->kind = "real";
+            amount->text += ".0";
+        }
+        construct.args.push_back(std::move(amount));
+        auto index = std::make_unique<Expr>();
+        index->kind = "int";
+        index->text = std::to_string(*unitIndex(*ns, unit));
+        index->loc = e.loc;
+        construct.args.push_back(std::move(index));
+        if (member.empty())
+            return value(construct, expected);
+        Expr access;
+        access.kind = "member";
+        access.text = member;
+        access.loc = e.loc;
+        access.args.push_back(clone(construct));
+        return value(access, expected);
+    }
+    // Arithmetic and comparisons with quantities: same-namespace + - and comparisons convert to
+    // the finer unit; * and / by numbers scale; * and / between namespaces use unitconv.
+    Val unitBinary(const std::string &op, Val a, Val c) {
+        auto qa = quantity(a.t), qc = quantity(c.t);
+        auto both = displayName(a.t.name) + " and " + displayName(c.t.name);
+        auto toReal = [&](Val v) -> Val {
+            auto q = quantity(v.t);
+            if (!q || q->real)
+                return v;
+            if (!q->ns->real)
+                error(op + " with " + displayName(v.t.name) +
+                      " needs floating point; declare unitns " + q->ns->name + " for int, float");
+            return callNamedMethod(v, "__fwu_float", {});
+        };
+        static const std::map<std::string, llvm::CmpInst::Predicate> comparisons = {
+            {"==", llvm::CmpInst::ICMP_EQ},  {"!=", llvm::CmpInst::ICMP_NE},
+            {"<", llvm::CmpInst::ICMP_SLT},  {"<=", llvm::CmpInst::ICMP_SLE},
+            {">", llvm::CmpInst::ICMP_SGT},  {">=", llvm::CmpInst::ICMP_SGE}};
+        if (qa && qc) {
+            if (qa->ns == qc->ns &&
+                (op == "+" || op == "-" || op == "/" || comparisons.count(op))) {
+                if (qa->real != qc->real) {
+                    a = toReal(a);
+                    c = toReal(c);
+                }
+                if (op == "+" || op == "-")
+                    return callNamedMethod(a, op == "+" ? "__fwu_add" : "__fwu_sub", {c});
+                if (op == "/")
+                    return callNamedMethod(a, "__fwu_ratio", {c});
+                auto order = callNamedMethod(a, "__fwu_cmp", {c});
+                return {b.CreateICmp(comparisons.at(op), order.v, i64(0)), Ty{"bool"}};
+            }
+            if (op == "*" || op == "/") {
+                auto method =
+                    std::string("__fwu_") + (op == "*" ? "mul" : "div") + "__" + qc->ns->name;
+                if (!qa->ns->real || !qc->ns->real ||
+                    resolveMethod(qa->ns->realClass, method).empty())
+                    error("no unitconv relates " + qa->ns->name + " " + op + " " + qc->ns->name +
+                          "; declare one, such as unitconv 1" + qa->ns->name + "." +
+                          qa->ns->units[0] + " " + op + " 1" + qc->ns->name + "." +
+                          qc->ns->units[0] + " = 1other.unit");
+                return callNamedMethod(toReal(a), method, {toReal(c)});
+            }
+            if (qa->ns != qc->ns)
+                error("cannot use " + op + " on " + both + ": they are in different unit "
+                      "namespaces");
+            error("operator " + op + " is not defined for quantities; use + - * / and comparisons");
+        }
+        auto q = qa ? qa : qc;
+        Val amount = qa ? a : c, number = qa ? c : a;
+        if (!number.t.numeric())
+            error("cannot use " + op + " on " + both);
+        if (op == "*") {
+            if (!q->real && number.t.integer())
+                return callNamedMethod(amount, "__fwu_scale", {convert(number, Ty{"i64"})});
+            return callNamedMethod(toReal(amount), "__fwu_scale",
+                                   {convert(number, Ty{"double"}, true)});
+        }
+        if (qa && op == "/")
+            return callNamedMethod(toReal(a), "__fwu_divide", {convert(c, Ty{"double"}, true)});
+        if (qa && op == "//") {
+            if (q->real || !number.t.integer())
+                error("// divides an int quantity by an int; use / for " + both);
+            return callNamedMethod(a, "__fwu_floordiv", {convert(c, Ty{"i64"})});
+        }
+        if (op == "+" || op == "-" || comparisons.count(op))
+            error("cannot use " + op + " on " + both + "; give the number a unit, such as " +
+                  (number.t.real() ? "1.5" : "5") + q->ns->units[0]);
+        error("cannot use " + op + " on " + both);
+    }
+    // Error names thrown by `throw "Name" ...` anywhere in the program, for `catch "Name"`
+    // warnings. A name computed at run time makes every catch by name plausible.
+    std::set<std::string> thrownNames;
+    bool dynamicErrorNames = false;
+    static std::optional<std::string> literalText(const Expr &e) {
+        if (e.kind == "string")
+            return e.text;
+        if (e.kind == "interpolate") {
+            std::string out;
+            for (auto &part : e.args)
+                if (!part || part->kind != "string")
+                    return std::nullopt;
+                else
+                    out += part->text;
+            return out;
+        }
+        return std::nullopt;
+    }
+    void collectThrownNames() {
+        std::function<void(std::vector<SP> &)> statements;
+        std::function<void(Expr &)> expression = [&](Expr &e) {
+            for (auto &a : e.args)
+                if (a)
+                    expression(*a);
+            if (e.lambda)
+                statements(e.lambda->body);
+        };
+        statements = [&](std::vector<SP> &list) {
+            for (auto &st : list) {
+                if (st->kind == "throw" && st->target && st->expr) {
+                    auto name = st->expr->kind == "name" || st->expr->kind == "member"
+                                    ? callable(*st->expr)
+                                    : "";
+                    if (auto text = literalText(*st->expr))
+                        thrownNames.insert(*text);
+                    else if (st->expr->kind == "call" ||
+                             (!name.empty() && (classes.count(name) || errorTypes.count(name))))
+                        ; // a typed error
+                    else
+                        dynamicErrorNames = true;
+                }
+                if (st->expr)
+                    expression(*st->expr);
+                if (st->target)
+                    expression(*st->target);
+                for (auto *inner : {&st->body, &st->other, &st->finalizer})
+                    statements(*inner);
+                for (auto &inner : st->catches)
+                    statements(inner);
+            }
+        };
+        statements(p.body);
+        for (auto &f : p.functions)
+            statements(f.body);
+        for (auto &c : p.classes)
+            for (auto &m : c.methods)
+                statements(m.body);
+    }
+    static size_t editDistance(const std::string &a, const std::string &b) {
+        std::vector<size_t> row(b.size() + 1);
+        for (size_t j = 0; j <= b.size(); ++j)
+            row[j] = j;
+        for (size_t i = 1; i <= a.size(); ++i) {
+            size_t diagonal = row[0];
+            row[0] = i;
+            for (size_t j = 1; j <= b.size(); ++j) {
+                size_t above = row[j];
+                row[j] = std::min({row[j] + 1, row[j - 1] + 1,
+                                   diagonal + (std::tolower(static_cast<unsigned char>(a[i - 1])) ==
+                                                       std::tolower(static_cast<unsigned char>(b[j - 1]))
+                                                   ? 0
+                                                   : 1)});
+                diagonal = above;
+            }
+        }
+        return row[b.size()];
+    }
+    // `catch "Name"` that no error in the program can match: warn, suggesting a close name.
+    void checkCatchName(const std::string &name, Location loc) {
+        if (dynamicErrorNames || name == "Error" || errorTypes.count(name) ||
+            thrownNames.count(name))
+            return;
+        std::set<std::string> known(thrownNames.begin(), thrownNames.end());
+        known.insert(errorTypes.begin(), errorTypes.end());
+        for (auto &[className, c] : classes) {
+            (void)c;
+            if (displayName(className) == name)
+                return;
+            known.insert(displayName(className));
+        }
+        std::string best;
+        size_t bestDistance = std::string::npos;
+        for (auto &candidate : known) {
+            if (candidate == "Error")
+                continue;
+            auto d = editDistance(name, candidate);
+            if (d < bestDistance) {
+                bestDistance = d;
+                best = candidate;
+            }
+        }
+        auto message = "catch \"" + name + "\" never matches: nothing in the program throws \"" +
+                       name + "\" or has a class of that name";
+        if (!best.empty() && bestDistance <= std::max<size_t>(1, name.size() / 3))
+            message += "; did you mean \"" + best + "\"?";
+        warn(loc, message);
+    }
     // --race: reports reads and writes of a module global to the race detector.
     void raceGlobal(Var &v, bool write) {
         if (!race || !v.initialized)
@@ -606,6 +911,20 @@ class Compiler {
             classes.count(name) ||
             t.enumeration())
             return t;
+        if (auto at = name.find("__fwu_"); at != std::string::npos) {
+            auto inner = name.substr(at + 6);
+            auto split = inner.rfind("__");
+            auto ns = inner.substr(0, split), kind = inner.substr(split + 2);
+            auto spelled = (kind == "int" ? "int[" : "float[") + ns + "]";
+            for (auto &candidate : p.unitNamespaces)
+                if (candidate.name == ns && (kind == "int" ? !candidate.integer : !candidate.real))
+                    error("unit namespace '" + ns + "' does not allow " +
+                          (kind == "int" ? "int" : "float") + " values; declare unitns " + ns +
+                          " for int, float");
+            error("unknown unit namespace '" + ns + "' in " + spelled +
+                  "; declare it with unitns " + ns + " for int, float (units are local to the "
+                  "module that declares them)");
+        }
         error("unknown or unsupported type '" + name + "'");
     }
     // Runtime slot kind for map keys: 0 signed, 1 unsigned, 3 bool, 4 reference, 5 char.
@@ -783,7 +1102,8 @@ end
             "fw_error_pending", "fw_error_matches", "fw_throw",         "fw_error_report",
             "fw_error_value",   "fw_error_take",    "fw_error_restore", "fw_web_shutdown",
             "fw_class_id",      "fw_enum_register", "fw_register_class", "fw_set_args",
-            "fw_gc_collect",    "fw_gc_pending",    "fw_error_matches_name", "fw_foreign_cstr"};
+            "fw_gc_collect",    "fw_gc_pending",    "fw_error_matches_name", "fw_foreign_cstr",
+            "fw_quantity_register"};
         if (!safe.count(name))
             checkError();
         return resultValue;
@@ -827,6 +1147,21 @@ end
     Val convert(Val x, Ty to, bool explicit_ = false) {
         if (x.t == to)
             return x;
+        if (auto from = quantity(x.t)) {
+            // int[time] widens to float[time]; quantities never become plain numbers implicitly.
+            auto target = quantity(nonNull(to));
+            if (target && target->ns == from->ns && !from->real && target->real)
+                return convert(callNamedMethod(x, "__fwu_float", {}), to, explicit_);
+            if (nonNull(to).numeric())
+                error("cannot convert " + displayName(x.t.name) + " to " + displayName(to.name) +
+                      "; use .value for the number, or `in` to change its unit");
+            if (target && target->ns != from->ns)
+                error("cannot convert " + displayName(x.t.name) + " to " + displayName(to.name) +
+                      ": they are in different unit namespaces");
+        } else if (auto target = quantity(nonNull(to)); target && x.t.numeric())
+            error("cannot convert " + displayName(x.t.name) + " to " + displayName(to.name) +
+                  "; give the number a unit, such as " + (x.t.real() ? "1.5" : "5") +
+                  target->ns->units[0]);
         if (x.t.classReference() && to.function())
             return constructorValue(x.t.name.substr(6), to);
         if (x.t.classReference())
@@ -1388,6 +1723,8 @@ end
         return load(*v);
     }
     Val binary(const std::string &op, Val a, Val c) {
+        if (quantity(a.t) || quantity(c.t))
+            return unitBinary(op, a, c);
         // Operator methods on classes: `function operator +(T other)`. `!=` negates
         // `operator ==`; comparisons missing an operator derive from `operator <`.
         if (classes.count(a.t.name)) {
@@ -2179,6 +2516,7 @@ end
 
   public:
     Compiler(Program &program, const std::string &file) : p(program), module(file, ctx), b(ctx) {
+        mainFileName = file;
         llvm::InitializeNativeTarget();
         llvm::InitializeNativeTargetAsmPrinter();
         auto triple = llvm::sys::getDefaultTargetTriple();
@@ -2346,6 +2684,8 @@ end
         return match;
     }
     void run(const Options &opts) {
+        warningSink = opts.warnings;
+        collectThrownNames();
         desktopBackend = opts.desktopBackend;
         compilerPath = opts.compilerPath;
         pageEntry = opts.entry;
@@ -2377,6 +2717,15 @@ end
              {b.CreateSExt(current->getArg(0), b.getInt64Ty()), current->getArg(1)});
         for (auto &name : builtinClassNames)
             call("fw_register_class", b.getVoidTy(), {b.CreateGlobalString(name), classId(name)});
+        for (auto &ns : p.unitNamespaces) {
+            std::string units;
+            for (auto &u : ns.units)
+                units += (units.empty() ? "" : ",") + u;
+            for (auto *name : {&ns.intClass, &ns.realClass})
+                if (!name->empty())
+                    call("fw_quantity_register", b.getVoidTy(),
+                         {classId(*name), b.CreateGlobalString(units)});
+        }
         failure = llvm::BasicBlock::Create(ctx, "propagate.error", current);
         scopes.emplace_back();
         top = true;
@@ -2635,6 +2984,8 @@ Val Compiler::value(Expr &e, Ty expected) {
         if (classes.count(name) || name == "desktop.window")
             return {llvm::ConstantPointerNull::get(b.getPtrTy()), Ty{"class:" + name}};
     }
+    if (e.kind == "unitlit")
+        return unitLiteral(e, expected);
     if (e.kind == "int") {
         llvm::APInt n;
         if (llvm::StringRef(e.text).getAsInteger(10, n) || n.getActiveBits() > 64)
@@ -2991,6 +3342,31 @@ Val Compiler::value(Expr &e, Ty expected) {
             phi->addIncoming(b.getInt1(!and_), left);
             phi->addIncoming(c.v, tail);
             return {phi, Ty{"bool"}};
+        }
+        if (auto q = quantity(a.t); q && e.text == "in") {
+            // `length in cm`, `duration in time.min`: the value converted to another unit.
+            auto &target = *e.args[1];
+            std::string unit;
+            UnitNamespace *named = nullptr;
+            if (target.kind == "name")
+                unit = target.text;
+            else if (target.kind == "member" && target.args[0]->kind == "name" &&
+                     (named = unitNamespace(target.args[0]->text)))
+                unit = target.text;
+            if (!unit.empty() && (named == nullptr || named == q->ns)) {
+                if (auto index = unitIndex(*q->ns, unit))
+                    return callNamedMethod(a, "__fwu_to", {Val{i64(static_cast<int64_t>(*index)),
+                                                                Ty{"i64"}}});
+            }
+            if (!unit.empty() && (named || !lookup(unit))) {
+                for (auto &other : p.unitNamespaces)
+                    if (&other != q->ns && unitIndex(other, unit) && (!named || named == &other))
+                        error("cannot convert " + displayName(a.t.name) + " to " + unit + ": " +
+                              unit + " is a unit of " + other.name);
+                if (named)
+                    error("unit namespace '" + named->name + "' has no unit '" + unit + "'");
+                error("unit namespace '" + q->ns->name + "' has no unit '" + unit + "'");
+            }
         }
         auto c = value(*e.args[1]);
         if (e.text == ".." || e.text == "..<") {
@@ -3604,6 +3980,21 @@ Val Compiler::invoke(Expr &e, Ty expected) {
     std::string name = callable(callee);
     if (name == "testing.expect_error")
         return expectError(e);
+    if (callee.kind == "name" && (name == "unit" || name == "unitns" || name == "type") &&
+        !lookup(name) && !functions.count(name)) {
+        // type(x) names a value's type; unit(x) and unitns(x) a quantity's unit and namespace.
+        if (rest.size() != 1)
+            error(name + "(x) takes one value");
+        auto x = value(*rest[0]);
+        auto q = quantity(x.t);
+        if (name == "type")
+            return literal(q ? (q->real ? q->ns->realSpelling : "int") : displayName(x.t.name));
+        if (!q)
+            error(name + "(x) needs a quantity such as 15s, got " + displayName(x.t.name));
+        if (name == "unitns")
+            return literal(q->ns->name);
+        return callNamedMethod(x, "__fwu_unit_name", {});
+    }
     if (callee.kind == "name" && !lookup(name))
         if (auto result = genericCall(e, name, expected))
             return *result;
@@ -4367,11 +4758,65 @@ void Compiler::statement(Stmt &s) {
     if (s.kind != "declare" || s.expr)
         countLine(s.loc);
     debugLocation();
-    if (s.kind == "throw" && s.target) {
-        // throw "Name" "message"
+    // `throw Type with "message"`: a builtin error type is constructed with the message; a class
+    // (such as one declared with `error Name`) is constructed and its `message` field set.
+    std::optional<Val> thrown;
+    if (s.kind == "throw" && s.op == "with") {
+        auto &subject = *s.expr;
+        auto name = subject.kind == "name" || subject.kind == "member" ? callable(subject) : "";
+        bool typeName = !name.empty() && !lookup(name) &&
+                        (classes.count(name) || errorTypes.count(name) || name == "Error");
+        auto callee = subject.kind == "call" && subject.args[0]->kind != "lambda"
+                          ? callable(*subject.args[0])
+                          : "";
+        if (typeName || (!callee.empty() && !lookup(callee) && classes.count(callee))) {
+            if (name == "Error")
+                error("throw Error with ... needs a specific type; use throw \"Name\" with "
+                      "\"message\" or declare one with `error Name`");
+            auto construct = std::make_unique<Expr>();
+            if (typeName) {
+                construct->kind = "call";
+                construct->loc = subject.loc;
+                construct->args.push_back(clone(subject));
+                if (errorTypes.count(name))
+                    construct->args.push_back(clone(*s.target));
+            } else
+                construct = clone(subject);
+            auto x = value(*construct);
+            if (!errorTypes.count(x.t.name)) {
+                if (!classes.count(x.t.name) || !hasField(x.t.name, "message"))
+                    error("throw ... with needs an error type with a message field; declare one "
+                          "with `error " + displayName(x.t.name) + "`, or add `string message` "
+                          "to the class");
+                auto [c, i] = field(x.t, "message");
+                if (type(c->fields[i].type).name != "string")
+                    error("throw ... with needs the message field of " + displayName(x.t.name) +
+                          " to be a string");
+                auto message = value(*s.target, Ty{"string"});
+                if (message.t.name != "string")
+                    error("throw ... with expects a string message, got " +
+                          displayName(message.t.name));
+                set(x, i64(i), message);
+            }
+            thrown = x;
+        }
+    }
+    if (s.kind == "throw" && !s.target && (s.expr->kind == "name" || s.expr->kind == "member") &&
+        !lookup(callable(*s.expr)) && classes.count(callable(*s.expr))) {
+        // `throw BadInput`: a class name throws a new instance (fields keep their defaults).
+        Expr construct;
+        construct.kind = "call";
+        construct.loc = s.expr->loc;
+        construct.args.push_back(clone(*s.expr));
+        thrown = value(construct);
+    }
+    if (s.kind == "throw" && s.target && !thrown) {
+        // throw "Name" "message", throw "Name" with "message"
         auto name = value(*s.expr), message = value(*s.target);
         if (name.t.name != "string" || message.t.name != "string")
-            error("throw with a name expects two strings: throw \"Name\" \"message\"");
+            error(s.op == "with" ? "throw ... with expects an error type or a string name, then a "
+                                   "string message: throw BadInput with \"message\""
+                                 : "throw with a name expects two strings: throw \"Name\" \"message\"");
         auto payload = objectCall("fw_error_named", {frame, name.v, message.v});
         call("fw_throw", b.getVoidTy(), {b.CreateGlobalString("Error"), payload});
         auto target = errorHandler();
@@ -4383,7 +4828,7 @@ void Compiler::statement(Stmt &s) {
         return;
     }
     if (s.kind == "throw") {
-        auto x = value(*s.expr);
+        auto x = thrown ? *thrown : value(*s.expr);
         if (x.t.classReference() || x.t.name == "void" || x.t.nullable() ||
             x.t.name.rfind("fn:", 0) == 0 || x.t.name.rfind("module:", 0) == 0)
             error("throw requires a non-null value");
@@ -4431,6 +4876,8 @@ void Compiler::statement(Stmt &s) {
             auto &spelled = s.catchTypes[i];
             bool byName = spelled.size() > 1 && spelled.front() == '"';
             auto name = byName ? spelled.substr(1, spelled.size() - 2) : "";
+            if (byName)
+                checkCatchName(name, i < s.catchLocations.size() ? s.catchLocations[i] : s.loc);
             auto t = byName ? Ty{errorTypes.count(name) ? name : "Error"} : type(spelled);
             if (t.name == "void")
                 error("catch cannot use void");

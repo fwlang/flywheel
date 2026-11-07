@@ -544,7 +544,14 @@ std::vector<Token> lex(const std::string &source) {
                 while (e < source.size() && std::isdigit(static_cast<unsigned char>(source[e])))
                     ++e;
             }
-            if (e < source.size() && (source[e] == 'e' || source[e] == 'E')) {
+            // An exponent needs digits (1e5, 2E-3); otherwise `e` starts a unit (5eV).
+            auto exponent = [&] {
+                size_t d = e + 1;
+                if (d < source.size() && (source[d] == '+' || source[d] == '-'))
+                    ++d;
+                return d < source.size() && std::isdigit(static_cast<unsigned char>(source[d]));
+            };
+            if (e < source.size() && (source[e] == 'e' || source[e] == 'E') && exponent()) {
                 real = true;
                 ++e;
                 if (e < source.size() && (source[e] == '+' || source[e] == '-'))
@@ -688,6 +695,15 @@ std::string Parser::type() {
             r += ">";
         }
     }
+    // A unit type: int[time] or float[metric_length], a number in a unit namespace. It names
+    // the namespace's hidden quantity class (see src/units.cpp).
+    if ((r == "int" || r == "float" || r == "double") && peek().text == "[" &&
+        peek(1).kind == "id" && peek(2).text == "]") {
+        take();
+        auto ns = identifier().text;
+        take();
+        r = "__fwu_" + ns + "__" + (r == "int" ? "int" : "double");
+    }
     while (true) {
         if (accept("?"))
             r += '?';
@@ -728,6 +744,18 @@ std::vector<std::string> Parser::typeParameters(std::map<std::string, std::strin
     } while (accept(","));
     expect(">");
     return names;
+}
+bool Parser::aliasDeclaration() {
+    if (peek().kind != "id" || peek(1).kind != "id" || peek(2).text != "/" || peek(2).kind != "op" ||
+        peek(3).kind != "id" || peek(4).text != "=")
+        return false;
+    if (peek().text == "var" || peek().text == "const")
+        throw Error(peek().loc, "negated aliases need the bool type: bool " + peek(1).text + "/" +
+                                    peek(3).text + " = ...");
+    if (peek().text != "bool")
+        throw Error(peek().loc, "negated aliases (name/negated) are only for bool, such as "
+                                "bool enabled/disabled = true");
+    return true;
 }
 bool Parser::typedDeclaration() {
     if (peek().text == "inst" || peek().text == "attr" || peek().text == "super")
@@ -1025,6 +1053,20 @@ EP Parser::prefix() {
     } else if (t.kind == "int" || t.kind == "real") {
         take();
         e = node(t.kind, t.text, t.loc);
+        // A quantity literal: a number with a unit right after it, 100m, 0.32km, 15time.s.
+        static const std::set<std::string> keywords = {
+            "and", "or", "not", "in", "is", "as", "then", "do", "else", "end", "which", "with",
+            "returns", "if", "for", "while", "true", "false", "null"};
+        if (peek().kind == "id" && !peek().spaced && !keywords.count(peek().text)) {
+            auto unit = take().text;
+            if (peek().text == "." && !peek().spaced && peek(1).kind == "id" && !peek(1).spaced) {
+                take();
+                unit += "." + take().text;
+            }
+            auto quantity = node("unitlit", unit, t.loc);
+            quantity->args.push_back(std::move(e));
+            e = std::move(quantity);
+        }
     } else if (t.kind == "char") {
         take();
         auto text = stringExpr({t.text, "string", t.loc});
@@ -1303,10 +1345,18 @@ SP Parser::statement() {
     auto s = std::make_unique<Stmt>();
     s->loc = peek().loc;
     if (accept("throw")) {
-        // `throw value`, or `throw "Name" "message"`: an error named by a string.
+        // `throw value`, `throw Type with "message"` (a class or error type, constructed with
+        // the message), or `throw "Name" with "message"` (also `throw "Name" "message"`): an
+        // error named by a string.
         s->kind = "throw";
         s->expr = expression();
-        if (peek().kind != "nl" && peek().kind != "eof") {
+        if (peek().text == "with" && peek().kind == "id") {
+            take();
+            s->op = "with";
+            if (peek().kind == "nl" || peek().kind == "eof")
+                throw Error(peek().loc, "'with' expects a message, such as throw BadInput with \"the input is bad\"");
+            s->target = expression();
+        } else if (peek().kind != "nl" && peek().kind != "eof") {
             accept(",");
             s->target = expression();
         }
@@ -1370,7 +1420,8 @@ SP Parser::statement() {
         finish();
         s->body = block();
         bool catchAll = false;
-        while (accept("catch")) {
+        while (peek().text == "catch") {
+            s->catchLocations.push_back(take().loc);
             if (catchAll)
                 throw Error(peek().loc, "catch-all must be the last catch clause");
             auto saved = pos;
@@ -1534,7 +1585,63 @@ SP Parser::statement() {
         finish();
         return s;
     }
+    // `when condition do ... end` runs its body each time the condition becomes true; the
+    // condition reads reactive or computed variables (see src/lower.cpp).
+    if (peek().kind == "id" && peek().text == "when") {
+        auto saved = pos;
+        auto loc = take().loc;
+        EP condition;
+        try {
+            if (peek().kind != "nl" && peek().text != "do")
+                condition = expression();
+        } catch (const Error &) {
+            condition.reset();
+        }
+        if (condition && peek().text == "do") {
+            take();
+            s->kind = "when";
+            s->loc = loc;
+            s->expr = std::move(condition);
+            finish();
+            s->body = block();
+            expect("end");
+            finish();
+            return s;
+        }
+        pos = saved;
+    }
+    // `reactive` and `computed` declarations: `reactive bool alive = true`,
+    // `computed bool dead = not alive`.
+    std::string declarationKind;
+    if (peek().kind == "id" && (peek().text == "reactive" || peek().text == "computed")) {
+        auto saved = pos;
+        auto keyword = take();
+        if (peek().text == "const")
+            throw Error(peek().loc, "'" + keyword.text + "' declarations cannot be const");
+        if (peek().text == "var" || aliasDeclaration() || typedDeclaration())
+            declarationKind = keyword.text;
+        else
+            pos = saved;
+    }
+    if (aliasDeclaration()) {
+        // bool enabled/disabled = true: `disabled` reads and writes the negation of `enabled`.
+        s->kind = "declare";
+        s->op = declarationKind.empty() ? "var" : declarationKind;
+        s->type = type();
+        s->name = identifier().text;
+        expect("/");
+        auto negated = identifier();
+        if (negated.text == s->name)
+            throw Error(negated.loc, "a negated alias needs a different name");
+        s->alias = negated.text;
+        expect("=");
+        s->expr = outer();
+        finish();
+        return s;
+    }
     bool isconst = accept("const"), inferred = accept("var");
+    if (!declarationKind.empty() && (peek().text == "(" || peek().text == "["))
+        throw Error(peek().loc, "'" + declarationKind + "' declares one variable at a time");
     if ((isconst || inferred) && (peek().text == "(" || peek().text == "[")) {
         // var (a, b) = pair / var [x, y] = items: bind each element of a tuple or array to a
         // name; `_` skips an element.
@@ -1576,7 +1683,7 @@ SP Parser::statement() {
     }
     if (isconst || inferred || typedDeclaration()) {
         s->kind = "declare";
-        s->op = isconst ? "const" : "var";
+        s->op = isconst ? "const" : declarationKind.empty() ? "var" : declarationKind;
         if (!inferred && peek(1).text != "=")
             s->type = type();
         s->name = identifier().text;
@@ -1899,6 +2006,126 @@ Program Parser::parse() {
             expect("end");
             finish();
             p.families.push_back(std::move(family));
+        } else if (peek().text == "unitns" && peek().kind == "id" && peek(1).kind == "id" &&
+                   peek(2).text == "for") {
+            // unitns time for int, float
+            take();
+            UnitNamespace ns;
+            ns.loc = peek().loc;
+            ns.name = identifier().text;
+            expect("for");
+            do {
+                auto kind = take();
+                if (kind.text == "int")
+                    ns.integer = true;
+                else if (kind.text == "float" || kind.text == "double") {
+                    ns.real = true;
+                    ns.realSpelling = kind.text;
+                } else
+                    throw Error(kind.loc, "unit namespaces hold int, float, or double values");
+            } while (accept(","));
+            finish();
+            for (auto &other : p.unitNamespaces)
+                if (other.name == ns.name)
+                    throw Error(ns.loc, "duplicate unit namespace '" + ns.name + "'");
+            p.unitNamespaces.push_back(std::move(ns));
+        } else if (peek().text == "unit" && peek().kind == "id" && peek(1).kind == "id" &&
+                   peek(2).text == "." && peek(3).kind == "id" && peek(4).text == "=") {
+            // unit time.min = 60: the unit's size in the namespace's base unit (factor 1).
+            take();
+            auto nsToken = identifier();
+            expect(".");
+            auto unitToken = identifier();
+            expect("=");
+            std::string factor;
+            auto number = [&] {
+                auto n = take();
+                if (n.kind != "int" && n.kind != "real")
+                    throw Error(n.loc, "a unit's factor is a positive number, such as "
+                                       "unit time.min = 60 or unit time.ms = 1/1000");
+                return n.text;
+            };
+            factor = number();
+            if (accept("/"))
+                factor += "/" + number();
+            finish();
+            UnitNamespace *ns = nullptr;
+            for (auto &candidate : p.unitNamespaces)
+                if (candidate.name == nsToken.text)
+                    ns = &candidate;
+            if (!ns)
+                throw Error(nsToken.loc, "unknown unit namespace '" + nsToken.text +
+                                             "'; declare it first: unitns " + nsToken.text +
+                                             " for int, float");
+            if (std::find(ns->units.begin(), ns->units.end(), unitToken.text) != ns->units.end())
+                throw Error(unitToken.loc, "duplicate unit '" + nsToken.text + "." +
+                                               unitToken.text + "'");
+            ns->units.push_back(unitToken.text);
+            ns->factors.push_back(factor);
+            ns->unitLocations.push_back(unitToken.loc);
+        } else if (peek().text == "unitconv" && peek().kind == "id" &&
+                   (peek(1).kind == "int" || peek(1).kind == "real")) {
+            // unitconv 1metric_length.m / 1time.s = 1metric_speed.mps
+            UnitConversion c;
+            c.loc = take().loc;
+            auto quantity = [&](int k) {
+                auto n = take();
+                if (n.kind != "int" && n.kind != "real")
+                    throw Error(n.loc, "unitconv relates quantities, such as "
+                                       "unitconv 1metric_length.m / 1time.s = 1metric_speed.mps");
+                c.amounts[k] = n.text;
+                auto first = identifier();
+                if (!accept("."))
+                    throw Error(first.loc, "unitconv names units with their namespace, such as "
+                                           "1time.s");
+                c.namespaces[k] = first.text;
+                c.units[k] = identifier().text;
+            };
+            quantity(0);
+            if (peek().text != "*" && peek().text != "/")
+                throw Error(peek().loc, "unitconv expects * or / between the first two quantities");
+            c.op = take().text;
+            quantity(1);
+            expect("=");
+            quantity(2);
+            finish();
+            p.unitConversions.push_back(std::move(c));
+        } else if (peek().text == "error" && peek().kind == "id" && peek(1).kind == "id" &&
+                   (peek(2).kind == "nl" || peek(2).kind == "eof" || peek(2).text == "(")) {
+            // `error Name` or `error Name(int status, ...)`: an error type. It is a class with
+            // the given readonly fields and a trailing `string message = ""`, which
+            // `throw Name with "message"` sets.
+            take();
+            Class c;
+            c.loc = peek().loc;
+            c.name = identifier().text;
+            if (accept("(") && !accept(")")) {
+                do {
+                    Param field;
+                    field.loc = peek().loc;
+                    field.readonly = true;
+                    field.type = type();
+                    field.name = identifier().text;
+                    if (field.name == "message")
+                        throw Error(field.loc, "error types already have a message field");
+                    if (accept("="))
+                        field.value = expression();
+                    for (auto &other : c.fields)
+                        if (other.name == field.name)
+                            throw Error(field.loc, "duplicate field '" + field.name + "'");
+                    c.fields.push_back(std::move(field));
+                } while (accept(","));
+                expect(")");
+            }
+            Param message;
+            message.loc = c.loc;
+            message.readonly = true;
+            message.type = "string";
+            message.name = "message";
+            message.value = node("string", "", c.loc);
+            c.fields.push_back(std::move(message));
+            finish();
+            p.classes.push_back(std::move(c));
         } else if (peek().text == "class" || peek().text == "interface") {
             Class c;
             c.isInterface = take().text == "interface";
@@ -1977,6 +2204,8 @@ Program Parser::parse() {
         if (hidden)
             p.privateNames.insert(declared);
     }
+    lowerUnits(p);
+    lowerReactive(p);
     return p;
 }
 EP clone(const Expr &e) {
@@ -2020,8 +2249,10 @@ SP clone(const Stmt &s) {
     out->body = cloneBody(s.body);
     out->other = cloneBody(s.other);
     out->finalizer = cloneBody(s.finalizer);
+    out->alias = s.alias;
     out->catchTypes = s.catchTypes;
     out->catchNames = s.catchNames;
+    out->catchLocations = s.catchLocations;
     for (auto &c : s.catches)
         out->catches.push_back(cloneBody(c));
     for (auto &values : s.patterns) {

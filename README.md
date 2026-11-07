@@ -129,6 +129,24 @@ var (label, count) = ["tokens", 3]
 print describe(Token.Number(1500)), "{label}: {count:>4}"
 ```
 
+## Reactive variables and units
+
+`reactive` variables can be watched: `when condition do ... end` runs each time the condition becomes true, and `computed` values follow their expression. `bool alive/dead = true` declares a bool with a negated alias. Units of measure are checked at compile time: `unitns`, `unit`, and `unitconv` declare dimensions, units, and relations, and `100m + 2km`, `distance in cm`, and `100m / 10s` work while `100m + 10s` is a compile error. See [reactive variables](docs/reactive.md) and [units](docs/units.md).
+
+```flywheel
+reactive bool playerAlive/playerDead = true
+when playerDead do
+    print "Game over!"
+end
+playerAlive = false              # prints "Game over!"
+
+unitns time for int, float
+unit time.s = 1
+unit time.min = 60
+int[time] duration = 90s
+print duration in time.min       # 1.5min
+```
+
 ## Constructors
 
 A bare class name is the class itself; calling it constructs:
@@ -172,7 +190,7 @@ Values are reference counted with atomic counts and freed deterministically; a s
 
 ## Modules and errors
 
-Local `.fw` / `.fly` imports resolve first, then installed packages (`.flywheel-modules`, then the installation's `modules` directory), then library and native modules. Packages are installed by [Pulley](../pulley/README.md) (`pulley` / `ppm`) from Distrobase registries; the `flywheel` command has no package commands. Top-level declarations are public by default; `private` hides implementation names. Dependency initialization runs once, and import cycles and wildcard collisions are diagnosed. See [modules](docs/modules.md). Typed `try`/`catch`/`finally` (`then` is another spelling of `finally`), errors named by strings (`throw "Name" "message"`, `catch "Name" e`), `assert condition "message"`, `Result<T,E>`, and typed library errors are described in [error handling](docs/errors.md). Imports also take strings, file paths, and URLs: `import "https://example.com/lib.fw"`.
+Local `.fw` / `.fly` imports resolve first, then installed packages (`.flywheel-modules`, then the installation's `modules` directory), then library and native modules. Packages are installed by [Pulley](../pulley/README.md) (`pulley` / `ppm`) from Distrobase registries; the `flywheel` command has no package commands. Top-level declarations are public by default; `private` hides implementation names. Dependency initialization runs once, and import cycles and wildcard collisions are diagnosed. See [modules](docs/modules.md). Typed `try`/`catch`/`finally` (`then` is another spelling of `finally`), declared error types (`error HttpFailure(int status)`, `throw HttpFailure(503) with "down"`), errors named by strings (`throw "Name" with "message"`, `catch "Name" e`, with a warning when nothing throws the name), `assert condition "message"`, `Result<T,E>`, and typed library errors are described in [error handling](docs/errors.md). Imports also take strings, file paths, and URLs: `import "https://example.com/lib.fw"`.
 
 ## Development and measurements
 

@@ -17,9 +17,36 @@ end
 
 Native runtime errors include `FileError`, `IndexError`, `KeyError`, `NumericError`, `AssertionError`, `JsonError`, `CastError`, `SelectorError`, `InputError`, `ProcessError`, `DesktopError`, `RegexError`, `NetworkError`, `ValueError` (invalid arguments and formats: format specs, destructuring lengths, frozen collections, parsing), `HttpError` (HTTP client failures), `DatabaseError` (SQLite), `NativeError` (C++ exceptions and Rust panics or Zig errors from [native imports](modules.md#native-imports-c-c-rust-and-zig)), `ResultError`, and `RuntimeError`. They expose `.message` and format as their message. Error constructors accept a string, for example `throw FileError("missing")`. Custom nominal class errors are matched exactly. `Error` is the universal catch type; builtin errors can also be assigned to an `Error` binding. Rethrowing a catch-all error preserves its original dynamic type.
 
+### Declaring error types
+
+`error Name` declares an error type; `error Name(int status, ...)` gives it fields. `throw Name with "message"` constructs it and sets its message, and `catch Name e` matches it exactly:
+
+```flywheel
+error BadInput
+error HttpFailure(int status)
+
+try
+    throw HttpFailure(503) with "upstream down"
+catch HttpFailure e
+    print e.status, e.message      # 503 upstream down
+end
+```
+
+- **What a declaration is:** an error type is a class with the declared fields (readonly) and a final `string message = ""` field.
+- **Fields and messages:**
+  - Fields are given to the constructor: `HttpFailure(503)`.
+  - The message comes after `with`.
+  - `throw BadInput` throws one with an empty message.
+- **Other types with `with`:**
+  - **Builtin error types:** `throw ValueError with "nope"`.
+  - **Classes:** any class with a `string message` field.
+- **Uncaught errors:** an uncaught error reports its type and message: `Flywheel runtime error: HttpFailure: upstream down`.
+
+Prefer declared error types to string names: a misspelled type in `catch` is a compile error, and the error can carry fields.
+
 ### Named errors, `assert`, and `then`
 
-`throw "Name" "message"` (a comma between them is optional) raises an error named by a string, without declaring a class. `catch "Name" e` catches errors by name: errors thrown with that name, builtin errors of that type, and instances of a class with that name. The binding is optional (`catch "Name"`). If the name is a builtin error type (`catch "ValueError" e`), the binding has that type; otherwise it is an `Error`. Every error binding has `.name` (its type name as written in source) and `.message`:
+`throw "Name" with "message"` (also written `throw "Name" "message"`, with an optional comma) raises an error named by a string, without declaring a type. `catch "Name" e` catches errors by name: errors thrown with that name, builtin errors of that type, and instances of a class with that name. The binding is optional (`catch "Name"`). If the name is a builtin error type (`catch "ValueError" e`), the binding has that type; otherwise it is an `Error`. Every error binding has `.name` (its type name as written in source) and `.message`:
 
 ```flywheel
 function load(string key) returns string
@@ -37,6 +64,14 @@ then
     print "done"
 end
 ```
+
+Names are matched exactly (case-sensitive). When nothing in the program throws a name that a `catch "Name"` expects, and no class or builtin error has that name, the compiler warns. If a known name is close, the warning suggests it:
+
+```
+main.fw:8:1: warning: catch "EmptyKye" never matches: nothing in the program throws "EmptyKye" or has a class of that name; did you mean "EmptyKey"?
+```
+
+The check is skipped when the program throws a name computed at run time (`throw kind "message"`).
 
 `then` is another spelling of `finally`: the block runs on every exit from the `try`.
 

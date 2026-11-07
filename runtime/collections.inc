@@ -53,6 +53,15 @@ std::string readableType(std::string text) {
     return out;
 }
 std::string formatSlot(const Slot &, bool, std::set<Object *> &, size_t);
+// Quantity classes (int[time], ...) by class identity: their unit names, registered at startup,
+// so quantities inside collections print as 15s rather than as instances.
+std::mutex quantityMutex;
+std::map<const void *, std::vector<std::string>> quantityUnits;
+const std::vector<std::string> *quantityNames(Object *object) {
+    std::lock_guard<std::mutex> lock(quantityMutex);
+    auto it = quantityUnits.find(object->classId);
+    return it == quantityUnits.end() ? nullptr : &it->second;
+}
 // Enum member names by enum id, registered by generated code before user code runs.
 std::mutex enumMutex;
 std::map<int64_t, std::vector<std::string>> enumTable;
@@ -137,6 +146,11 @@ std::string formatObject(Object *object, bool nested, std::set<Object *> &active
                item(slots.at(1)) + ")";
     }
     if (object->kind == Object::Instance) {
+        if (auto units = quantityNames(object); units && slots.size() == 2) {
+            auto index = static_cast<size_t>(slots[1].integer);
+            return formatSlot(slots[0], false, active, depth + 1) +
+                   (index < units->size() ? (*units)[index] : "");
+        }
         // Members of enums with data (Shape.Empty) print without parentheses when fieldless.
         if (slots.empty() && object->text.find('.') != std::string::npos &&
             object->text.find('<') == std::string::npos)
@@ -523,6 +537,19 @@ Slot castValue(Frame *frame, const Slot &value, const CastType &source, const Ca
 }
 } // namespace
 extern "C" {
+void fw_quantity_register(const void *id, const char *units) {
+    std::vector<std::string> names;
+    std::string text = units;
+    for (size_t begin = 0;;) {
+        auto end = text.find(',', begin);
+        names.push_back(text.substr(begin, end == std::string::npos ? end : end - begin));
+        if (end == std::string::npos)
+            break;
+        begin = end + 1;
+    }
+    std::lock_guard<std::mutex> lock(quantityMutex);
+    quantityUnits[id] = std::move(names);
+}
 Object *fw_instance(Frame *frame, int64_t count, const char *type, const char *name,
                     const char *fields) {
     return nativeBoundary([&] {

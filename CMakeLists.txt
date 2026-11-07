@@ -31,7 +31,7 @@ add_custom_command(
   DEPENDS ${FW_LIBRARY_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedStdlib.cmake
   COMMENT "Embedding Flywheel library modules")
 add_executable(flywheel src/frontend.cpp src/modules.cpp src/compiler.cpp src/format.cpp src/lsp.cpp
-               src/package.cpp src/docs.cpp src/native.cpp src/remote.cpp src/main.cpp "${CMAKE_CURRENT_BINARY_DIR}/library_modules.cpp")
+               src/package.cpp src/docs.cpp src/native.cpp src/remote.cpp src/lower.cpp src/units.cpp src/main.cpp "${CMAKE_CURRENT_BINARY_DIR}/library_modules.cpp")
 target_include_directories(flywheel PRIVATE include)
 target_include_directories(flywheel SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
 separate_arguments(LLVM_DEFINITION_LIST NATIVE_COMMAND ${LLVM_DEFINITIONS})

@@ -141,6 +141,8 @@ std::string document(const std::string &path) {
     for (auto &f : program.functions)
         entry(f.loc.line, "function", f.name);
     for (auto &c : program.classes) {
+        if (c.name.rfind("__fw", 0) == 0)
+            continue; // hidden quantity classes (src/units.cpp)
         std::string members;
         for (auto &field : c.fields) {
             if (field.isPrivate)
@@ -165,7 +167,7 @@ std::string document(const std::string &path) {
         entry(en.loc.line, "enum", en.name, members + "</ul>\n");
     }
     for (auto &s : program.body)
-        if (s->kind == "declare" && s->op == "const")
+        if (s->kind == "declare" && s->op == "const" && s->name.rfind("__fw", 0) != 0)
             entry(s->loc.line, "const", s->name);
     std::sort(entries.begin(), entries.end(), [](auto &a, auto &b) { return a.line < b.line; });
     for (auto &e : entries) {

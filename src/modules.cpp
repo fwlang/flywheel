@@ -672,6 +672,13 @@ class Loader {
             merged.classes.push_back(std::move(c));
         for (auto &en : u.program.enums)
             merged.enums.push_back(std::move(en));
+        for (auto &ns : u.program.unitNamespaces) {
+            ns.loc.file = u.path;
+            for (auto *name : {&ns.intClass, &ns.realClass})
+                if (!name->empty())
+                    *name = u.own.at(*name);
+            merged.unitNamespaces.push_back(std::move(ns));
+        }
         for (auto &s : u.program.body)
             merged.body.push_back(std::move(s));
         merged.html = merged.html || u.html;
