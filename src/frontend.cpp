@@ -2086,14 +2086,28 @@ Program Parser::parse() {
                                            "1time.s");
                 c.namespaces[k] = first.text;
                 c.units[k] = identifier().text;
+                // 0.3048metric.length.m: a namespace of an imported module
+                if (peek().text == "." && peek(1).kind == "id") {
+                    take();
+                    c.namespaces[k] += "." + c.units[k];
+                    c.units[k] = identifier().text;
+                }
             };
             quantity(0);
-            if (peek().text != "*" && peek().text != "/")
-                throw Error(peek().loc, "unitconv expects * or / between the first two quantities");
-            c.op = take().text;
-            quantity(1);
-            expect("=");
-            quantity(2);
+            if (peek().text == "=") {
+                // unitconv 1length.ft = 0.3048metric.length.m
+                take();
+                c.op = "=";
+                quantity(1);
+            } else {
+                if (peek().text != "*" && peek().text != "/")
+                    throw Error(peek().loc, "unitconv expects * or /, or = to relate two "
+                                            "namespaces that measure the same thing");
+                c.op = take().text;
+                quantity(1);
+                expect("=");
+                quantity(2);
+            }
             finish();
             p.unitConversions.push_back(std::move(c));
         } else if (peek().text == "error" && peek().kind == "id" && peek(1).kind == "id" &&

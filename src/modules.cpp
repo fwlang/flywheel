@@ -489,20 +489,29 @@ class Loader {
         std::set<std::string> own;
         for (auto &ns : u.program.unitNamespaces)
             own.insert(ns.name);
+        for (auto &ns : u.program.unitNamespaces)
+            ns.key = u.prefix + "__fwu_" + ns.name + "__int";
         for (auto &[name, sources] : byName) {
-            if (own.count(name))
-                continue;
-            if (sources.size() > 1) {
+            bool bare = !own.count(name) && sources.size() == 1;
+            if (!own.count(name) && sources.size() > 1)
                 u.ambiguousUnits[name] = sources[0].second + " and " + sources[1].second;
-                continue;
+            for (auto &[dependency, module] : sources) {
+                bool aliased = u.modules.count(module) && u.modules.at(module) == dependency;
+                if (!bare && !aliased)
+                    continue;
+                for (auto &ns : dependency->unitExports)
+                    if (ns.name == name) {
+                        // Reached bare when unique, else through the import (metric.length).
+                        auto copy = ns;
+                        copy.module = aliased ? module : "";
+                        copy.ref = bare ? "" : module + ".";
+                        imported.push_back(copy);
+                    }
+                if (bare)
+                    for (auto &hidden : unitNames(name))
+                        if (dependency->own.count(hidden))
+                            u.names[hidden] = dependency->own.at(hidden);
             }
-            auto &dependency = *sources[0].first;
-            for (auto &ns : dependency.unitExports)
-                if (ns.name == name)
-                    imported.push_back(ns);
-            for (auto &hidden : unitNames(name))
-                if (dependency.own.count(hidden))
-                    u.names[hidden] = dependency.own.at(hidden);
         }
         try {
             lowerUnits(u.program, imported, true);

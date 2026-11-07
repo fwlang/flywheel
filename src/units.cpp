@@ -138,6 +138,12 @@ std::string real(double v) {
 std::string quote(const std::string &s) {
     return "\"" + s + "\"";
 }
+// `unitconv 1length.ft = 0.3048metric.length.m`: `own` (declared here) and `other` measure the
+// same thing; other's base = own's base * k.
+struct Equivalence {
+    const UnitNamespace *own, *other;
+    double k;
+};
 struct Relation {
     std::string left, op, right, result; // namespace names
     size_t resultUnit = 0;
@@ -154,9 +160,14 @@ std::string generate(Program &p, const std::vector<UnitNamespace> &imported, boo
     std::set<std::string> own;
     for (auto &ns : p.unitNamespaces)
         own.insert(ns.name);
+    // Imported namespaces by qualified spelling (metric.length), for equivalences.
+    std::map<std::string, UnitNamespace *> qualified;
     for (auto &ns : foreign) {
-        // A namespace of this module hides an imported one of the same name.
-        if (own.count(ns.name))
+        if (!ns.module.empty())
+            qualified[ns.module + "." + ns.name] = &ns;
+        // A namespace of this module hides an imported one of the same name; a name that two
+        // imports declare is reached only qualified.
+        if (own.count(ns.name) || !ns.ref.empty())
             continue;
         byName[ns.name] = &ns;
         for (size_t i = 0; i < ns.units.size(); ++i)
@@ -186,7 +197,58 @@ std::string generate(Program &p, const std::vector<UnitNamespace> &imported, boo
             }
         relations.push_back(r);
     };
+    std::vector<Equivalence> equivalences;
     for (auto &c : p.unitConversions) {
+        if (c.op != "=")
+            continue;
+        UnitNamespace *ns[2];
+        bool known = true;
+        for (int k = 0; k < 2; ++k) {
+            auto &spelled = c.namespaces[k];
+            ns[k] = nullptr;
+            if (spelled.find('.') != std::string::npos) {
+                if (auto it = qualified.find(spelled); it != qualified.end())
+                    ns[k] = it->second;
+            } else if (auto it = byName.find(spelled); it != byName.end())
+                ns[k] = it->second;
+            known = known && ns[k];
+        }
+        if (!known && !strict)
+            continue;
+        for (int k = 0; k < 2; ++k)
+            if (!ns[k])
+                throw Error(c.loc, "unknown unit namespace '" + c.namespaces[k] +
+                                       "'; declare it with unitns or import a module that "
+                                       "declares it");
+        bool own0 = own.count(c.namespaces[0]) && c.namespaces[0].find('.') == std::string::npos,
+             own1 = own.count(c.namespaces[1]) && c.namespaces[1].find('.') == std::string::npos;
+        if (!own0 && !own1)
+            throw Error(c.loc, "unitconv relates namespaces of other modules; relate them in a "
+                               "module that declares one of them");
+        if (ns[0] == ns[1])
+            throw Error(c.loc, "unitconv = relates two different namespaces");
+        double base[2];
+        for (int k = 0; k < 2; ++k) {
+            auto u = std::find(ns[k]->units.begin(), ns[k]->units.end(), c.units[k]);
+            if (u == ns[k]->units.end())
+                throw Error(c.loc, "unit namespace '" + ns[k]->name + "' has no unit '" +
+                                       c.units[k] + "'");
+            double amount = std::stod(c.amounts[k]);
+            if (!(amount > 0))
+                throw Error(c.loc, "unitconv amounts must be positive");
+            auto i = static_cast<size_t>(u - ns[k]->units.begin());
+            base[k] = amount * factor(ns[k]->factors[i], ns[k]->unitLocations[i]).value;
+        }
+        int a = own0 ? 0 : 1, b = 1 - a;
+        for (auto &e : equivalences)
+            if ((e.own == ns[a] && e.other == ns[b]) || (e.own == ns[b] && e.other == ns[a]))
+                throw Error(c.loc, "unitconv already relates " + c.namespaces[0] + " and " +
+                                       c.namespaces[1]);
+        equivalences.push_back({ns[a], ns[b], base[b] / base[a]});
+    }
+    for (auto &c : p.unitConversions) {
+        if (c.op == "=")
+            continue;
         std::vector<double> base;
         bool known = true;
         for (int k = 0; k < 3; ++k)
@@ -378,6 +440,22 @@ std::string generate(Program &p, const std::vector<UnitNamespace> &imported, boo
                     << "    function __fwu_to(int j) returns " << C << "\n"
                     << "        return " << C << "(inst __fwu_real(j), j)\n"
                     << "    end\n";
+                // Equivalences: this value in another namespace's unit (o's), and o in this one's.
+                for (auto &e : equivalences) {
+                    if (e.own != &ns)
+                        continue;
+                    auto B = e.other->ref + "__fwu_" + e.other->name + "__double";
+                    auto BF = e.other->ref + "__fwu_" + e.other->name + "__factor";
+                    auto key = unitKey(*e.other);
+                    out << "    function __fwu_as__" << key << "(" << B << " o) returns " << B << "\n"
+                        << "        return " << B << "(inst __fwu_base() * " << real(e.k) << " / "
+                        << BF << "[o.__fwu_unit], o.__fwu_unit)\n"
+                        << "    end\n"
+                        << "    function __fwu_from__" << key << "(" << B << " o) returns " << C << "\n"
+                        << "        return " << C << "(o.__fwu_base() / " << real(e.k) << " / "
+                        << table("factor") << "[inst __fwu_unit], inst __fwu_unit)\n"
+                        << "    end\n";
+                }
                 for (auto &r : relations) {
                     if (r.left != ns.name)
                         continue;
@@ -415,6 +493,13 @@ std::string generate(Program &p, const std::vector<UnitNamespace> &imported, boo
     return out.str();
 }
 } // namespace
+std::string unitKey(const UnitNamespace &ns) {
+    auto key = ns.key.empty() ? (ns.intClass.empty() ? ns.name : ns.intClass) : ns.key;
+    for (auto &c : key)
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_')
+            c = '_';
+    return key;
+}
 void lowerUnits(Program &p, const std::vector<UnitNamespace> &imported, bool strict) {
     if (p.unitNamespaces.empty()) {
         if (!p.unitConversions.empty() && (strict || imported.empty()))

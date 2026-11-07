@@ -149,11 +149,19 @@ struct UnitNamespace {
     std::vector<std::string> units, factors; // in declaration order; factors as written
     std::vector<Location> unitLocations;
     std::string intClass, realClass; // hidden class names
+    // Set by the module loader: a unique identifier for the namespace (its qualified hidden
+    // class), and for an imported one how the importing module spells its hidden names
+    // ("" or "metric.").
+    std::string key, ref, module;
 };
+// The identifier that names namespace `ns` in equivalence methods (__fwu_as__<key>).
+std::string unitKey(const UnitNamespace &ns);
 // `unitconv 1metric_length.m / 1time.s = 1metric_speed.mps`: relates three namespaces.
 struct UnitConversion {
     Location loc;
-    std::string op; // "*" or "/"
+    // "*" or "/"; "=" for `unitconv 1length.ft = 0.3048metric.length.m`, two namespaces that
+    // measure the same thing (only [0] and [1] are used; a namespace may be module-qualified).
+    std::string op;
     std::string amounts[3], namespaces[3], units[3];
 };
 struct Program {

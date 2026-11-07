@@ -2619,6 +2619,27 @@ print w + 500g, w in t
             "2.5km 2500m length\n10mps 36kmph 20m 20m 7200s\n12m2 24m3 24000l\n1.5min 1.5min int 7d\n"
             "3500g 0.003t\n",
         ),
+        "unit_equivalences": (
+            """import metric
+import imperial
+import time
+print 1m + 1ft, 1ft + 1m, 1m - 1ft
+print 1m > 1ft, 1ft == 0.3048m, 1inch < 3cm, 1mi / 1km
+print 5ft in cm, 1km in mi, 2lb in kg, 1gal in l, 1acre in m2, 60mph in kmph
+float[imperial.length] run = 5mi
+float[metric.length] total = 10km
+print total + run, run + total
+unitns money
+unit money.cent = 1
+unit money.eur = 100
+unitns cash
+unit cash.coin = 1
+unitconv 1money.eur = 50cash.coin
+print 1eur + 10coin, 10coin + 1eur, 3coin in cent, 2eur > 99coin""",
+            "1.3048m 4.28083989501312ft 0.6952m\ntrue true true 1.609344\n"
+            "152.4cm 0.621371192237334mi 0.90718474kg 4.54609l 4046.8564224m2 96.56064kmph\n"
+            "18.04672km 11.2137119223733mi\n1.2eur 60coin 6cent true\n",
+        ),
         "unit_libraries_both": (
             """import metric
 import imperial
@@ -2666,6 +2687,14 @@ NEGATIVE.update(
         ),
         "units_library_not_imported": ("import time\nprint 5km\n", "unknown unit 'km'"),
         "units_literal_needs_import": ("import metric\nprint 1h\n", "unknown unit 'h' after 1; import time"),
+        "units_no_equivalence": (
+            "import metric\nimport time\nprint 1m + 1s\n",
+            "cannot use + on int[length] and int[time]",
+        ),
+        "units_equivalence_same": (
+            "unitns a\nunit a.x = 1\nunitconv 1a.x = 2a.x\n",
+            "unitconv = relates two different namespaces",
+        ),
         "units_old_unitns": ("unitns n for int, float\nunit n.a = 1\n", "unitns takes only a name"),
         "units_not_number": (
             "unitns n\nunit n.a = 1\nstring[n] s = \"x\"\n",

@@ -101,6 +101,7 @@ print 72km / 10metric_speed.mps  # 7200s
 - **Result unit:** results are expressed in the unit that the relation names for them.
 - **Floating point:** relations compute in floating point and give float quantities.
 - **Namespaces of other modules:** a relation may name namespaces of imported modules, as `metric` does with `time` (`unitconv 1length.m / 1time.s = 1speed.mps`). At least one of the three must be declared in the module, and a quotient's left side must be one of its own (write the relation as a product otherwise). Products work in either order: `2s * speed` uses the relation that `speed * 2s` does.
+- **Equivalent namespaces:** `unitconv 1a.x = n b.y` (written `unitconv 1length.ft = 0.3048metric.length.m`) says that two namespaces measure the same thing. Then `+`, `-`, comparisons, and `/` (a plain ratio) accept one quantity of each: the second value is converted to the unit of the first, and the result is a float quantity. `x in y` converts to a unit of the other namespace. One of the two must be declared in the module, and the other may be qualified with its module (`metric.length`).
 - **Undeclared products:** a product or quotient with no relation is a compile error. There are no automatic derived dimensions such as `m * m`; declare `unitconv 1length.m * 1length.m = 1area.m2` for area.
 
 ## Unit libraries
@@ -113,7 +114,7 @@ print 72km / 10metric_speed.mps  # 7200s
 
 - **Relations:** `metric` and `imperial` relate length × length = area, area × length = volume, and length / time = speed (they import `time`), so `3m * 4m` is `12m2`, `100m / 10s` is `10mps`, and `60mi / 1h in mph` is `60mph`.
 - **Imperial measures:** `imperial` uses British imperial measures: a pint is 20 fluid ounces, a gallon 160, and a ton is the long ton (2240 lb). `in` is a keyword, so inches are `inch`.
-- **Separate systems:** metric and imperial namespaces are separate dimensions: `1m + 1ft` is a compile error, also when both modules are imported. Use `.value` with a factor to cross between them.
+- **Between the systems:** `imperial` imports `metric` and relates each of its namespaces to the metric one (`unitconv 1length.ft = 0.3048metric.length.m`), so with both imported `1m + 1ft` is `1.3048m`, `1ft + 1m` is `4.28083989501312ft`, `1m > 1ft` is `true`, and `5ft in cm` is `152.4cm`.
 
 ```flywheel
 import metric

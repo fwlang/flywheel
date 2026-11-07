@@ -1,7 +1,9 @@
 # Imperial (British) units of length, area, volume, weight, and speed: `import imperial`, then
 # `float[length] d = 3mi`, `d in ft`, `60mi / 1h` (a speed). `in` is a keyword, so inches are
 # `inch`. Volumes are imperial (UK) measures: a pint is 20 fluid ounces.
-# With `import metric` too, qualify the namespaces: float[imperial.length].
+# With `import metric` too, qualify the namespaces: float[imperial.length]. Each namespace
+# measures the same thing as its metric one, so `1m + 1ft` is 1.3048m and `5ft in cm` is 152.4cm.
+import metric
 import time
 
 unitns length
@@ -43,3 +45,10 @@ unit speed.mph = 22/15
 unitconv 1length.ft * 1length.ft = 1area.sqft
 unitconv 1area.sqft * 1length.ft = 1volume.cuft
 unitconv 1length.ft / 1time.s = 1speed.fps
+
+# The same quantities in metric units (exact by definition: 1 ft = 0.3048 m, 1 lb = 0.45359237 kg).
+unitconv 1length.ft = 0.3048metric.length.m
+unitconv 1area.sqft = 0.09290304metric.area.m2
+unitconv 1volume.floz = 28.4130625metric.volume.ml
+unitconv 1weight.lb = 0.45359237metric.weight.kg
+unitconv 1speed.fps = 0.3048metric.speed.mps

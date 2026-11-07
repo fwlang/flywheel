@@ -377,7 +377,7 @@ Invalid ranges, probabilities, weights, and sample counts raise `ValueError`.
 
 ### metric and imperial
 
-Units of measure (see [units](../docs/units.md#unit-libraries)). `import metric` declares the namespaces `length` (`mm`, `cm`, `m`, `km`, ...), `area` (`m2`, `ha`, ...), `volume` (`ml`, `l`, `m3`, ...), `weight` (`g`, `kg`, `t`, ...), and `speed` (`mps`, `kmph`), with the relations length × length = area, area × length = volume, and length / time = speed. `import imperial` declares the same namespaces in British imperial units (`inch`, `ft`, `yd`, `mi`; `sqft`, `acre`; `floz`, `pt`, `gal`; `oz`, `lb`, `st`; `fps`, `mph`). Both import `time`, whose `time` namespace has `ns`, `us`, `ms`, `s`, `min`, `h`, `d`, and `wk`. With both imported, qualify the namespace: `float[metric.length]`.
+Units of measure (see [units](../docs/units.md#unit-libraries)). `import metric` declares the namespaces `length` (`mm`, `cm`, `m`, `km`, ...), `area` (`m2`, `ha`, ...), `volume` (`ml`, `l`, `m3`, ...), `weight` (`g`, `kg`, `t`, ...), and `speed` (`mps`, `kmph`), with the relations length × length = area, area × length = volume, and length / time = speed. `import imperial` declares the same namespaces in British imperial units (`inch`, `ft`, `yd`, `mi`; `sqft`, `acre`; `floz`, `pt`, `gal`; `oz`, `lb`, `st`; `fps`, `mph`). Both import `time`, whose `time` namespace has `ns`, `us`, `ms`, `s`, `min`, `h`, `d`, and `wk`. With both imported, qualify the namespace: `float[metric.length]`. `imperial` imports `metric` and relates each pair of namespaces, so `1m + 1ft` is `1.3048m` (the second value is converted to the first one's unit) and `5ft in cm` is `152.4cm`.
 
 ```flywheel
 import metric

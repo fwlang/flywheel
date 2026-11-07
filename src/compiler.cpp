@@ -402,6 +402,44 @@ class Compiler {
     }
     // Arithmetic and comparisons with quantities: same-namespace + - and comparisons convert to
     // the finer unit; * and / by numbers scale; * and / between namespaces use unitconv.
+    // `from` in the namespace and unit of `like`, when a `unitconv A = B` relates their
+    // namespaces (the methods live on the namespace that declared the relation).
+    std::optional<Val> unitAcross(Val from, Val like) {
+        auto qf = quantity(from.t), ql = quantity(like.t);
+        if (!qf || !ql || qf->ns == ql->ns)
+            return std::nullopt;
+        auto real = [&](Val v) {
+            return quantity(v.t)->real ? v : callNamedMethod(v, "__fwu_float", {});
+        };
+        auto as = "__fwu_as__" + unitKey(*ql->ns), from_ = "__fwu_from__" + unitKey(*qf->ns);
+        if (!resolveMethod(qf->ns->realClass, as).empty())
+            return callNamedMethod(real(from), as, {real(like)});
+        if (!resolveMethod(ql->ns->realClass, from_).empty())
+            return callNamedMethod(real(like), from_, {real(from)});
+        return std::nullopt;
+    }
+    // A float quantity of zero in unit `index` of `ns`, to name a target unit.
+    Val unitTemplate(UnitNamespace &ns, size_t index, Location loc) {
+        Expr construct;
+        construct.kind = "call";
+        construct.loc = loc;
+        auto callee = std::make_unique<Expr>();
+        callee->kind = "name";
+        callee->text = ns.realClass;
+        callee->loc = loc;
+        construct.args.push_back(std::move(callee));
+        auto zero = std::make_unique<Expr>();
+        zero->kind = "real";
+        zero->text = "0.0";
+        zero->loc = loc;
+        construct.args.push_back(std::move(zero));
+        auto at = std::make_unique<Expr>();
+        at->kind = "int";
+        at->text = std::to_string(index);
+        at->loc = loc;
+        construct.args.push_back(std::move(at));
+        return value(construct, Ty{});
+    }
     Val unitBinary(const std::string &op, Val a, Val c) {
         auto qa = quantity(a.t), qc = quantity(c.t);
         auto both = displayName(a.t.name) + " and " + displayName(c.t.name);
@@ -416,6 +454,11 @@ class Compiler {
             {"<", llvm::CmpInst::ICMP_SLT},  {"<=", llvm::CmpInst::ICMP_SLE},
             {">", llvm::CmpInst::ICMP_SGT},  {">=", llvm::CmpInst::ICMP_SGE}};
         if (qa && qc) {
+            // 1m + 1ft: the second value in the first one's unit, through `unitconv A = B`.
+            if (qa->ns != qc->ns && (op == "+" || op == "-" || op == "/" || comparisons.count(op)))
+                if (auto converted = unitAcross(c, a))
+                    return unitBinary(op, qa->real ? a : callNamedMethod(a, "__fwu_float", {}),
+                                      *converted);
             if (qa->ns == qc->ns &&
                 (op == "+" || op == "-" || op == "/" || comparisons.count(op))) {
                 if (qa->real != qc->real) {
@@ -3358,6 +3401,12 @@ Val Compiler::value(Expr &e, Ty expected) {
                                                                 Ty{"i64"}}});
             }
             if (!unit.empty() && (named || !lookup(unit))) {
+                // 1m in ft: into a namespace that `unitconv A = B` relates
+                for (auto &other : p.unitNamespaces)
+                    if (&other != q->ns && unitIndex(other, unit) && (!named || named == &other))
+                        if (auto converted =
+                                unitAcross(a, unitTemplate(other, *unitIndex(other, unit), e.loc)))
+                            return *converted;
                 for (auto &other : p.unitNamespaces)
                     if (&other != q->ns && unitIndex(other, unit) && (!named || named == &other))
                         error("cannot convert " + displayName(a.t.name) + " to " + unit + ": " +
