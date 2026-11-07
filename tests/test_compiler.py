@@ -2283,6 +2283,19 @@ POSITIVE.update(
             "0.3 2.68 0.125\ntrue 5 [\"a\", \"b\"]\n"
             '2 <ul><li>one</li><li class="x">two</li></ul><p>a &amp; b</p>\n',
         ),
+        "random_module": (
+            "import random\n"
+            "random.seed(42)\nvar a = random.integer(1, 1000000)\nvar xs = [1, 2, 3, 4, 5, 6]\nrandom.shuffle(xs)\n"
+            "var first = xs.copy()\nrandom.seed(42)\nrandom.integer(1, 1000000)\nvar ys = [1, 2, 3, 4, 5, 6]\nrandom.shuffle(ys)\n"
+            "print string(first) == string(ys), a >= 1 and a <= 1000000\nys.sort()\nprint ys, random.below(1), random.choice([\"only\"])\n"
+            "var r = random.random()\nvar u = random.uniform(5.0, 6.0)\n"
+            "print r >= 0.0 and r < 1.0, u >= 5.0 and u < 6.0, random.normal(3.0, 0.0), random.chance(1.0), random.chance(0.0)\n"
+            "var s = random.sample(xs, 6)\ns.sort()\nprint s, random.sample(xs, 0), random.shuffled([\"a\"]), random.weighted([\"no\", \"yes\"], [0.0, 2.0])\n"
+            "try\n    random.sample(xs, 7)\ncatch ValueError e\n    print \"bad count\"\nend\n"
+            "try\n    random.choice(xs.slice(0, 0))\ncatch IndexError e\n    print \"empty\"\nend\n",
+            "true true\n[1, 2, 3, 4, 5, 6] 0 only\ntrue true 3 true false\n"
+            '[1, 2, 3, 4, 5, 6] [] ["a"] yes\nbad count\nempty\n',
+        ),
     }
 )
 POSITIVE.update(

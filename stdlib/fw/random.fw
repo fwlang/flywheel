@@ -1,0 +1,129 @@
+# Pseudo-random numbers, choices, shuffles, and samples.
+# Built on the math module's per-thread generator, so random.seed and math.seed set the same
+# sequence. Not for secrets: use crypto.random_bytes, crypto.token, or crypto.random_int.
+import math
+
+# Makes the sequence repeatable from `n`.
+function seed(int n)
+    math.seed(n)
+end
+
+# A double in [0, 1).
+function random returns double
+    return math.random()
+end
+
+# An integer in the inclusive range [low, high].
+function integer(int low, int high) returns int
+    if low > high then
+        throw ValueError("random.integer requires low <= high")
+    end
+    return math.random_int(low, high)
+end
+
+# An integer in [0, n), for picking an index.
+function below(int n) returns int
+    if n <= 0 then
+        throw ValueError("random.below requires a positive bound")
+    end
+    return math.random_int(0, n - 1)
+end
+
+# A double in [low, high).
+function uniform(double low, double high) returns double
+    if low > high then
+        throw ValueError("random.uniform requires low <= high")
+    end
+    return low + (high - low) * math.random()
+end
+
+# true with probability p (0 to 1).
+function chance(double p = 0.5) returns bool
+    if p < 0.0 or p > 1.0 then
+        throw ValueError("random.chance requires a probability from 0 to 1")
+    end
+    return math.random() < p
+end
+
+# A normally distributed double (Box-Muller).
+function normal(double mean = 0.0, double stddev = 1.0) returns double
+    if stddev < 0.0 then
+        throw ValueError("random.normal requires stddev >= 0")
+    end
+    var u = 1.0 - math.random()
+    var v = math.random()
+    return mean + stddev * math.sqrt(-2.0 * math.log(u)) * math.cos(2.0 * math.PI * v)
+end
+
+# One item, uniformly.
+function choice<T>(T[] items) returns T
+    if items.length == 0 then
+        throw IndexError("random.choice of an empty array")
+    end
+    return items[math.random_int(0, items.length - 1)]
+end
+
+# One item, with probability proportional to its weight.
+function weighted<T>(T[] items, double[] weights) returns T
+    if items.length == 0 or items.length != weights.length then
+        throw ValueError("random.weighted needs one weight per item and at least one item")
+    end
+    var total = 0.0
+    for w in weights do
+        if w < 0.0 or not math.is_finite(w) then
+            throw ValueError("random.weighted requires finite, non-negative weights")
+        end
+        total += w
+    end
+    if total <= 0.0 then
+        throw ValueError("random.weighted requires a positive total weight")
+    end
+    var target = math.random() * total
+    var last = 0
+    for i, w in weights do
+        if w > 0.0 then
+            last = i
+            if target < w then
+                return items[i]
+            end
+            target -= w
+        end
+    end
+    return items[last]
+end
+
+# Shuffles the array in place (Fisher-Yates).
+function shuffle<T>(T[] items)
+    var i = items.length - 1
+    while i > 0 do
+        var j = math.random_int(0, i)
+        var held = items[i]
+        items[i] = items[j]
+        items[j] = held
+        i -= 1
+    end
+end
+
+# A shuffled copy; the array is unchanged.
+function shuffled<T>(T[] items) returns T[]
+    var out = items.copy()
+    shuffle(out)
+    return out
+end
+
+# `count` items from distinct positions, in random order.
+function sample<T>(T[] items, int count) returns T[]
+    if count < 0 or count > items.length then
+        throw ValueError("random.sample count must be from 0 to the array length")
+    end
+    var pool = items.copy()
+    T[] out = []
+    for i in 0..<count do
+        var j = math.random_int(i, pool.length - 1)
+        var held = pool[i]
+        pool[i] = pool[j]
+        pool[j] = held
+        out.push(pool[i])
+    end
+    return out
+end

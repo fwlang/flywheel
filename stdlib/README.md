@@ -27,7 +27,7 @@ Libraries are compiler-resolved declarations backed by C++ runtime functions; no
 | `compress` | gzip, zlib, deflate, CRC-32, zip archives |
 | `sqlite` | SQLite 3 databases |
 | `toml`, `yaml` | configuration formats, parsed to `json.value` |
-| `csv`, `url`, `log`, `args`, `bigint`, `decimal` | [library modules written in Flywheel](#library-modules) |
+| `csv`, `url`, `log`, `args`, `bigint`, `decimal`, `random` | [library modules written in Flywheel](#library-modules) |
 
 ## Strings
 
@@ -345,6 +345,35 @@ print parsed.flag("verbose"), parsed.integer("width"), parsed.list("files")
 ```
 
 Flags (`--verbose`, `-v`, combined `-vq`), options (`--width 640`, `--width=640`, `-w640`; repeated options collect into `list(name)`), positionals (`many` collects the rest), and `--` for literal arguments. `parse` prints generated help for `-h`/`--help` and exits 0, or prints the problem and usage to standard error and exits 2; `parse_or_throw` raises `args.Usage` instead. `get`, `integer`, `number`, `flag`, `list`, and `has` read the results.
+
+### random
+
+Pseudo-random values from the same per-thread generator as `math.random`, so `random.seed(n)` (or `math.seed(n)`) makes both repeatable. For secrets use `crypto`.
+
+| Function | Result |
+|---|---|
+| `seed(n)` | restart the sequence from `n` |
+| `random()` | a double in [0, 1) |
+| `integer(low, high)` | an int in the inclusive range |
+| `below(n)` | an int in [0, n), for indexes |
+| `uniform(low, high)` | a double in [low, high) |
+| `chance(p = 0.5)` | `true` with probability `p` |
+| `normal(mean = 0.0, stddev = 1.0)` | a normally distributed double |
+| `choice(items)` | one item of an array (`IndexError` when empty) |
+| `weighted(items, weights)` | one item, chosen in proportion to its `double` weight |
+| `shuffle(items)` | shuffle an array in place |
+| `shuffled(items)` | a shuffled copy |
+| `sample(items, count)` | `count` items from distinct positions, in random order |
+
+```flywheel
+import random
+var deck = ["A", "K", "Q", "J"]
+random.shuffle(deck)
+print random.choice(deck), random.integer(1, 6), random.sample(deck, 2)
+print random.weighted(["common", "rare"], [9.0, 1.0])
+```
+
+Invalid ranges, probabilities, weights, and sample counts raise `ValueError`.
 
 ### bigint and decimal
 
