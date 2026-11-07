@@ -93,9 +93,9 @@ std::string displayName(const std::string &text) {
         if (split == std::string::npos || split == 0)
             continue;
         auto kind = inner.substr(split + 2);
-        if (kind != "int" && kind != "double")
-            continue;
-        result.replace(at, end - at, (kind == "int" ? "int[" : "float[") + inner.substr(0, split) + "]");
+        result.replace(at, end - at,
+                       (kind == "int" ? "int" : kind == "double" ? "float" : kind) + "[" +
+                           inner.substr(0, split) + "]");
     }
     return result;
 }
@@ -324,6 +324,10 @@ class Compiler {
     // The namespace a name refers to in a unit context (`time` in time.s); imports of a module
     // with the same name do not hide it.
     UnitNamespace *unitNamespace(const std::string &name) {
+        // The module loader spells a resolved namespace by its hidden class (src/modules.cpp).
+        for (auto &ns : p.unitNamespaces)
+            if (ns.intClass == name)
+                return &ns;
         for (auto &ns : p.unitNamespaces)
             if (ns.name == name || (p.imports.count(name) && p.imports.at(name) == ns.name))
                 return &ns;
@@ -356,8 +360,9 @@ class Compiler {
             if (found.empty())
                 error(p.unitNamespaces.empty()
                           ? "unknown unit '" + unit + "' after " + e.args[0]->text +
-                                "; declare units with unitns and unit, such as `unitns length "
-                                "for int, float` and `unit length." + unit + " = 1`"
+                                "; declare units with unitns and unit, such as `unitns length` "
+                                "and `unit length." + unit + " = 1`, or import a unit library "
+                                "such as metric"
                           : "unknown unit '" + unit + "' after " + e.args[0]->text);
             if (found.size() > 1)
                 error("unit '" + unit + "' is ambiguous: " + found[0]->name + " and " +
@@ -366,11 +371,7 @@ class Compiler {
             ns = found[0];
         }
         auto &number = *e.args[0];
-        bool real = number.kind == "real" || !ns->integer ||
-                    (wanted && wanted->ns == ns && wanted->real);
-        if (real && !ns->real)
-            error("int[" + ns->name + "] cannot hold " + number.text + "; declare unitns " +
-                  ns->name + " for int, float");
+        bool real = number.kind == "real" || (wanted && wanted->ns == ns && wanted->real);
         Expr construct;
         construct.kind = "call";
         construct.loc = e.loc;
@@ -408,9 +409,6 @@ class Compiler {
             auto q = quantity(v.t);
             if (!q || q->real)
                 return v;
-            if (!q->ns->real)
-                error(op + " with " + displayName(v.t.name) +
-                      " needs floating point; declare unitns " + q->ns->name + " for int, float");
             return callNamedMethod(v, "__fwu_float", {});
         };
         static const std::map<std::string, llvm::CmpInst::Predicate> comparisons = {
@@ -434,8 +432,12 @@ class Compiler {
             if (op == "*" || op == "/") {
                 auto method =
                     std::string("__fwu_") + (op == "*" ? "mul" : "div") + "__" + qc->ns->name;
-                if (!qa->ns->real || !qc->ns->real ||
-                    resolveMethod(qa->ns->realClass, method).empty())
+                // a * b may be declared on b's namespace, in another module: b * a.
+                auto commuted = "__fwu_mul__" + qa->ns->name;
+                if (op == "*" && resolveMethod(qa->ns->realClass, method).empty() &&
+                    !resolveMethod(qc->ns->realClass, commuted).empty())
+                    return callNamedMethod(toReal(c), commuted, {toReal(a)});
+                if (resolveMethod(qa->ns->realClass, method).empty())
                     error("no unitconv relates " + qa->ns->name + " " + op + " " + qc->ns->name +
                           "; declare one, such as unitconv 1" + qa->ns->name + "." +
                           qa->ns->units[0] + " " + op + " 1" + qc->ns->name + "." +
@@ -915,15 +917,12 @@ class Compiler {
             auto inner = name.substr(at + 6);
             auto split = inner.rfind("__");
             auto ns = inner.substr(0, split), kind = inner.substr(split + 2);
+            if (kind != "int" && kind != "double")
+                error("units apply only to numbers: " + kind + "[" + ns + "] is not a type; "
+                      "use a numeric type such as int[" + ns + "] or float[" + ns + "]");
             auto spelled = (kind == "int" ? "int[" : "float[") + ns + "]";
-            for (auto &candidate : p.unitNamespaces)
-                if (candidate.name == ns && (kind == "int" ? !candidate.integer : !candidate.real))
-                    error("unit namespace '" + ns + "' does not allow " +
-                          (kind == "int" ? "int" : "float") + " values; declare unitns " + ns +
-                          " for int, float");
             error("unknown unit namespace '" + ns + "' in " + spelled +
-                  "; declare it with unitns " + ns + " for int, float (units are local to the "
-                  "module that declares them)");
+                  "; declare it with unitns " + ns + " or import a module that declares it");
         }
         error("unknown or unsupported type '" + name + "'");
     }
@@ -3353,7 +3352,7 @@ Val Compiler::value(Expr &e, Ty expected) {
             else if (target.kind == "member" && target.args[0]->kind == "name" &&
                      (named = unitNamespace(target.args[0]->text)))
                 unit = target.text;
-            if (!unit.empty() && (named == nullptr || named == q->ns)) {
+            if (!unit.empty() && (named == nullptr || named->name == q->ns->name)) {
                 if (auto index = unitIndex(*q->ns, unit))
                     return callNamedMethod(a, "__fwu_to", {Val{i64(static_cast<int64_t>(*index)),
                                                                 Ty{"i64"}}});
@@ -3988,7 +3987,7 @@ Val Compiler::invoke(Expr &e, Ty expected) {
         auto x = value(*rest[0]);
         auto q = quantity(x.t);
         if (name == "type")
-            return literal(q ? (q->real ? q->ns->realSpelling : "int") : displayName(x.t.name));
+            return literal(q ? (q->real ? "float" : "int") : displayName(x.t.name));
         if (!q)
             error(name + "(x) needs a quantity such as 15s, got " + displayName(x.t.name));
         if (name == "unitns")

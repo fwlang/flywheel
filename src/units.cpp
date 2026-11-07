@@ -1,4 +1,4 @@
-// Units: `unitns time for int, float`, `unit time.min = 60`, and
+// Units: `unitns time`, `unit time.min = 60`, and
 // `unitconv 1metric_length.m / 1time.s = 1metric_speed.mps`.
 //
 // Each namespace becomes hidden classes, `__fwu_time__int` and `__fwu_time__double`, whose
@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <map>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -145,10 +146,22 @@ struct Relation {
     Location loc;
 };
 
-std::string generate(Program &p) {
+std::string generate(Program &p, const std::vector<UnitNamespace> &imported, bool strict) {
     std::ostringstream out;
     std::map<std::string, UnitNamespace *> byName;
     std::map<std::string, std::vector<Ratio>> factors;
+    std::vector<UnitNamespace> foreign = imported;
+    std::set<std::string> own;
+    for (auto &ns : p.unitNamespaces)
+        own.insert(ns.name);
+    for (auto &ns : foreign) {
+        // A namespace of this module hides an imported one of the same name.
+        if (own.count(ns.name))
+            continue;
+        byName[ns.name] = &ns;
+        for (size_t i = 0; i < ns.units.size(); ++i)
+            factors[ns.name].push_back(factor(ns.factors[i], ns.unitLocations[i]));
+    }
     for (auto &ns : p.unitNamespaces) {
         byName[ns.name] = &ns;
         if (ns.units.empty())
@@ -156,10 +169,8 @@ std::string generate(Program &p) {
                                 "as unit " + ns.name + ".base = 1");
         for (size_t i = 0; i < ns.units.size(); ++i)
             factors[ns.name].push_back(factor(ns.factors[i], ns.unitLocations[i]));
-        if (ns.integer)
-            ns.intClass = "__fwu_" + ns.name + "__int";
-        if (ns.real)
-            ns.realClass = "__fwu_" + ns.name + "__double";
+        ns.intClass = "__fwu_" + ns.name + "__int";
+        ns.realClass = "__fwu_" + ns.name + "__double";
     }
     // Relations between namespaces, with the ones that follow from each declared one.
     std::vector<Relation> relations;
@@ -177,18 +188,31 @@ std::string generate(Program &p) {
     };
     for (auto &c : p.unitConversions) {
         std::vector<double> base;
+        bool known = true;
+        for (int k = 0; k < 3; ++k)
+            known = known && byName.count(c.namespaces[k]);
+        if (!known && !strict)
+            continue;
+        if (!own.count(c.namespaces[0]) && !own.count(c.namespaces[1]) &&
+            !own.count(c.namespaces[2]) && known)
+            throw Error(c.loc, "unitconv relates namespaces of other modules; relate them in a "
+                               "module that declares one of them");
+        if (c.op == "/" && known && !own.count(c.namespaces[0]))
+            throw Error(c.loc, "unitconv divides " + c.namespaces[0] + ", which another module "
+                               "declares; write the relation as a product, such as unitconv 1" +
+                               c.namespaces[2] + "." + c.units[2] + " * 1" + c.namespaces[1] +
+                               "." + c.units[1] + " = 1" + c.namespaces[0] + "." + c.units[0]);
         for (int k = 0; k < 3; ++k) {
             auto it = byName.find(c.namespaces[k]);
             if (it == byName.end())
-                throw Error(c.loc, "unknown unit namespace '" + c.namespaces[k] + "'");
+                throw Error(c.loc, "unknown unit namespace '" + c.namespaces[k] +
+                                       "'; declare it with unitns or import a module that "
+                                       "declares it");
             auto &ns = *it->second;
             auto u = std::find(ns.units.begin(), ns.units.end(), c.units[k]);
             if (u == ns.units.end())
                 throw Error(c.loc, "unit namespace '" + ns.name + "' has no unit '" + c.units[k] +
                                        "'");
-            if (!ns.real)
-                throw Error(c.loc, "unitconv computes in floating point; declare unitns " +
-                                       ns.name + " for int, float");
             double amount = std::stod(c.amounts[k]);
             if (!(amount > 0))
                 throw Error(c.loc, "unitconv amounts must be positive");
@@ -259,8 +283,6 @@ std::string generate(Program &p) {
         };
         for (int kind = 0; kind < 2; ++kind) {
             bool isInt = kind == 0;
-            if ((isInt && !ns.integer) || (!isInt && !ns.real))
-                continue;
             auto C = isInt ? ns.intClass : ns.realClass;
             auto T = isInt ? "int" : "double";
             auto self = "inst __fwu_unit";
@@ -294,7 +316,7 @@ std::string generate(Program &p) {
                     << "        if m == 0 then\n"
                     << "            throw ValueError(\"{inst value}\" + " << table("names") << "["
                     << self << "] + \" is not a whole number of \" + " << table("names")
-                    << "[j] + \"; use " << ns.realSpelling << "[" << ns.name << "]\")\n"
+                    << "[j] + \"; use float[" << ns.name << "]\")\n"
                     << "        end\n"
                     << "        return inst value * m\n"
                     << "    end\n";
@@ -326,18 +348,12 @@ std::string generate(Program &p) {
                     << "    function __fwu_floordiv(int k) returns " << C << "\n"
                     << "        return " << C << "(inst value // k, " << self << ")\n"
                     << "    end\n";
-                if (ns.real)
-                    out << "    function __fwu_float() returns " << ns.realClass << "\n"
-                        << "        return " << ns.realClass << "(double(inst value), " << self
-                        << ")\n"
-                        << "    end\n"
-                        << "    function __fwu_to(int j) returns " << ns.realClass << "\n"
-                        << "        return " << ns.realClass << "(inst __fwu_real(j), j)\n"
-                        << "    end\n";
-                else
-                    out << "    function __fwu_to(int j) returns " << C << "\n"
-                        << "        return " << C << "(inst __fwu_exact(j), j)\n"
-                        << "    end\n";
+                out << "    function __fwu_float() returns " << ns.realClass << "\n"
+                    << "        return " << ns.realClass << "(double(inst value), " << self << ")\n"
+                    << "    end\n"
+                    << "    function __fwu_to(int j) returns " << ns.realClass << "\n"
+                    << "        return " << ns.realClass << "(inst __fwu_real(j), j)\n"
+                    << "    end\n";
             } else {
                 for (auto [name, op] : {std::pair{"add", "+"}, std::pair{"sub", "-"}})
                     out << "    function __fwu_" << name << "(" << C << " o) returns " << C << "\n"
@@ -399,14 +415,18 @@ std::string generate(Program &p) {
     return out.str();
 }
 } // namespace
-void lowerUnits(Program &p) {
+void lowerUnits(Program &p, const std::vector<UnitNamespace> &imported, bool strict) {
     if (p.unitNamespaces.empty()) {
-        if (!p.unitConversions.empty())
-            throw Error(p.unitConversions[0].loc, "unitconv needs unit namespaces; declare them "
-                                                  "with unitns");
+        if (!p.unitConversions.empty() && (strict || imported.empty()))
+            throw Error(p.unitConversions[0].loc,
+                        imported.empty() ? "unitconv needs unit namespaces; declare them with "
+                                           "unitns"
+                                         : "unitconv relates namespaces of other modules; relate "
+                                           "them in a module that declares one of them");
+        p.unitConversions.clear();
         return;
     }
-    auto text = generate(p);
+    auto text = generate(p, imported, strict);
     p.unitConversions.clear();
     Program generated;
     try {

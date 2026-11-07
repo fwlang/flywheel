@@ -19,7 +19,7 @@ Libraries are compiler-resolved declarations backed by C++ runtime functions; no
 | `regex` | regular expressions |
 | `testing` | assertions and lifetime metrics — [tooling](../docs/tooling.md) |
 | `thread` | tasks, channels, mutexes — [concurrency](../docs/concurrency.md) |
-| `time` | clocks, sleeping, calendar dates, formatting |
+| `time` | clocks, sleeping, calendar dates, formatting, and the `time` unit namespace (`90s`, `t in min`) |
 | `web` | HTTP and HTTPS servers and client |
 | `crypto` | SHA-256, SHA-1, MD5, HMAC, secure random numbers |
 | `encoding` | base64, base64url, hex, URL and form encoding |
@@ -27,7 +27,7 @@ Libraries are compiler-resolved declarations backed by C++ runtime functions; no
 | `compress` | gzip, zlib, deflate, CRC-32, zip archives |
 | `sqlite` | SQLite 3 databases |
 | `toml`, `yaml` | configuration formats, parsed to `json.value` |
-| `csv`, `url`, `log`, `args`, `bigint`, `decimal`, `random` | [library modules written in Flywheel](#library-modules) |
+| `csv`, `url`, `log`, `args`, `bigint`, `decimal`, `random`, `metric`, `imperial` | [library modules written in Flywheel](#library-modules) |
 
 ## Strings
 
@@ -374,6 +374,17 @@ print random.weighted(["common", "rare"], [9.0, 1.0])
 ```
 
 Invalid ranges, probabilities, weights, and sample counts raise `ValueError`.
+
+### metric and imperial
+
+Units of measure (see [units](../docs/units.md#unit-libraries)). `import metric` declares the namespaces `length` (`mm`, `cm`, `m`, `km`, ...), `area` (`m2`, `ha`, ...), `volume` (`ml`, `l`, `m3`, ...), `weight` (`g`, `kg`, `t`, ...), and `speed` (`mps`, `kmph`), with the relations length × length = area, area × length = volume, and length / time = speed. `import imperial` declares the same namespaces in British imperial units (`inch`, `ft`, `yd`, `mi`; `sqft`, `acre`; `floz`, `pt`, `gal`; `oz`, `lb`, `st`; `fps`, `mph`). Both import `time`, whose `time` namespace has `ns`, `us`, `ms`, `s`, `min`, `h`, `d`, and `wk`. With both imported, qualify the namespace: `float[metric.length]`.
+
+```flywheel
+import metric
+import time
+float[length] trip = 12.5km
+print trip / 30min in kmph      # 25kmph
+```
 
 ### bigint and decimal
 

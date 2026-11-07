@@ -1,0 +1,45 @@
+# Imperial (British) units of length, area, volume, weight, and speed: `import imperial`, then
+# `float[length] d = 3mi`, `d in ft`, `60mi / 1h` (a speed). `in` is a keyword, so inches are
+# `inch`. Volumes are imperial (UK) measures: a pint is 20 fluid ounces.
+# With `import metric` too, qualify the namespaces: float[imperial.length].
+import time
+
+unitns length
+unit length.inch = 1/12
+unit length.ft = 1
+unit length.yd = 3
+unit length.ch = 66
+unit length.fur = 660
+unit length.mi = 5280
+
+unitns area
+unit area.sqin = 1/144
+unit area.sqft = 1
+unit area.sqyd = 9
+unit area.acre = 43560
+unit area.sqmi = 27878400
+
+# Fluid ounces to gallons, and cubic inches and feet (1 floz = 28.4130625 ml).
+unitns volume
+unit volume.floz = 1
+unit volume.gi = 5
+unit volume.pt = 20
+unit volume.qt = 40
+unit volume.gal = 160
+unit volume.cuin = 16.387064/28.4130625
+unit volume.cuft = 28316.846592/28.4130625
+
+unitns weight
+unit weight.oz = 1/16
+unit weight.lb = 1
+unit weight.st = 14
+unit weight.cwt = 112
+unit weight.ton = 2240
+
+unitns speed
+unit speed.fps = 1
+unit speed.mph = 22/15
+
+unitconv 1length.ft * 1length.ft = 1area.sqft
+unitconv 1area.sqft * 1length.ft = 1volume.cuft
+unitconv 1length.ft / 1time.s = 1speed.fps

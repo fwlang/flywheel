@@ -140,16 +140,15 @@ std::string contentHash(const std::string &text);
 std::string fileUrlPath(const std::string &url);
 // Stores `contents` in the download cache under the URL's file name and returns the local path.
 std::string cacheDownload(const std::string &url, const std::string &contents);
-// A unit namespace (`unitns time for int, float`) and its units (`unit time.s = 1`). Quantity
-// values such as `15s` are instances of hidden classes, one per numeric kind (src/units.cpp).
+// A unit namespace (`unitns time`) and its units (`unit time.s = 1`). Units apply to every
+// numeric type: quantity values such as `15s` are instances of two hidden classes, one for
+// integer amounts and one for floating-point amounts (src/units.cpp).
 struct UnitNamespace {
     std::string name;
     Location loc;
-    bool integer = false, real = false;
-    std::string realSpelling = "float";     // how type() names the floating-point kind
     std::vector<std::string> units, factors; // in declaration order; factors as written
     std::vector<Location> unitLocations;
-    std::string intClass, realClass; // hidden class names; empty when the kind is not allowed
+    std::string intClass, realClass; // hidden class names
 };
 // `unitconv 1metric_length.m / 1time.s = 1metric_speed.mps`: relates three namespaces.
 struct UnitConversion {
@@ -212,13 +211,19 @@ class Parser {
   public:
     explicit Parser(std::vector<Token> t) : tokens(std::move(t)) {}
     Program parse();
+    // The module loader lowers units itself, once the imported modules' namespaces are known.
+    bool deferUnits = false;
 };
 Program loadProgram(const std::string &filename);
 // Lowers reactive variables (`reactive`, `computed`, `when`) and negated bool aliases into
 // ordinary declarations, closures, and watcher lists (src/lower.cpp). Parser::parse runs it.
 void lowerReactive(Program &program);
 // Unit namespaces (`unitns`, `unit`, `unitconv`) become hidden quantity classes (src/units.cpp).
-void lowerUnits(Program &program);
+// `imported` are the namespaces of imported modules, which `unitconv` may relate; their hidden
+// names are the unqualified ones, which the importing module resolves. When `strict` is false
+// (parsing a file on its own), relations naming namespaces it does not know are skipped.
+void lowerUnits(Program &program, const std::vector<UnitNamespace> &imported = {},
+                bool strict = false);
 EP clone(const Expr &e);
 SP clone(const Stmt &s);
 Function clone(const Function &f);

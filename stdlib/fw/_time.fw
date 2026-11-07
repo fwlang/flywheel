@@ -1,0 +1,11 @@
+# The time unit namespace that `import time` brings: `int[time] t = 90s`, `t in min`.
+# Months and years vary in length, so they are not units here.
+unitns time
+unit time.ns = 1/1000000000
+unit time.us = 1/1000000
+unit time.ms = 1/1000
+unit time.s = 1
+unit time.min = 60
+unit time.h = 3600
+unit time.d = 86400
+unit time.wk = 604800

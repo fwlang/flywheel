@@ -695,14 +695,28 @@ std::string Parser::type() {
             r += ">";
         }
     }
-    // A unit type: int[time] or float[metric_length], a number in a unit namespace. It names
-    // the namespace's hidden quantity class (see src/units.cpp).
-    if ((r == "int" || r == "float" || r == "double") && peek().text == "[" &&
-        peek(1).kind == "id" && peek(2).text == "]") {
+    // A unit type: int[time], float[metric_length], u8[time], ...: a number in a unit
+    // namespace. Integer types name the namespace's integer quantity class and float/double its
+    // floating-point class (see src/units.cpp). Other builtin types are kept as an invalid
+    // quantity name so the compiler can say that units apply only to numbers.
+    static const std::set<std::string> integers = {"int", "i8",  "i16", "i32", "i64",
+                                                   "u8",  "u16", "u32", "u64"};
+    static const std::set<std::string> others = {"string", "bool", "char", "void", "element",
+                                                 "fragment"};
+    // A namespace from an imported module may be qualified: float[metric.length].
+    bool qualified = peek(2).text == "." && peek(3).kind == "id" && peek(4).text == "]";
+    if ((integers.count(r) || r == "float" || r == "double" || others.count(r)) &&
+        peek().text == "[" && peek(1).kind == "id" && (peek(2).text == "]" || qualified)) {
         take();
+        std::string module;
+        if (qualified) {
+            module = identifier().text + ".";
+            take();
+        }
         auto ns = identifier().text;
         take();
-        r = "__fwu_" + ns + "__" + (r == "int" ? "int" : "double");
+        r = module + "__fwu_" + ns + "__" +
+            (integers.count(r) ? "int" : r == "float" || r == "double" ? "double" : r);
     }
     while (true) {
         if (accept("?"))
@@ -2007,23 +2021,16 @@ Program Parser::parse() {
             finish();
             p.families.push_back(std::move(family));
         } else if (peek().text == "unitns" && peek().kind == "id" && peek(1).kind == "id" &&
-                   peek(2).text == "for") {
-            // unitns time for int, float
+                   (peek(2).kind == "nl" || peek(2).kind == "eof" || peek(2).text == ";" ||
+                    peek(2).text == "for")) {
+            // unitns time: a unit namespace. Its units apply to every numeric type.
             take();
             UnitNamespace ns;
             ns.loc = peek().loc;
             ns.name = identifier().text;
-            expect("for");
-            do {
-                auto kind = take();
-                if (kind.text == "int")
-                    ns.integer = true;
-                else if (kind.text == "float" || kind.text == "double") {
-                    ns.real = true;
-                    ns.realSpelling = kind.text;
-                } else
-                    throw Error(kind.loc, "unit namespaces hold int, float, or double values");
-            } while (accept(","));
+            if (peek().text == "for")
+                throw Error(peek().loc, "unitns takes only a name: write `unitns " + ns.name +
+                                            "`; units apply to every numeric type");
             finish();
             for (auto &other : p.unitNamespaces)
                 if (other.name == ns.name)
@@ -2055,8 +2062,7 @@ Program Parser::parse() {
                     ns = &candidate;
             if (!ns)
                 throw Error(nsToken.loc, "unknown unit namespace '" + nsToken.text +
-                                             "'; declare it first: unitns " + nsToken.text +
-                                             " for int, float");
+                                             "'; declare it first: unitns " + nsToken.text);
             if (std::find(ns->units.begin(), ns->units.end(), unitToken.text) != ns->units.end())
                 throw Error(unitToken.loc, "duplicate unit '" + nsToken.text + "." +
                                                unitToken.text + "'");
@@ -2204,7 +2210,8 @@ Program Parser::parse() {
         if (hidden)
             p.privateNames.insert(declared);
     }
-    lowerUnits(p);
+    if (!deferUnits)
+        lowerUnits(p);
     lowerReactive(p);
     return p;
 }

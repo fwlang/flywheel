@@ -33,7 +33,20 @@ struct Unit {
     std::map<std::string, std::string> builtins;
     bool html = false, svg = false;
     std::set<std::string> familyTags; // element family tags visible in this module
+    // Unit namespaces this module declares (hidden names unqualified), and the modules whose
+    // namespaces it sees: its imports, and the units library behind `import time`.
+    std::vector<UnitNamespace> unitExports;
+    std::vector<Unit *> unitModules;
+    std::map<std::string, std::string> ambiguousUnits; // namespace -> "a and b"
+    std::vector<UnitNamespace> visibleUnits; // own and imported, for unit literals
 };
+// The hidden names a unit namespace's lowering generates (src/units.cpp).
+std::vector<std::string> unitNames(const std::string &ns) {
+    std::vector<std::string> out;
+    for (auto suffix : {"int", "double", "names", "factor", "finer", "num", "den", "mul"})
+        out.push_back("__fwu_" + ns + "__" + suffix);
+    return out;
+}
 // Embedded library modules load from this virtual directory.
 const fs::path libraryDirectory = fs::path("/") / "<flywheel>" / "lib";
 // The URL's directory, with a trailing '/': "https://x.org/a/b.fw" -> "https://x.org/a/".
@@ -88,6 +101,14 @@ class Loader {
         return it->second;
     }
     std::string resolve(Unit &u, std::string name, Location loc) {
+        if (name.rfind("__fwu_", 0) == 0 && !u.names.count(name)) {
+            auto inner = name.substr(6);
+            auto ns = inner.substr(0, inner.rfind("__"));
+            if (auto it = u.ambiguousUnits.find(ns); it != u.ambiguousUnits.end())
+                throw Error(loc, "unit namespace '" + ns + "' is ambiguous: modules " + it->second +
+                                     " both declare it; qualify it, such as float[" +
+                                     it->second.substr(0, it->second.find(' ')) + "." + ns + "]");
+        }
         auto dot = name.find('.');
         if (dot != std::string::npos) {
             auto it = u.modules.find(name.substr(0, dot));
@@ -122,8 +143,71 @@ class Loader {
         }
         return out;
     }
+    // 5km, 15time.s: the unit must belong to a namespace the module declares or imports.
+    // The literal is then spelled with its namespace's hidden class (`$m2$__fwu_time__int.s`), so
+    // the compiler finds that namespace even when other modules have one of the same name; the
+    // module's own namespaces come first.
+    void unitLiteral(Unit &u, Expr &e) {
+        auto text = e.text, unit = text;
+        auto spell = [&](const UnitNamespace &ns, const std::string &unitName) {
+            auto it = u.names.find(ns.intClass);
+            if (it != u.names.end())
+                e.text = it->second + "." + unitName;
+        };
+        auto own = [&](const UnitNamespace &ns) {
+            return &ns < u.visibleUnits.data() + u.program.unitNamespaces.size();
+        };
+        if (auto dot = text.find('.'); dot != std::string::npos) {
+            auto name = text.substr(0, dot), rest = text.substr(dot + 1);
+            const UnitNamespace *found = nullptr;
+            int count = 0;
+            for (auto &ns : u.visibleUnits)
+                if (ns.name == name) {
+                    if (own(ns) && !found) {
+                        found = &ns;
+                        count = 1;
+                        break;
+                    }
+                    found = found ? found : &ns;
+                    ++count;
+                }
+            if (found) {
+                if (count == 1 && rest.find('.') == std::string::npos)
+                    spell(*found, rest);
+                return; // the unit itself is checked by the compiler
+            }
+            unit = name; // 15s.value
+        }
+        std::vector<const UnitNamespace *> candidates, mine;
+        for (auto &ns : u.visibleUnits)
+            if (std::find(ns.units.begin(), ns.units.end(), unit) != ns.units.end()) {
+                candidates.push_back(&ns);
+                if (own(ns))
+                    mine.push_back(&ns);
+            }
+        if (!mine.empty())
+            candidates = mine;
+        if (candidates.size() == 1 && text.find('.') == std::string::npos)
+            spell(*candidates[0], unit);
+        if (!candidates.empty())
+            return;
+        std::string where;
+        for (auto &[path, other] : units)
+            for (auto &ns : other->unitExports)
+                if (where.empty() &&
+                    std::find(ns.units.begin(), ns.units.end(), unit) != ns.units.end())
+                    where = path.rfind((libraryDirectory / "").string(), 0) == 0
+                                ? fs::path(path).stem().string()
+                                : path;
+        if (where == "_time")
+            where = "time";
+        throw Error(e.loc, "unknown unit '" + unit + "' after " + e.args[0]->text +
+                               (where.empty() ? "" : "; import " + where + ", which declares it"));
+    }
     void expression(Unit &u, Expr &e, const std::set<std::string> &locals) {
         e.loc.file = u.path;
+        if (e.kind == "unitlit")
+            unitLiteral(u, e);
         // Type arguments on members (json.decode<User>, thread.channel<Job>) name local types.
         if (e.kind == "member")
             if (auto open = e.text.find('<'); open != std::string::npos)
@@ -386,6 +470,63 @@ class Loader {
     static std::string canonicalLocation(const std::string &location) {
         return isUrl(location) ? location : fs::weakly_canonical(fs::path(location)).string();
     }
+    // Lowers the module's units once its imports are loaded: imported namespaces become visible
+    // by name (int[time]), and unitconv may relate them.
+    template <class Add> void units_(Unit &u, Add &add) {
+        std::vector<UnitNamespace> imported;
+        std::map<std::string, std::vector<std::pair<Unit *, std::string>>> byName;
+        std::set<Unit *> seen;
+        for (auto *dependency : u.unitModules) {
+            if (!seen.insert(dependency).second)
+                continue;
+            std::string module = dependency->path;
+            for (auto &[alias, unit] : u.modules)
+                if (unit == dependency)
+                    module = alias;
+            for (auto &ns : dependency->unitExports)
+                byName[ns.name].push_back({dependency, module});
+        }
+        std::set<std::string> own;
+        for (auto &ns : u.program.unitNamespaces)
+            own.insert(ns.name);
+        for (auto &[name, sources] : byName) {
+            if (own.count(name))
+                continue;
+            if (sources.size() > 1) {
+                u.ambiguousUnits[name] = sources[0].second + " and " + sources[1].second;
+                continue;
+            }
+            auto &dependency = *sources[0].first;
+            for (auto &ns : dependency.unitExports)
+                if (ns.name == name)
+                    imported.push_back(ns);
+            for (auto &hidden : unitNames(name))
+                if (dependency.own.count(hidden))
+                    u.names[hidden] = dependency.own.at(hidden);
+        }
+        try {
+            lowerUnits(u.program, imported, true);
+        } catch (Error &e) {
+            e.loc.file = u.path;
+            throw;
+        }
+        // A namespace of the module hides imported ones of the same name.
+        u.visibleUnits = u.program.unitNamespaces;
+        for (auto *dependency : seen)
+            for (auto &ns : dependency->unitExports)
+                if (!own.count(ns.name))
+                    u.visibleUnits.push_back(ns);
+        for (auto &c : u.program.classes)
+            if (c.name.rfind("__fwu_", 0) == 0 && !u.own.count(c.name)) {
+                add(c.name, c.loc);
+                u.names[c.name] = u.own.at(c.name);
+            }
+        for (auto &s : u.program.body)
+            if (s->kind == "declare" && s->name.rfind("__fwu_", 0) == 0 && !u.own.count(s->name)) {
+                add(s->name, s->loc);
+                u.names[s->name] = u.own.at(s->name);
+            }
+    }
     Unit &load(const std::string &location) {
         bool remote = isUrl(location);
         fs::path path = remote ? fs::path() : fs::path(location);
@@ -422,7 +563,9 @@ class Loader {
         u.path = canonical;
         u.prefix = "$m" + std::to_string(units.size()) + "$";
         try {
-            u.program = Parser(lex(text.str())).parse();
+            Parser parser(lex(text.str()));
+            parser.deferUnits = true;
+            u.program = parser.parse();
         } catch (Error &e) {
             e.loc.file = canonical;
             throw;
@@ -599,6 +742,7 @@ class Loader {
             if (!found.empty()) {
                 auto &dependency = load(found);
                 u.modules[alias] = &dependency;
+                u.unitModules.push_back(&dependency);
                 for (auto &family : dependency.program.families)
                     for (auto &[tag, info] : family.tags)
                         u.familyTags.insert(tag);
@@ -619,6 +763,9 @@ class Loader {
                                 "native wildcard imports are supported only for html and svg");
                 auto qualified = "$native$" + name;
                 u.builtins[alias] = qualified;
+                // `import time` also brings the time unit namespace (stdlib/fw/_time.fw).
+                if (name == "time")
+                    u.unitModules.push_back(&load((libraryDirectory / "_time.fw").string()));
                 merged.imports[qualified] = name;
                 if (name == "html" && u.program.wildcards.count(alias))
                     u.html = true;
@@ -633,6 +780,7 @@ class Loader {
         for (auto &family : u.program.families)
             for (auto &[tag, info] : family.tags)
                 u.familyTags.insert(tag);
+        units_(u, add);
         for (auto &f : u.program.functions)
             function(u, f);
         for (auto &en : u.program.enums) {
@@ -672,6 +820,7 @@ class Loader {
             merged.classes.push_back(std::move(c));
         for (auto &en : u.program.enums)
             merged.enums.push_back(std::move(en));
+        u.unitExports = u.program.unitNamespaces;
         for (auto &ns : u.program.unitNamespaces) {
             ns.loc.file = u.path;
             for (auto *name : {&ns.intClass, &ns.realClass})

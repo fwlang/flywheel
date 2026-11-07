@@ -2421,15 +2421,15 @@ NEGATIVE.update(
 )
 
 
-UNITS_PRELUDE = """unitns time for int, float
+UNITS_PRELUDE = """unitns time
 unit time.s = 1
 unit time.min = 60
 unit time.h = 3600
-unitns metric_length for int, float
+unitns metric_length
 unit metric_length.cm = 0.01
 unit metric_length.m = 1
 unit metric_length.km = 1000
-unitns metric_speed for int, float
+unitns metric_speed
 unit metric_speed.mps = 1
 unit metric_speed.kmph = 0.2777777777777778
 unitconv 1metric_length.m / 1time.s = 1metric_speed.mps
@@ -2593,11 +2593,42 @@ when elapsed >= 2min do
 end
 elapsed += 90s
 elapsed += 30s
-print type(5), type("x")""",
+print type(5), type("x")
+i32[time] small = 90s
+u8[metric_length] tiny = 3m
+double[time] precise = 2.5min
+print small in time.min, tiny + 50cm, type(precise), precise, small < precise""",
             "100m 32000cm\nint s time 0.25min\n2100m true 1900m true true false\n"
             "10000cm 0.01m\n-100m 300m 300m 33m 25m 0.05\n10mps 36kmph float metric_speed\n"
             "36kmph 20m 7200s\n15s 105s float\n[1m, 50cm, 2km] 150cm 100 15\n10km\n2\n90s 1.5min\n"
-            "two minutes at 120s\nint string\n",
+            "two minutes at 120s\nint string\n1.5min 350cm float 2.5min true\n",
+        ),
+        "unit_libraries": (
+            """import metric
+import time
+float[length] dist = 2.5km
+print dist, dist in m, unitns(dist)
+var speed = 100m / 10s
+print speed, speed in kmph, speed * 2s, 2s * speed, 72km / 10speed.mps
+print 3m * 4m, 3m * 4m * 2m, (3m * 4m * 2m) in l
+int[time] dur = 90s
+print dur in min, dur in time.min, type(dur), 1wk in d
+i32[weight] w = 3kg
+print w + 500g, w in t
+""",
+            "2.5km 2500m length\n10mps 36kmph 20m 20m 7200s\n12m2 24m3 24000l\n1.5min 1.5min int 7d\n"
+            "3500g 0.003t\n",
+        ),
+        "unit_libraries_both": (
+            """import metric
+import imperial
+import time
+float[metric.length] a = 1km
+float[imperial.length] b = 1mi
+print a in m, b in ft, 60mi / 1h in mph, 1gal in pt, 1acre in sqft
+print 3ft * 2ft, 14lb in st
+""",
+            "1000m 5280ft 60mph 8pt 43560sqft\n6sqft 1st\n",
         ),
     }
 )
@@ -2629,18 +2660,25 @@ NEGATIVE.update(
         "units_unknown": ("print 5px\n", "unknown unit 'px'"),
         "units_no_unitconv": (UNITS_PRELUDE + "print 1s * 1s\n", "no unitconv relates time * time"),
         "units_wrong_unit": (UNITS_PRELUDE + "print 5m in s\n", "s is a unit of time"),
-        "units_float_kind": (
-            "unitns n for int\nunit n.a = 1\nfloat[n] x = 1.5a\n",
-            "does not allow float values",
+        "units_ambiguous_namespace": (
+            "import metric\nimport imperial\nfloat[length] x = 1m\n",
+            "unit namespace 'length' is ambiguous",
+        ),
+        "units_library_not_imported": ("import time\nprint 5km\n", "unknown unit 'km'"),
+        "units_literal_needs_import": ("import metric\nprint 1h\n", "unknown unit 'h' after 1; import time"),
+        "units_old_unitns": ("unitns n for int, float\nunit n.a = 1\n", "unitns takes only a name"),
+        "units_not_number": (
+            "unitns n\nunit n.a = 1\nstring[n] s = \"x\"\n",
+            "units apply only to numbers: string[n]",
         ),
         "units_unknown_namespace": ("int[nowhere] x = 0\n", "unknown unit namespace 'nowhere'"),
         "units_duplicate_unit": (
-            "unitns n for int\nunit n.a = 1\nunit n.a = 2\n",
+            "unitns n\nunit n.a = 1\nunit n.a = 2\n",
             "duplicate unit 'n.a'",
         ),
-        "units_bad_factor": ("unitns n for int\nunit n.a = 0\n", "factor must be a positive number"),
+        "units_bad_factor": ("unitns n\nunit n.a = 0\n", "factor must be a positive number"),
         "units_ambiguous": (
-            "unitns a for int\nunit a.m = 1\nunitns b for int\nunit b.m = 1\nprint 5m\n",
+            "unitns a\nunit a.m = 1\nunitns b\nunit b.m = 1\nprint 5m\n",
             "unit 'm' is ambiguous",
         ),
     }
@@ -2652,7 +2690,7 @@ TRAPS.update(
             "HttpFailure: fatal",
         ),
         "units_inexact_int": (
-            "unitns len for int, float\nunit len.m = 1\nunit len.ft = 0.3048\nprint 1m + 1ft\n",
+            "unitns len\nunit len.m = 1\nunit len.ft = 0.3048\nprint 1m + 1ft\n",
             "is not a whole number of ft",
         ),
     }

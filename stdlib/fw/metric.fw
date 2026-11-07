@@ -1,0 +1,45 @@
+# Metric (SI) units of length, area, volume, weight, and speed: `import metric`, then
+# `float[length] d = 2.5km`, `d in m`, `100m / 10s` (a speed), `3m * 4m` (an area).
+# With `import imperial` too, qualify the namespaces: float[metric.length].
+import time
+
+unitns length
+unit length.nm = 1/1000000000
+unit length.um = 1/1000000
+unit length.mm = 1/1000
+unit length.cm = 1/100
+unit length.dm = 1/10
+unit length.m = 1
+unit length.km = 1000
+
+unitns area
+unit area.mm2 = 1/1000000
+unit area.cm2 = 1/10000
+unit area.m2 = 1
+unit area.ha = 10000
+unit area.km2 = 1000000
+
+# Litres and cubic metres; 1 l = 1 dm3 and 1 ml = 1 cm3.
+unitns volume
+unit volume.ml = 1/1000
+unit volume.cm3 = 1/1000
+unit volume.cl = 1/100
+unit volume.dl = 1/10
+unit volume.l = 1
+unit volume.dm3 = 1
+unit volume.m3 = 1000
+
+# Mass, in the everyday sense of weight.
+unitns weight
+unit weight.mg = 1/1000000
+unit weight.g = 1/1000
+unit weight.kg = 1
+unit weight.t = 1000
+
+unitns speed
+unit speed.mps = 1
+unit speed.kmph = 5/18
+
+unitconv 1length.m * 1length.m = 1area.m2
+unitconv 1area.m2 * 1length.m = 1volume.m3
+unitconv 1length.m / 1time.s = 1speed.mps
